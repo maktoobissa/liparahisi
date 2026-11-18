@@ -254,6 +254,7 @@ function ProductTile({ product, onArchive, canArchive }) {
       <div className="product-tile-details">
         <strong>{product.name}</strong>
         <span>TZS {formatMoney(product.amount)}</span>
+        <small>Stock: {product.stock_quantity ?? 0}</small>
         {product.shop_name && <small>{product.shop_name}</small>}
         {!product.is_active && <small className="muted-status">Imeondolewa</small>}
         <div className="product-tile-actions">
@@ -283,7 +284,9 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [products, setProducts] = useState([]);
   const [sales, setSales] = useState([]);
   const [sellers, setSellers] = useState([]);
-  const [productForm, setProductForm] = useState({ name: "", amount: "", cost_amount: "" });
+  const [auditRows, setAuditRows] = useState([]);
+  const [productForm, setProductForm] = useState({ name: "", amount: "", cost_amount: "", stock_quantity: "" });
+  const [productQuery, setProductQuery] = useState("");
   const [passwordForm, setPasswordForm] = useState({ current_password: "", new_password: "" });
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -293,13 +296,14 @@ function MarketplaceDashboard({ user, onLogout }) {
   async function refresh() {
     const [dashboard, productRows, salesRows] = await Promise.all([
       api("/dashboard"),
-      api("/products"),
+      api(`/products?q=${encodeURIComponent(productQuery)}`),
       api("/sales"),
     ]);
     setStats(dashboard);
     setProducts(productRows);
     setSales(salesRows);
     if (isAdmin) setSellers(await api("/admin/sellers"));
+    if (isAdmin) setAuditRows(await api("/admin/audit"));
   }
 
   useEffect(() => {
@@ -318,9 +322,10 @@ function MarketplaceDashboard({ user, onLogout }) {
           name: productForm.name.trim(),
           amount: Number(productForm.amount),
           cost_amount: Number(productForm.cost_amount) || 0,
+          stock_quantity: Number(productForm.stock_quantity) || 0,
         }),
       });
-      setProductForm({ name: "", amount: "", cost_amount: "" });
+      setProductForm({ name: "", amount: "", cost_amount: "", stock_quantity: "" });
       setMessage("Bidhaa imehifadhiwa. QR na barcode yake vipo kwenye orodha hapa chini.");
       await refresh();
     } catch (requestError) {
@@ -384,6 +389,7 @@ function MarketplaceDashboard({ user, onLogout }) {
     ["products", "Bidhaa"],
     ["sales", "Mauzo"],
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
+    ...(isAdmin ? [["audit", "Audit"]] : []),
     ["settings", "Akaunti"],
   ];
 
@@ -437,6 +443,8 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <input id="product-amount" className="text-input" type="number" min="1" step="1" required value={productForm.amount} onChange={(event) => setProductForm({ ...productForm, amount: event.target.value })} />
                 <label className="field-label" htmlFor="product-cost">Gharama ya bidhaa (TZS)</label>
                 <input id="product-cost" className="text-input" type="number" min="0" step="1" value={productForm.cost_amount} onChange={(event) => setProductForm({ ...productForm, cost_amount: event.target.value })} />
+                <label className="field-label" htmlFor="product-stock">Stock inayopatikana</label>
+                <input id="product-stock" className="text-input" type="number" min="0" step="1" required value={productForm.stock_quantity} onChange={(event) => setProductForm({ ...productForm, stock_quantity: event.target.value })} />
                 <p className="field-hint">Gharama hutumika kukadiria faida; inaweza kuachwa wazi.</p>
                 <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inahifadhi..." : "Hifadhi bidhaa"}</button>
               </form>
@@ -448,6 +456,10 @@ function MarketplaceDashboard({ user, onLogout }) {
             </div>
           )}
           <div className="dashboard-section-heading"><h2>{isAdmin ? "Bidhaa zote" : "Bidhaa zako"}</h2><span>{products.filter((item) => item.is_active).length} hai</span></div>
+          <div className="product-search">
+            <input className="text-input" type="search" placeholder="Tafuta bidhaa au duka..." value={productQuery} onChange={(event) => setProductQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") refresh(); }} />
+            <button type="button" className="table-action" onClick={() => refresh()}>Tafuta</button>
+          </div>
           {products.length ? (
             <div className="product-grid">
               {products.map((product) => <ProductTile key={product.id} product={product} canArchive={!isAdmin} onArchive={archiveProduct} />)}
@@ -481,6 +493,34 @@ function MarketplaceDashboard({ user, onLogout }) {
             ))}
             {!sellers.length && <p className="empty-state">Hakuna muuzaji aliyesajiliwa bado.</p>}
           </div>
+        </section>
+      )}
+
+      {tab === "audit" && isAdmin && (
+        <section className="dashboard-content">
+          <div className="dashboard-section-heading">
+            <h2>Rekodi za usalama na shughuli</h2>
+            <a className="table-action" href="/api/admin/export/sales">Pakua mauzo CSV</a>
+          </div>
+          {auditRows.length ? (
+            <div className="table-scroll">
+              <table className="sales-table">
+                <thead><tr><th>Shughuli</th><th>Mtumiaji</th><th>Target</th><th>Maelezo</th><th>IP</th><th>Muda</th></tr></thead>
+                <tbody>
+                  {auditRows.map((row) => (
+                    <tr key={row.id}>
+                      <td><strong>{row.action}</strong></td>
+                      <td>{row.actor_email || "Mfumo"}</td>
+                      <td>{row.target_type}: {row.target_id}</td>
+                      <td>{row.detail}</td>
+                      <td>{row.ip_address || "—"}</td>
+                      <td>{row.created_at}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <p className="empty-state">Bado hakuna rekodi za audit.</p>}
         </section>
       )}
 

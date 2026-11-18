@@ -6,6 +6,8 @@ import re
 import secrets
 import sqlite3
 import time
+import csv
+import io
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Literal
@@ -14,7 +16,7 @@ from urllib.parse import quote, urlsplit
 import psycopg
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, validator
@@ -147,8 +149,25 @@ def initialize_db():
                 amount INTEGER NOT NULL CHECK (amount > 0),
                 seller_id TEXT REFERENCES users(id),
                 cost_amount INTEGER NOT NULL DEFAULT 0,
+                stock_quantity INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                actor_id TEXT,
+                actor_email TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                ip_address TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                email TEXT PRIMARY KEY,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                blocked_until REAL NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY,
@@ -194,6 +213,7 @@ def initialize_db():
         product_columns = {
             "seller_id": "TEXT",
             "cost_amount": "INTEGER NOT NULL DEFAULT 0",
+            "stock_quantity": "INTEGER NOT NULL DEFAULT 0",
             "is_active": "INTEGER NOT NULL DEFAULT 1",
         }
         order_columns = {
@@ -277,6 +297,7 @@ class ProductInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     amount: int = Field(gt=0, le=999999999)
     cost_amount: int = Field(default=0, ge=0, le=999999999)
+    stock_quantity: int = Field(default=0, ge=0, le=999999999)
 
     @validator("name")
     def strip_product_name(cls, value):
@@ -290,6 +311,7 @@ class ProductUpdateInput(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     amount: int | None = Field(default=None, gt=0, le=999999999)
     cost_amount: int | None = Field(default=None, ge=0, le=999999999)
+    stock_quantity: int | None = Field(default=None, ge=0, le=999999999)
 
     @validator("name")
     def strip_product_name(cls, value):
@@ -472,11 +494,36 @@ def is_integrity_error(error):
     return isinstance(error, (sqlite3.IntegrityError, psycopg.IntegrityError))
 
 
+def record_audit(action, target_type="", target_id="", detail="", actor=None, request=None):
+    actor_id = actor["id"] if actor else ""
+    actor_email = actor["email"] if actor else ""
+    ip_address = ""
+    if request is not None:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        ip_address = forwarded.split(",")[0].strip() if forwarded else request.client.host if request.client else ""
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO audit_log
+                (id, actor_id, actor_email, action, target_type, target_id, detail, ip_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                secrets.token_hex(16),
+                actor_id,
+                actor_email,
+                action,
+                target_type,
+                target_id,
+                detail,
+                ip_address,
+            ),
+        )
 def get_product(product_id):
     with db_connection() as connection:
         product = connection.execute(
             """
-            SELECT p.id, p.name, p.amount, p.cost_amount, p.seller_id,
+            SELECT p.id, p.name, p.amount, p.cost_amount, p.stock_quantity, p.seller_id,
                    u.shop_name, u.full_name AS seller_name
             FROM products p
             LEFT JOIN users u ON u.id = p.seller_id
@@ -575,6 +622,33 @@ def complete_demo_order(order_id):
         payout = order["amount"] - fee - order["provider_fee"]
         profit = payout - order["product_cost"]
         with db_connection() as connection:
+            items = connection.execute(
+                "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                (order_id,),
+            ).fetchall()
+            if items:
+                for item in items:
+                    result = connection.execute(
+                        """
+                        UPDATE products
+                        SET stock_quantity = stock_quantity - ?
+                        WHERE id = ? AND stock_quantity >= ?
+                        """,
+                        (item["quantity"], item["product_id"], item["quantity"]),
+                    )
+                    if result.rowcount == 0:
+                        raise HTTPException(status_code=409, detail="Stock ya bidhaa imeisha.")
+            else:
+                product = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (order["product_id"],),
+                ).fetchone()
+                if product and product["stock_quantity"] <= 0:
+                    raise HTTPException(status_code=409, detail="Stock ya bidhaa imeisha.")
+                connection.execute(
+                    "UPDATE products SET stock_quantity = stock_quantity - 1 WHERE id = ?",
+                    (order["product_id"],),
+                )
             connection.execute(
                 """
                 UPDATE orders
@@ -710,17 +784,46 @@ def register_seller(payload: SellerRegistrationInput):
 def login(payload: LoginInput, request: Request, response: Response):
     email = payload.email.strip().lower()
     with db_connection() as connection:
+        attempt = connection.execute(
+            "SELECT failed_count, blocked_until FROM login_attempts WHERE email = ?",
+            (email,),
+        ).fetchone()
+        if attempt and attempt["blocked_until"] > time.time():
+            raise HTTPException(
+                status_code=429,
+                detail="Akaunti imezuiwa kwa muda kutokana na majaribio mengi ya login.",
+            )
         user = connection.execute(
             "SELECT * FROM users WHERE email = ?",
             (email,),
         ).fetchone()
         if user is None or not verify_password(payload.password, user["password_hash"]):
+            failed = connection.execute(
+                "SELECT failed_count FROM login_attempts WHERE email = ?",
+                (email,),
+            ).fetchone()
+            failed_count = (failed["failed_count"] if failed else 0) + 1
+            blocked_until = time.time() + 15 * 60 if failed_count >= 5 else 0
+            if failed:
+                connection.execute(
+                    "UPDATE login_attempts SET failed_count = ?, blocked_until = ? WHERE email = ?",
+                    (failed_count, blocked_until, email),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO login_attempts (email, failed_count, blocked_until) VALUES (?, ?, ?)",
+                    (email, failed_count, blocked_until),
+                )
             raise HTTPException(status_code=401, detail="Barua pepe au nenosiri si sahihi.")
         if user["status"] != "ACTIVE":
             raise HTTPException(
                 status_code=403,
                 detail="Akaunti inasubiri idhini ya msimamizi mkuu.",
             )
+        connection.execute(
+            "DELETE FROM login_attempts WHERE email = ?",
+            (email,),
+        )
         token = create_session(connection, user["id"])
         result = safe_user(user)
     set_session_cookie(response, request, token)
@@ -756,25 +859,41 @@ def change_password(payload: PasswordChangeInput, request: Request):
 
 
 @app.get("/api/products")
-def list_products(request: Request):
+def list_products(request: Request, q: str = "", seller: str = "", min_amount: int = 0, max_amount: int = 999999999):
     user = get_current_user(request)
+    search = q.strip().lower()
+    seller_search = seller.strip().lower()
+    terms = ["p.amount >= ?", "p.amount <= ?"]
+    params = [max(0, min_amount), max(0, max_amount)]
+    if search:
+        terms.append("(LOWER(p.name) LIKE ? OR LOWER(COALESCE(u.shop_name, '')) LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    if seller_search:
+        terms.append("LOWER(COALESCE(u.shop_name, '')) LIKE ?")
+        params.append(f"%{seller_search}%")
+    where = " AND ".join(terms)
     with db_connection() as connection:
         if user["role"] == "ADMIN":
             rows = connection.execute(
                 """
                 SELECT p.id, p.name, p.amount, p.cost_amount, p.is_active,
-                       p.seller_id, p.created_at, u.shop_name
+                       p.stock_quantity, p.seller_id, p.created_at, u.shop_name
                 FROM products p LEFT JOIN users u ON u.id = p.seller_id
+                WHERE """ + where + """
                 ORDER BY p.created_at DESC
-                """
+                """,
+                tuple(params),
             ).fetchall()
         else:
             rows = connection.execute(
                 """
-                SELECT id, name, amount, cost_amount, is_active, seller_id, created_at, '' AS shop_name
-                FROM products WHERE seller_id = ? ORDER BY created_at DESC
+                SELECT p.id, p.name, p.amount, p.cost_amount, p.is_active,
+                       p.stock_quantity, p.seller_id, p.created_at, '' AS shop_name
+                FROM products p LEFT JOIN users u ON u.id = p.seller_id
+                WHERE p.seller_id = ? AND """ + where + """
+                ORDER BY p.created_at DESC
                 """,
-                (user["id"],),
+                (user["id"], *params),
             ).fetchall()
     app_url = public_app_url(str(request.base_url))
     return [
@@ -796,17 +915,27 @@ def create_product(payload: ProductInput, request: Request):
     with db_connection() as connection:
         connection.execute(
             """
-            INSERT INTO products (id, name, amount, seller_id, cost_amount)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO products
+                (id, name, amount, seller_id, cost_amount, stock_quantity)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (product_id, payload.name, payload.amount, user["id"], payload.cost_amount),
+            (
+                product_id,
+                payload.name,
+                payload.amount,
+                user["id"],
+                payload.cost_amount,
+                payload.stock_quantity,
+            ),
         )
+    record_audit("PRODUCT_CREATED", "product", product_id, payload.name, actor=user, request=request)
     app_url = public_app_url(str(request.base_url))
     return {
         "id": product_id,
         "name": payload.name,
         "amount": payload.amount,
         "cost_amount": payload.cost_amount,
+        "stock_quantity": payload.stock_quantity,
         "qr_url": f"{app_url}/p/{product_id}",
     }
 
@@ -826,11 +955,19 @@ def update_product(product_id: str, payload: ProductUpdateInput, request: Reques
         name = payload.name if payload.name is not None else product["name"]
         amount = payload.amount if payload.amount is not None else product["amount"]
         cost_amount = payload.cost_amount if payload.cost_amount is not None else product["cost_amount"]
+        stock_quantity = payload.stock_quantity if payload.stock_quantity is not None else product["stock_quantity"]
         connection.execute(
-            "UPDATE products SET name = ?, amount = ?, cost_amount = ? WHERE id = ?",
-            (name, amount, cost_amount, product_id),
+            "UPDATE products SET name = ?, amount = ?, cost_amount = ?, stock_quantity = ? WHERE id = ?",
+            (name, amount, cost_amount, stock_quantity, product_id),
         )
-    return {"id": product_id, "name": name, "amount": amount, "cost_amount": cost_amount}
+    record_audit("PRODUCT_UPDATED", "product", product_id, f"{name} stock={stock_quantity}", actor=user, request=request)
+    return {
+        "id": product_id,
+        "name": name,
+        "amount": amount,
+        "cost_amount": cost_amount,
+        "stock_quantity": stock_quantity,
+    }
 
 
 @app.delete("/api/products/{product_id}")
@@ -854,6 +991,7 @@ def read_product(product_id: str):
         "id": product["id"],
         "name": product["name"],
         "amount": product["amount"],
+        "stock_quantity": product["stock_quantity"],
         "shop_name": product["shop_name"] or product["seller_name"] or "Muuzaji",
     }
 
@@ -868,6 +1006,8 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
     product = get_product(product_id)
     if not product["seller_id"]:
         raise HTTPException(status_code=503, detail="Bidhaa hii inahitaji kuunganishwa na akaunti ya muuzaji.")
+    if product["stock_quantity"] <= 0:
+        raise HTTPException(status_code=409, detail="Stock ya bidhaa imeisha.")
     if payload.payment_method.endswith("Branch") and not payload.bank_branch:
         raise HTTPException(status_code=422, detail="Chagua tawi la benki.")
 
@@ -910,6 +1050,14 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                     time.time() + ORDER_TTL_SECONDS,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO order_items
+                    (order_id, product_id, quantity, unit_amount, unit_cost)
+                VALUES (?, ?, 1, ?, ?)
+                """,
+                (order_id, product_id, product["amount"], product["cost_amount"]),
+            )
     except Exception as error:
         if is_integrity_error(error):
             with db_connection() as connection:
@@ -951,7 +1099,7 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         for item in payload.items:
             product = connection.execute(
                 """
-                SELECT p.id, p.name, p.amount, p.cost_amount, p.seller_id,
+                SELECT p.id, p.name, p.amount, p.cost_amount, p.stock_quantity, p.seller_id,
                        u.status AS seller_status
                 FROM products p LEFT JOIN users u ON u.id = p.seller_id
                 WHERE p.id = ? AND p.is_active = 1
@@ -960,6 +1108,11 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             ).fetchone()
             if product is None or product["seller_id"] is None or product["seller_status"] != "ACTIVE":
                 raise HTTPException(status_code=404, detail="Bidhaa haipatikani au muuzaji wake hajathibitishwa.")
+            if product["stock_quantity"] < item.quantity:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Stock ya {product['name']} haitoshi; inabaki {product['stock_quantity']}.",
+                )
             seller_id = product["seller_id"]
             merged.setdefault(seller_id, []).append(
                 (product, item.quantity)
@@ -1234,6 +1387,7 @@ def archive_sale(order_id: str, request: Request):
         )
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Rekodi ya mauzo haikupatikana.")
+    record_audit("SALE_ARCHIVED", "order", order_id, "Seller archived completed sale", actor=user, request=request)
     return {"message": "Rekodi imefichwa kwenye historia yako; admin bado anaiona."}
 
 
@@ -1258,7 +1412,7 @@ def list_sellers(request: Request):
 
 @app.patch("/api/admin/sellers/{seller_id}")
 def update_seller_status(seller_id: str, payload: SellerStatusInput, request: Request):
-    require_admin(request)
+    actor = require_admin(request)
     status = payload.status
     with db_connection() as connection:
         result = connection.execute(
@@ -1267,7 +1421,56 @@ def update_seller_status(seller_id: str, payload: SellerStatusInput, request: Re
         )
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Muuzaji hakupatikana.")
+    record_audit("SELLER_STATUS_UPDATED", "seller", seller_id, payload.status, actor=actor, request=request)
     return {"id": seller_id, "status": status}
+
+
+@app.get("/api/admin/audit")
+def list_audit(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, actor_id, actor_email, action, target_type, target_id,
+                   detail, ip_address, created_at
+            FROM audit_log
+            ORDER BY created_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/admin/export/sales")
+def export_sales(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT o.order_id, o.created_at, o.completed_at, o.payment_status,
+                   o.buyer_name, o.buyer_email, o.buyer_phone, o.payment_method,
+                   o.amount, o.product_cost, o.platform_fee, o.seller_payout,
+                   o.net_profit, u.shop_name
+            FROM orders o LEFT JOIN users u ON u.id = o.seller_id
+            ORDER BY o.created_at DESC
+            """
+        ).fetchall()
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        "order_id", "created_at", "completed_at", "payment_status",
+        "buyer_name", "buyer_email", "buyer_phone", "payment_method",
+        "amount", "product_cost", "platform_fee", "seller_payout",
+        "net_profit", "shop_name",
+    ])
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(dict(row))
+    record_audit("SALES_EXPORTED", "export", "sales.csv", "Admin exported sales", actor=require_admin(request), request=request)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=liparahisi-sales.csv"},
+    )
 
 
 if FRONTEND_DIST.is_dir():

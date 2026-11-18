@@ -113,7 +113,7 @@ class MarketplaceFlowTests(unittest.TestCase):
             ):
                 product = seller_client.post(
                     "/api/products",
-                    json={"name": "Kikombe cha kahawa", "amount": 5000, "cost_amount": 2500},
+                    json={"name": "Kikombe cha kahawa", "amount": 5000, "cost_amount": 2500, "stock_quantity": 100},
                 )
             self.assertEqual(product.status_code, 201)
             product_data = product.json()

@@ -1158,6 +1158,14 @@ footer span span {
   font-size: 13px;
 }
 
+.product-search {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+  margin: 12px 0 18px;
+}
+
 @media (max-width: 760px) {
   .page-shell {
     width: min(540px, calc(100% - 32px));
