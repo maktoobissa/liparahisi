@@ -1080,12 +1080,15 @@ def get_cart_checkout(checkout_id):
         else "EXPIRED" if all(split["payment_status"] == "EXPIRED" for split in splits)
         else "PENDING",
         "buyer_name": orders[0]["buyer_name"],
+        "buyer_email": orders[0]["buyer_email"],
+        "buyer_phone": orders[0]["buyer_phone"],
         "payment_method": orders[0]["payment_method"],
         "bank_branch": orders[0]["bank_branch"],
         "expires_at": orders[0]["expires_at"],
         "demo": True,
         "total_amount": sum(split["amount"] for split in splits),
         "platform_fee": sum(split["platform_fee"] for split in splits),
+        "completed_at": next((row["completed_at"] for row in orders if row["completed_at"]), None),
         "splits": splits,
     }
 

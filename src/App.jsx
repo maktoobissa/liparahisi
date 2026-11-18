@@ -795,6 +795,34 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
     }
   }
 
+  function downloadCartReceipt() {
+    if (!checkout || checkout.payment_status !== "COMPLETED") return;
+    const itemsHtml = checkout.splits.map((split) => `
+      <h3>${escapeHtml(split.shop_name)}</h3>
+      ${split.items.map((item) => `<p>${item.quantity} x ${escapeHtml(item.product_name)} — TZS ${formatMoney(item.quantity * item.unit_amount)}</p>`).join("")}
+      <p><strong>Jumla ya muuzaji: TZS ${formatMoney(split.amount)}</strong></p>
+      <p>Kamisheni ya jukwaa (5%): TZS ${formatMoney(split.platform_fee)}</p>
+    `).join("");
+    const html = `<!doctype html><html><meta charset="utf-8"><body>
+      <h1>LipaRahisi — Risiti ya kikapu (majaribio)</h1>
+      <p>Oda: ${escapeHtml(checkout.checkout_id)}</p>
+      <p>Mnunuzi: ${escapeHtml(checkout.buyer_name)}</p>
+      <p>Barua pepe: ${escapeHtml(checkout.buyer_email)}</p>
+      <p>Simu: ${escapeHtml(checkout.buyer_phone)}</p>
+      <p>Njia: ${escapeHtml(checkout.payment_method)}${checkout.bank_branch ? ` — ${escapeHtml(checkout.bank_branch)}` : ""}</p>
+      ${itemsHtml}
+      <h2>Jumla ya bili: TZS ${formatMoney(checkout.total_amount)}</h2>
+      <p>Hali: Imekamilika (demo; hakuna pesa halisi)</p>
+      <p>Tarehe: ${escapeHtml(checkout.completed_at || "")}</p>
+    </body></html>`;
+    const link = document.createElement("a");
+    const objectUrl = URL.createObjectURL(new Blob([html], { type: "application/msword;charset=utf-8" }));
+    link.href = objectUrl;
+    link.download = `risiti-kikapu-${checkout.checkout_id}.doc`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  }
+
   const total = products.reduce((sum, product) => sum + product.amount * (items.find((item) => item.product_id === product.id)?.quantity || 0), 0);
 
   return (
@@ -858,6 +886,18 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               {checkout.payment_status === "COMPLETED" && <p className="success-message">Oda zote za wauzaji zimekamilika kama majaribio.</p>}
               {checkout.payment_status === "EXPIRED" && <p className="form-error">Oda imekwisha muda; anzisha kikapu kipya.</p>}
               {error && <p className="form-error" role="alert">{error}</p>}
+              {checkout.payment_status === "COMPLETED" && (
+                <>
+                  <dl className="receipt-details">
+                    <div><dt>Mnunuzi</dt><dd>{checkout.buyer_name}</dd></div>
+                    <div><dt>Njia ya malipo</dt><dd>{checkout.payment_method}{checkout.bank_branch ? ` — ${checkout.bank_branch}` : ""}</dd></div>
+                    <div><dt>Kamisheni ya jukwaa</dt><dd>TZS {formatMoney(checkout.platform_fee)}</dd></div>
+                    <div><dt>Tarehe</dt><dd>{checkout.completed_at || "—"}</dd></div>
+                  </dl>
+                  <button type="button" className="document-button" onClick={() => window.print()}>Chapisha / hifadhi risiti kama PDF</button>
+                  <button type="button" className="document-button" onClick={downloadCartReceipt}>Pakua risiti ya kikapu (.doc)</button>
+                </>
+              )}
               <a className="retry-link" href="/">Rudi mwanzo</a>
             </>
           )}
