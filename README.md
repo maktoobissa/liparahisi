@@ -53,11 +53,12 @@ Setting `DATABASE_URL` selects PostgreSQL instead.
 
 ## Render deployment
 
-The Blueprint defines the web service and a managed PostgreSQL database so
-products and sales survive service restarts. At the current Render dashboard
-price, the smallest paid plan plus 1 GB storage is about $6.30/month ($6 compute
-+ $0.30 storage), billed by the second. Confirm the price shown by Render
-before applying a Blueprint sync. The deployment remains in demo-payment mode.
+The Blueprint uses Render's Free Postgres plan to start without a database
+charge. It is limited to 1 GB, has no backups, and expires 30 days after
+creation. Render gives a 14-day grace period to upgrade after expiration; after
+that it deletes the database and its data. Use it for testing only, and export
+or upgrade before the expiration date if you need to keep records. The web
+service remains in demo-payment mode.
 
 1. Push the project to GitHub and open Render's **New > Blueprint** flow.
 2. Select the repository and review the resources and their current prices.

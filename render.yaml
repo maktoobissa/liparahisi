@@ -18,5 +18,4 @@ databases:
   - name: liparahisi-db
     databaseName: liparahisi
     user: liparahisi
-    plan: 0.1c-256mb
-    diskSizeGB: 1
+    plan: free
