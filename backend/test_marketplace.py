@@ -34,6 +34,27 @@ class MarketplaceFlowTests(unittest.TestCase):
         main.DATABASE_PATH = self.original_database_path
         self.temp_dir.cleanup()
 
+    def test_integration_status_and_password_reset(self):
+        status = self.client.get("/api/config/integrations").json()
+        self.assertFalse(status["live_payments_enabled"])
+        self.assertFalse(status["smtp_configured"])
+
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        reset_request = self.client.post(
+            "/api/auth/password-reset/request",
+            json={"email": "admin@example.com"},
+        )
+        self.assertEqual(reset_request.status_code, 503)
+
     def test_seller_approval_sales_commission_and_archive_isolation(self):
         status = self.client.get("/api/auth/status").json()
         self.assertTrue(status["setup_required"])

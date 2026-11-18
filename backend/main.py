@@ -8,7 +8,9 @@ import sqlite3
 import time
 import csv
 import io
+import smtplib
 from contextlib import asynccontextmanager, contextmanager
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlsplit
@@ -133,6 +135,10 @@ def initialize_db():
                 status TEXT NOT NULL,
                 shop_name TEXT NOT NULL DEFAULT '',
                 phone TEXT NOT NULL DEFAULT '',
+                email_verified INTEGER NOT NULL DEFAULT 0,
+                verification_token_hash TEXT NOT NULL DEFAULT '',
+                reset_token_hash TEXT NOT NULL DEFAULT '',
+                reset_expires REAL NOT NULL DEFAULT 0,
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_marketplace_admin
@@ -216,6 +222,12 @@ def initialize_db():
             "stock_quantity": "INTEGER NOT NULL DEFAULT 0",
             "is_active": "INTEGER NOT NULL DEFAULT 1",
         }
+        user_columns = {
+            "email_verified": "INTEGER NOT NULL DEFAULT 0",
+            "verification_token_hash": "TEXT NOT NULL DEFAULT ''",
+            "reset_token_hash": "TEXT NOT NULL DEFAULT ''",
+            "reset_expires": "REAL NOT NULL DEFAULT 0",
+        }
         order_columns = {
             "seller_id": "TEXT",
             "buyer_name": "TEXT NOT NULL DEFAULT ''",
@@ -236,6 +248,8 @@ def initialize_db():
         }
         for column, declaration in product_columns.items():
             ensure_column(connection, "products", column, declaration)
+        for column, declaration in user_columns.items():
+            ensure_column(connection, "users", column, declaration)
         for column, declaration in order_columns.items():
             ensure_column(connection, "orders", column, declaration)
         connection.execute(
@@ -286,6 +300,15 @@ class LoginInput(BaseModel):
 
 class PasswordChangeInput(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=10, max_length=128)
+
+
+class PasswordResetRequestInput(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+
+
+class PasswordResetInput(BaseModel):
+    reset_token: str = Field(min_length=32, max_length=256)
     new_password: str = Field(min_length=10, max_length=128)
 
 
@@ -399,6 +422,35 @@ def hash_password(password):
         base64.urlsafe_b64encode(salt).decode("ascii"),
         base64.urlsafe_b64encode(digest).decode("ascii"),
     )
+
+
+def send_smtp_email(to_email, subject, text):
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "587").strip() or "587")
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "").strip()
+    sender = os.getenv("SMTP_FROM", username).strip()
+    if not host or not username or not password or not sender:
+        raise HTTPException(
+            status_code=503,
+            detail="SMTP haijawekwa. Weka SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD na SMTP_FROM kwenye Render.",
+        )
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender
+    message["To"] = to_email
+    message.set_content(text)
+    if os.getenv("SMTP_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        server = smtplib.SMTP_SSL(host, port, timeout=20)
+    else:
+        server = smtplib.SMTP(host, port, timeout=20)
+    try:
+        with server:
+            server.starttls()
+            server.login(username, password)
+            server.send_message(message)
+    except (smtplib.SMTPException, TimeoutError, OSError) as error:
+        raise HTTPException(status_code=502, detail="Imeshindikana kutuma barua pepe.") from error
 
 
 def verify_password(password, encoded):
@@ -669,6 +721,28 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/config/integrations")
+def integration_status():
+    selcom_configured = all(
+        os.getenv(key, "").strip()
+        for key in ("SELCOM_BASE_URL", "SELCOM_API_KEY", "SELCOM_API_SECRET", "SELCOM_VENDOR")
+    )
+    smtp_configured = all(
+        os.getenv(key, "").strip()
+        for key in ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM")
+    )
+    live_enabled = (
+        os.getenv("SELCOM_LIVE_ENABLED", "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    return {
+        "demo_mode": is_demo_mode(),
+        "live_payments_enabled": live_enabled,
+        "selcom_configured": selcom_configured,
+        "smtp_configured": smtp_configured,
+    }
+
+
 @app.get("/api/auth/status")
 def auth_status(request: Request):
     with db_connection() as connection:
@@ -743,7 +817,7 @@ def setup_admin(payload: AdminSetupInput, request: Request, response: Response):
 
 
 @app.post("/api/auth/register", status_code=201)
-def register_seller(payload: SellerRegistrationInput):
+def register_seller(payload: SellerRegistrationInput, request: Request):
     full_name, email = clean_identity(payload.full_name, payload.email)
     shop_name = payload.shop_name.strip()
     if not shop_name:
@@ -767,6 +841,12 @@ def register_seller(payload: SellerRegistrationInput):
                     phone,
                 ),
             )
+            verification_token = secrets.token_urlsafe(32)
+            verification_hash = hashlib.sha256(verification_token.encode("utf-8")).hexdigest()
+            connection.execute(
+                "UPDATE users SET verification_token_hash = ? WHERE id = ?",
+                (verification_hash, user_id),
+            )
     except Exception as error:
         if is_integrity_error(error):
             raise HTTPException(
@@ -774,6 +854,15 @@ def register_seller(payload: SellerRegistrationInput):
                 detail="Barua pepe hii tayari imesajiliwa.",
             ) from error
         raise
+    try:
+        app_url = public_app_url(str(request.base_url))
+        send_smtp_email(
+            email,
+            "LipaRahisi — thibitisha akaunti",
+            f"Thibitisha akaunti: {app_url}/verify-email?token={quote(verification_token, safe='')}",
+        )
+    except HTTPException:
+        pass
     return {
         "status": "PENDING",
         "message": "Usajili umepokelewa. Msimamizi mkuu ataidhinisha akaunti yako kabla ya kuuza.",
@@ -856,6 +945,66 @@ def change_password(payload: PasswordChangeInput, request: Request):
             (hash_password(payload.new_password), user["id"]),
         )
     return {"message": "Nenosiri limebadilishwa."}
+
+
+@app.post("/api/auth/password-reset/request")
+def request_password_reset(payload: PasswordResetRequestInput, request: Request):
+    email = payload.email.strip().lower()
+    with db_connection() as connection:
+        user = connection.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+        if user is not None:
+            reset_token = secrets.token_urlsafe(32)
+            reset_hash = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
+            connection.execute(
+                "UPDATE users SET reset_token_hash = ?, reset_expires = ? WHERE id = ?",
+                (reset_hash, time.time() + 60 * 60, user["id"]),
+            )
+            app_url = public_app_url(str(request.base_url))
+            send_smtp_email(
+                email,
+                "LipaRahisi — password reset",
+                "Reset link: "
+                f"{app_url}/reset-password?token={quote(reset_token, safe='')}\n"
+                "Link hii inaisha baada ya saa 1.",
+            )
+    return {"message": "Ikiwa akaunti ipo, link ya kubadilisha nenosiri imetumwa."}
+
+
+@app.post("/api/auth/password-reset/confirm")
+def confirm_password_reset(payload: PasswordResetInput):
+    reset_hash = hashlib.sha256(payload.reset_token.encode("utf-8")).hexdigest()
+    with db_connection() as connection:
+        user = connection.execute(
+            "SELECT id FROM users WHERE reset_token_hash = ? AND reset_expires > ?",
+            (reset_hash, time.time()),
+        ).fetchone()
+        if user is None:
+            raise HTTPException(status_code=400, detail="Link ya reset si sahihi au imekwisha muda.")
+        connection.execute(
+            "UPDATE users SET password_hash = ?, reset_token_hash = '', reset_expires = 0 WHERE id = ?",
+            (hash_password(payload.new_password), user["id"]),
+        )
+    return {"message": "Nenosiri limebadilishwa."}
+
+
+@app.get("/api/auth/verify-email")
+def verify_email(token: str):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db_connection() as connection:
+        user = connection.execute(
+            "SELECT id FROM users WHERE verification_token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        if user is None:
+            raise HTTPException(status_code=400, detail="Link ya uthibitisho si sahihi.")
+        connection.execute(
+            "UPDATE users SET email_verified = 1, verification_token_hash = '' WHERE id = ?",
+            (user["id"],),
+        )
+    return {"message": "Barua pepe imethibitishwa."}
 
 
 @app.get("/api/products")

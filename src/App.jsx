@@ -187,6 +187,11 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth }) {
             {busy ? "Inahifadhi..." : isSetup ? "Anzisha admin mkuu" : isRegister ? "Tuma usajili" : "Ingia"}
           </button>
         </form>
+        {!setupRequired && mode === "login" && (
+          <div className="auth-switch">
+            <button type="button" onClick={() => { window.history.pushState({}, "", "/forgot-password"); window.location.reload(); }}>Umesahau nenosiri?</button>
+          </div>
+        )}
         {!setupRequired && (
           <div className="auth-switch">
             {isRegister ? "Tayari una akaunti?" : "Unataka kuuza bidhaa?"}
@@ -565,6 +570,119 @@ function SalesTable({ sales, isAdmin, onArchive }) {
     </div>
   );
 }
+
+function ForgotPasswordPage() {
+  const [email, setEmail] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const result = await api("/auth/password-reset/request", {
+        method: "POST",
+        body: JSON.stringify({ email }),
+      });
+      setMessage(result.message);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <main className="page-shell auth-shell">
+      <Header label="Password reset" />
+      <section className="auth-card">
+        <div className="eyebrow"><span /> AKAUNTI</div>
+        <h1>Rejesha nenosiri</h1>
+        <form className="buyer-form" onSubmit={submit}>
+          <label className="field-label" htmlFor="forgot-email">Barua pepe</label>
+          <input id="forgot-email" className="text-input" type="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
+          {message && <p className="success-message" role="status">{message}</p>}
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inatuma..." : "Tuma link ya reset"}</button>
+        </form>
+        <a className="retry-link" href="/">Rudi kuingia</a>
+      </section>
+    </main>
+  );
+}
+
+
+function ResetPasswordPage() {
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const token = new URLSearchParams(window.location.search).get("token") || "";
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const result = await api("/auth/password-reset/confirm", {
+        method: "POST",
+        body: JSON.stringify({ reset_token: token, new_password: password }),
+      });
+      setMessage(result.message);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <main className="page-shell auth-shell">
+      <Header label="Password reset" />
+      <section className="auth-card">
+        <div className="eyebrow"><span /> AKAUNTI</div>
+        <h1>Weka nenosiri jipya</h1>
+        <form className="buyer-form" onSubmit={submit}>
+          <label className="field-label" htmlFor="reset-password">Nenosiri jipya (angalau herufi 10)</label>
+          <input id="reset-password" className="text-input" type="password" minLength={10} required value={password} onChange={(event) => setPassword(event.target.value)} />
+          {message && <p className="success-message" role="status">{message}</p>}
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <button className="generate-button" type="submit" disabled={busy || !token}>{busy ? "Inahifadhi..." : "Badilisha nenosiri"}</button>
+        </form>
+        <a className="retry-link" href="/">Rudi kuingia</a>
+      </section>
+    </main>
+  );
+}
+
+
+function VerifyEmailPage() {
+  const [message, setMessage] = useState("Inathibitisha...");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const token = new URLSearchParams(window.location.search).get("token") || "";
+    if (!token) {
+      setError("Token ya uthibitisho haipo.");
+      setMessage("");
+      return;
+    }
+    api(`/auth/verify-email?token=${encodeURIComponent(token)}`)
+      .then((result) => setMessage(result.message))
+      .catch((requestError) => { setError(requestError.message); setMessage(""); });
+  }, []);
+  return (
+    <main className="page-shell auth-shell">
+      <Header label="Email verification" />
+      <section className="auth-card">
+        <h1>Thibitisha barua pepe</h1>
+        {message && <p className="success-message" role="status">{message}</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <a className="retry-link" href="/">Rudi mwanzo</a>
+      </section>
+    </main>
+  );
+}
+
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -951,12 +1069,15 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
 export default function App() {
   const checkoutMatch = window.location.pathname.match(/^\/(?:pay|p)\/([a-f0-9]{32})\/?$/i);
   const cartMatch = window.location.pathname.match(/^\/cart(?:\/([A-Z0-9]+))?\/?$/i);
+  const forgotMatch = window.location.pathname === "/forgot-password";
+  const resetMatch = window.location.pathname === "/reset-password";
+  const verifyMatch = window.location.pathname === "/verify-email";
   const [auth, setAuth] = useState(null);
   const [authState, setAuthState] = useState(null);
   const [authError, setAuthError] = useState("");
 
   useEffect(() => {
-    if (checkoutMatch || cartMatch) return;
+    if (checkoutMatch || cartMatch || forgotMatch || resetMatch || verifyMatch) return;
     api("/auth/status")
       .then(setAuthState)
       .catch((requestError) => setAuthError(requestError.message));
@@ -974,6 +1095,9 @@ export default function App() {
 
   if (checkoutMatch) return <CheckoutPage productId={checkoutMatch[1]} />;
   if (cartMatch) return <CartPage checkoutId={cartMatch[1] || ""} />;
+  if (forgotMatch) return <ForgotPasswordPage />;
+  if (resetMatch) return <ResetPasswordPage />;
+  if (verifyMatch) return <VerifyEmailPage />;
   if (authError) {
     return <main className="page-shell auth-shell"><Header label="Marketplace" /><p className="form-error">{authError}</p></main>;
   }
