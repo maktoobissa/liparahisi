@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: liparahisi
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DEMO_MODE
+        value: "true"
+      - key: DATABASE_PATH
+        value: /tmp/liparahisi.sqlite3
+      - key: MERCHANT_ADMIN_TOKEN
+        sync: false
