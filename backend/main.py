@@ -28,6 +28,7 @@ FRONTEND_DIST = PROJECT_ROOT / "dist"
 SESSION_COOKIE = "liparahisi_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 COMMISSION_PERCENT = 5
+ORDER_TTL_SECONDS = 60 * 60 * 24
 PAYMENT_METHODS = {
     "M-Pesa",
     "Tigo Pesa",
@@ -167,9 +168,20 @@ def initialize_db():
                 platform_fee INTEGER NOT NULL DEFAULT 0,
                 seller_payout INTEGER NOT NULL DEFAULT 0,
                 net_profit INTEGER NOT NULL DEFAULT 0,
+                checkout_id TEXT,
+                cart_request_key TEXT,
+                expires_at DOUBLE PRECISION,
                 completed_at {timestamp_type},
                 archived_at {timestamp_type},
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS order_items (
+                order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+                product_id TEXT NOT NULL REFERENCES products(id),
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                unit_amount INTEGER NOT NULL CHECK (unit_amount > 0),
+                unit_cost INTEGER NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+                PRIMARY KEY (order_id, product_id)
             );
             CREATE TABLE IF NOT EXISTS merchant_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -196,6 +208,9 @@ def initialize_db():
             "platform_fee": "INTEGER NOT NULL DEFAULT 0",
             "seller_payout": "INTEGER NOT NULL DEFAULT 0",
             "net_profit": "INTEGER NOT NULL DEFAULT 0",
+            "checkout_id": "TEXT",
+            "cart_request_key": "TEXT",
+            "expires_at": "DOUBLE PRECISION",
             "completed_at": timestamp_type,
             "archived_at": timestamp_type,
         }
@@ -208,6 +223,15 @@ def initialize_db():
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS orders_seller_status_idx ON orders(seller_id, payment_status)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS order_items_order_idx ON order_items(order_id)"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS orders_checkout_seller_idx
+            ON orders(checkout_id, seller_id)
+            """
         )
 
 
@@ -313,6 +337,15 @@ class CheckoutInput(BaseModel):
         if value not in PAYMENT_METHODS:
             raise ValueError("Chagua mtandao au huduma ya benki iliyopo.")
         return value
+
+
+class CartItemInput(BaseModel):
+    product_id: str = Field(min_length=1, max_length=64)
+    quantity: int = Field(gt=0, le=99)
+
+
+class CartCheckoutInput(CheckoutInput):
+    items: list[CartItemInput] = Field(min_items=1, max_items=100)
 
 
 def clean_identity(full_name, email):
@@ -458,6 +491,7 @@ def get_product(product_id):
 
 
 def get_order(order_id):
+    expire_pending_orders()
     with db_connection() as connection:
         order = connection.execute(
             "SELECT * FROM orders WHERE order_id = ?",
@@ -501,10 +535,35 @@ def commission_amount(amount):
     return (amount * COMMISSION_PERCENT + 50) // 100
 
 
+def expire_pending_orders(connection=None):
+    now = time.time()
+    should_close = connection is None
+    if connection is None:
+        context = db_connection()
+        connection = context.__enter__()
+    try:
+        connection.execute(
+            """
+            UPDATE orders
+            SET payment_status = 'EXPIRED'
+            WHERE payment_status = 'PENDING'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            """,
+            (now,),
+        )
+    finally:
+        if should_close:
+            connection.commit()
+            context.__exit__(None, None, None)
+
+
 def complete_demo_order(order_id):
     order = get_order(order_id)
     if not order["order_id"].startswith("DEMO"):
         raise HTTPException(status_code=400, detail="Hili si oda ya majaribio.")
+    if order["payment_status"] == "EXPIRED":
+        raise HTTPException(status_code=410, detail="Oda hii imekwisha muda; anzisha oda mpya.")
     if order["payment_status"] != "COMPLETED":
         fee = commission_amount(order["amount"])
         payout = order["amount"] - fee - order["provider_fee"]
@@ -826,8 +885,9 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                 """
                 INSERT INTO orders
                     (order_id, request_key, product_id, seller_id, amount,
-                     buyer_name, buyer_email, buyer_phone, payment_method, bank_branch, product_cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     buyer_name, buyer_email, buyer_phone, payment_method, bank_branch,
+                     product_cost, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -841,6 +901,7 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                     payload.payment_method,
                     payload.bank_branch or "",
                     product["cost_amount"],
+                    time.time() + ORDER_TTL_SECONDS,
                 ),
             )
     except Exception as error:
@@ -867,6 +928,190 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
             (checkout_url, order_id),
         )
     return {"order_id": order_id, "checkout_url": checkout_url, "demo": True}
+
+
+@app.post("/api/cart/checkout")
+def create_cart_checkout(payload: CartCheckoutInput, request: Request):
+    if not is_demo_mode():
+        raise HTTPException(
+            status_code=503,
+            detail="Malipo halisi yamezimwa hadi mgawanyo wa malipo wa wauzaji viunganishwe.",
+        )
+    if payload.payment_method.endswith("Branch") and not payload.bank_branch:
+        raise HTTPException(status_code=422, detail="Chagua tawi la benki.")
+
+    merged = {}
+    with db_connection() as connection:
+        for item in payload.items:
+            product = connection.execute(
+                """
+                SELECT p.id, p.name, p.amount, p.cost_amount, p.seller_id,
+                       u.status AS seller_status
+                FROM products p LEFT JOIN users u ON u.id = p.seller_id
+                WHERE p.id = ? AND p.is_active = 1
+                """,
+                (item.product_id,),
+            ).fetchone()
+            if product is None or product["seller_id"] is None or product["seller_status"] != "ACTIVE":
+                raise HTTPException(status_code=404, detail="Bidhaa haipatikani au muuzaji wake hajathibitishwa.")
+            seller_id = product["seller_id"]
+            merged.setdefault(seller_id, []).append(
+                (product, item.quantity)
+            )
+        existing = connection.execute(
+            "SELECT checkout_id FROM orders WHERE cart_request_key = ?",
+            (payload.request_key,),
+        ).fetchone()
+        if existing:
+            return get_cart_checkout(existing["checkout_id"])
+
+        checkout_id = "CART" + secrets.token_hex(16).upper()
+        expires_at = time.time() + ORDER_TTL_SECONDS
+        order_ids = []
+        for seller_index, (seller_id, seller_items) in enumerate(merged.items()):
+            order_id = "DEMO" + secrets.token_hex(10).upper()
+            amount = sum(product["amount"] * quantity for product, quantity in seller_items)
+            product_cost = sum(product["cost_amount"] * quantity for product, quantity in seller_items)
+            fee = commission_amount(amount)
+            payout = amount - fee
+            profit = payout - product_cost
+            first_product = seller_items[0][0]
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (order_id, request_key, product_id, seller_id, amount,
+                     buyer_name, buyer_email, buyer_phone, payment_method, bank_branch,
+                     product_cost, platform_fee, seller_payout, net_profit,
+                     checkout_id, cart_request_key, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    f"{payload.request_key}{seller_index:02d}",
+                    first_product["id"],
+                    seller_id,
+                    amount,
+                    payload.buyer_name.strip(),
+                    payload.buyer_email,
+                    payload.buyer_phone,
+                    payload.payment_method,
+                    payload.bank_branch or "",
+                    product_cost,
+                    fee,
+                    payout,
+                    profit,
+                    checkout_id,
+                    payload.request_key,
+                    expires_at,
+                ),
+            )
+            for product, quantity in seller_items:
+                connection.execute(
+                    """
+                    INSERT INTO order_items
+                        (order_id, product_id, quantity, unit_amount, unit_cost)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        product["id"],
+                        quantity,
+                        product["amount"],
+                        product["cost_amount"],
+                    ),
+                )
+            order_ids.append(order_id)
+
+    app_url = public_app_url(str(request.base_url))
+    checkout_url = f"{app_url}/cart/{checkout_id}"
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET checkout_url = ? WHERE checkout_id = ?",
+            (checkout_url, checkout_id),
+        )
+    return {
+        "checkout_id": checkout_id,
+        "checkout_url": checkout_url,
+        "order_ids": order_ids,
+        "demo": True,
+    }
+
+
+def get_cart_checkout(checkout_id):
+    expire_pending_orders()
+    with db_connection() as connection:
+        orders = connection.execute(
+            """
+            SELECT o.*, u.shop_name
+            FROM orders o LEFT JOIN users u ON u.id = o.seller_id
+            WHERE o.checkout_id = ?
+            ORDER BY o.created_at
+            """,
+            (checkout_id,),
+        ).fetchall()
+    if not orders:
+        raise HTTPException(status_code=404, detail="Kikapu cha malipo hakikupatikana.")
+    splits = []
+    for order in orders:
+        row = dict(order)
+        with db_connection() as connection:
+            items = connection.execute(
+                """
+                SELECT oi.product_id, oi.quantity, oi.unit_amount,
+                       p.name AS product_name
+                FROM order_items oi JOIN products p ON p.id = oi.product_id
+                WHERE oi.order_id = ?
+                """,
+                (row["order_id"],),
+            ).fetchall()
+        splits.append({
+            "order_id": row["order_id"],
+            "seller_id": row["seller_id"],
+            "shop_name": row["shop_name"] or "Muuzaji",
+            "amount": row["amount"],
+            "payment_status": row["payment_status"],
+            "platform_fee": row["platform_fee"],
+            "seller_payout": row["seller_payout"],
+            "items": [dict(item) for item in items],
+        })
+    return {
+        "checkout_id": checkout_id,
+        "payment_status": "COMPLETED" if all(split["payment_status"] == "COMPLETED" for split in splits)
+        else "EXPIRED" if all(split["payment_status"] == "EXPIRED" for split in splits)
+        else "PENDING",
+        "buyer_name": orders[0]["buyer_name"],
+        "payment_method": orders[0]["payment_method"],
+        "bank_branch": orders[0]["bank_branch"],
+        "expires_at": orders[0]["expires_at"],
+        "demo": True,
+        "total_amount": sum(split["amount"] for split in splits),
+        "platform_fee": sum(split["platform_fee"] for split in splits),
+        "splits": splits,
+    }
+
+
+@app.get("/api/checkouts/{checkout_id}")
+def read_cart_checkout(checkout_id: str):
+    return get_cart_checkout(checkout_id)
+
+
+@app.post("/api/checkouts/{checkout_id}/demo-complete")
+def complete_cart_checkout(checkout_id: str):
+    if not is_demo_mode():
+        raise HTTPException(status_code=404, detail="Endpoint ya majaribio imezimwa.")
+    expire_pending_orders()
+    with db_connection() as connection:
+        orders = connection.execute(
+            "SELECT order_id, payment_status FROM orders WHERE checkout_id = ?",
+            (checkout_id,),
+        ).fetchall()
+    if not orders:
+        raise HTTPException(status_code=404, detail="Kikapu cha malipo hakikupatikana.")
+    if any(order["payment_status"] == "EXPIRED" for order in orders):
+        raise HTTPException(status_code=410, detail="Kikapu hiki kimekwisha muda; anzisha oda mpya.")
+    for order in orders:
+        complete_demo_order(order["order_id"])
+    return get_cart_checkout(checkout_id)
 
 
 @app.get("/api/orders/{order_id}")

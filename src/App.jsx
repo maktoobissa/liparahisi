@@ -532,6 +532,21 @@ function escapeHtml(value) {
   })[character]);
 }
 
+const CART_STORAGE_KEY = "liparahisi_cart";
+
+function loadCart() {
+  try {
+    return JSON.parse(window.localStorage.getItem(CART_STORAGE_KEY) || "[]")
+      .filter((item) => item?.product_id && Number(item.quantity) > 0);
+  } catch {
+    return [];
+  }
+}
+
+function saveCart(items) {
+  window.localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(items));
+}
+
 function CheckoutPage({ productId }) {
   const [product, setProduct] = useState(null);
   const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
@@ -539,6 +554,7 @@ function CheckoutPage({ productId }) {
   const [order, setOrder] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cartCount, setCartCount] = useState(() => loadCart().reduce((sum, item) => sum + item.quantity, 0));
 
   useEffect(() => {
     api(`/products/${productId}`).then(setProduct).catch((requestError) => setError(requestError.message));
@@ -548,6 +564,15 @@ function CheckoutPage({ productId }) {
     if (!orderId) return;
     api(`/orders/${encodeURIComponent(orderId)}`).then(setOrder).catch((requestError) => setError(requestError.message));
   }, [orderId]);
+
+  function addToCart() {
+    const cart = loadCart();
+    const existing = cart.find((item) => item.product_id === productId);
+    if (existing) existing.quantity += 1;
+    else cart.push({ product_id: productId, quantity: 1 });
+    saveCart(cart);
+    setCartCount(cart.reduce((sum, item) => sum + item.quantity, 0));
+  }
 
   async function submitCheckout(event) {
     event.preventDefault();
@@ -655,6 +680,8 @@ function CheckoutPage({ productId }) {
               {error && <p className="form-error" role="alert">{error}</p>}
               <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
             </form>
+            <button className="cart-secondary-button" type="button" onClick={addToCart}>Ongeza bidhaa nyingine kwenye kikapu</button>
+            {cartCount > 0 && <a className="cart-link" href="/cart">Nenda kikapu ({cartCount})</a>}
             <p className="checkout-footnote">Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji.</p>
           </section>
         )}
@@ -694,14 +721,162 @@ function CheckoutPage({ productId }) {
   );
 }
 
+function CartPage({ checkoutId: initialCheckoutId = "" }) {
+  const [items, setItems] = useState(loadCart());
+  const [products, setProducts] = useState([]);
+  const [checkoutId, setCheckoutId] = useState(initialCheckoutId);
+  const [checkout, setCheckout] = useState(null);
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    Promise.all(items.map((item) => api(`/products/${item.product_id}`).then((product) => ({ ...item, ...product })).catch(() => null)))
+      .then((rows) => setProducts(rows.filter(Boolean)));
+  }, []);
+
+  useEffect(() => {
+    if (!checkoutId) return;
+    api(`/checkouts/${encodeURIComponent(checkoutId)}`).then(setCheckout).catch((requestError) => setError(requestError.message));
+  }, [checkoutId]);
+
+  function updateQuantity(productId, quantity) {
+    const next = items.map((item) => item.product_id === productId ? { ...item, quantity: Math.max(1, quantity) } : item).filter((item) => item.quantity > 0);
+    setItems(next);
+    saveCart(next);
+  }
+
+  function removeItem(productId) {
+    const next = items.filter((item) => item.product_id !== productId);
+    setItems(next);
+    saveCart(next);
+  }
+
+  async function submitCart(event) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const result = await api("/cart/checkout", {
+        method: "POST",
+        body: JSON.stringify({
+          request_key: newRequestKey(),
+          buyer_name: form.buyer_name,
+          buyer_email: form.buyer_email,
+          buyer_phone: form.buyer_phone,
+          payment_method: form.payment_method,
+          bank_branch: form.bank_branch,
+          items: items.map((item) => ({
+            product_id: item.product_id,
+            quantity: item.quantity,
+          })),
+        }),
+      });
+      setCheckoutId(result.checkout_id);
+      window.history.replaceState({}, "", `/cart/${result.checkout_id}`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function completeCart() {
+    setError("");
+    setBusy(true);
+    try {
+      const result = await api(`/checkouts/${encodeURIComponent(checkoutId)}/demo-complete`, { method: "POST" });
+      setCheckout(result);
+      saveCart([]);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const total = products.reduce((sum, product) => sum + product.amount * (items.find((item) => item.product_id === product.id)?.quantity || 0), 0);
+
+  return (
+    <main className="page-shell checkout-shell">
+      <Header label="Kikapu cha malipo" />
+      <div className="checkout-layout cart-layout">
+        <section className="checkout-card">
+          {!checkoutId && (
+            <>
+              <div className="eyebrow"><span /> KIKAPU CHA BIDHAA</div>
+              <h1>Chagua bili yako</h1>
+              {products.length === 0 && <p className="buyer-intro">Kikapu kiko tupu. Scan QR ya bidhaa ili uongeze bidhaa.</p>}
+              {products.map((product) => (
+                <div className="cart-row" key={product.id}>
+                  <div><strong>{product.name}</strong><span>Wauzaji: {product.shop_name}</span><small>TZS {formatMoney(product.amount)}</small></div>
+                  <input aria-label={`Idadi ya ${product.name}`} className="cart-quantity" type="number" min="1" max="99" value={items.find((item) => item.product_id === product.id)?.quantity || 1} onChange={(event) => updateQuantity(product.id, Number(event.target.value) || 1)} />
+                  <button type="button" onClick={() => removeItem(product.id)}>Ondoa</button>
+                </div>
+              ))}
+              {products.length > 0 && (
+                <form className="buyer-form" onSubmit={submitCart}>
+                  <label className="field-label" htmlFor="cart-buyer-name">Jina la mnunuzi</label>
+                  <input id="cart-buyer-name" className="text-input" autoComplete="name" required minLength={2} value={form.buyer_name} onChange={(event) => setForm({ ...form, buyer_name: event.target.value })} />
+                  <label className="field-label" htmlFor="cart-buyer-email">Barua pepe</label>
+                  <input id="cart-buyer-email" className="text-input" type="email" autoComplete="email" required value={form.buyer_email} onChange={(event) => setForm({ ...form, buyer_email: event.target.value })} />
+                  <label className="field-label" htmlFor="cart-buyer-phone">Namba ya simu</label>
+                  <input id="cart-buyer-phone" className="text-input" type="tel" inputMode="tel" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
+                  <fieldset className="payment-fieldset">
+                    <legend>Chagua mtandao wa malipo</legend>
+                    <div className="method-grid">
+                      {networks.map((method) => (
+                        <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
+                          <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                        </button>
+                      ))}
+                    </div>
+                  </fieldset>
+                  {error && <p className="form-error" role="alert">{error}</p>}
+                  <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}</button>
+                </form>
+              )}
+              <p className="checkout-footnote">Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa.</p>
+            </>
+          )}
+          {checkoutId && checkout && (
+            <>
+              <div className="eyebrow"><span /> ODA YA MAJARIBIO</div>
+              <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : "Gawanya kwa wauzaji"}</h1>
+              {checkout.splits.map((split) => (
+                <div className="cart-split" key={split.order_id}>
+                  <strong>{split.shop_name}</strong>
+                  <span>{split.items.map((item) => `${item.quantity} x ${item.product_name}`).join(", ")}</span>
+                  <b>TZS {formatMoney(split.amount)}</b>
+                  <small>Kamisheni ya jukwaa: TZS {formatMoney(split.platform_fee)}</small>
+                </div>
+              ))}
+              <div className="checkout-amount">Jumla: TZS {formatMoney(checkout.total_amount)}</div>
+              {checkout.payment_status === "PENDING" && (
+                <button className="generate-button" type="button" disabled={busy} onClick={completeCart}>{busy ? "Inathibitisha..." : "Thibitisha demo kwa wauzaji wote"}</button>
+              )}
+              {checkout.payment_status === "COMPLETED" && <p className="success-message">Oda zote za wauzaji zimekamilika kama majaribio.</p>}
+              {checkout.payment_status === "EXPIRED" && <p className="form-error">Oda imekwisha muda; anzisha kikapu kipya.</p>}
+              {error && <p className="form-error" role="alert">{error}</p>}
+              <a className="retry-link" href="/">Rudi mwanzo</a>
+            </>
+          )}
+        </section>
+      </div>
+      <footer><span>© 2026 LipaRahisi</span><span>QR ya bidhaa ni reusable; oda ya malipo ina muda wa saa 24</span></footer>
+    </main>
+  );
+}
+
 export default function App() {
   const checkoutMatch = window.location.pathname.match(/^\/(?:pay|p)\/([a-f0-9]{32})\/?$/i);
+  const cartMatch = window.location.pathname.match(/^\/cart(?:\/([A-Z0-9]+))?\/?$/i);
   const [auth, setAuth] = useState(null);
   const [authState, setAuthState] = useState(null);
   const [authError, setAuthError] = useState("");
 
   useEffect(() => {
-    if (checkoutMatch) return;
+    if (checkoutMatch || cartMatch) return;
     api("/auth/status")
       .then(setAuthState)
       .catch((requestError) => setAuthError(requestError.message));
@@ -718,6 +893,7 @@ export default function App() {
   }
 
   if (checkoutMatch) return <CheckoutPage productId={checkoutMatch[1]} />;
+  if (cartMatch) return <CartPage checkoutId={cartMatch[1] || ""} />;
   if (authError) {
     return <main className="page-shell auth-shell"><Header label="Marketplace" /><p className="form-error">{authError}</p></main>;
   }

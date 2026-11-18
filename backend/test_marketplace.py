@@ -159,6 +159,31 @@ class MarketplaceFlowTests(unittest.TestCase):
 
             buyer_client = TestClient(main.app)
             with buyer_client:
+                cart_checkout = buyer_client.post(
+                    "/api/cart/checkout",
+                    json={
+                        "request_key": "c" * 32,
+                        "buyer_name": "Buyer Cart",
+                        "buyer_email": "buyer-cart@example.com",
+                        "buyer_phone": "0712345678",
+                        "payment_method": "M-Pesa",
+                        "items": [{"product_id": product_id, "quantity": 2}],
+                    },
+                )
+                self.assertEqual(cart_checkout.status_code, 200)
+                cart = cart_checkout.json()
+                self.assertEqual(len(cart["order_ids"]), 1)
+                cart_status = buyer_client.get(
+                    f"/api/checkouts/{cart['checkout_id']}"
+                ).json()
+                self.assertEqual(cart_status["total_amount"], 10000)
+                self.assertEqual(len(cart_status["splits"]), 1)
+                cart_completed = buyer_client.post(
+                    f"/api/checkouts/{cart['checkout_id']}/demo-complete"
+                )
+                self.assertEqual(cart_completed.status_code, 200)
+                self.assertEqual(cart_completed.json()["payment_status"], "COMPLETED")
+                cart_split_order_id = cart_completed.json()["splits"][0]["order_id"]
                 checkout_payload = {
                     "request_key": "a" * 32,
                     "buyer_name": "Buyer One",
@@ -186,12 +211,16 @@ class MarketplaceFlowTests(unittest.TestCase):
                 self.assertEqual(completed.status_code, 200)
                 self.assertEqual(completed.json()["platform_fee"], 250)
             dashboard = seller_client.get("/api/dashboard").json()
-            self.assertEqual(dashboard["gross_sales"], 5000)
-            self.assertEqual(dashboard["platform_fees"], 250)
-            self.assertEqual(dashboard["net_profit"], 2250)
+            self.assertEqual(dashboard["gross_sales"], 15000)
+            self.assertEqual(dashboard["platform_fees"], 750)
+            self.assertEqual(dashboard["net_profit"], 6750)
 
             archived = seller_client.post(f"/api/sales/{order_id}/archive")
             self.assertEqual(archived.status_code, 200)
+            cart_archived = seller_client.post(
+                f"/api/sales/{cart_split_order_id}/archive"
+            )
+            self.assertEqual(cart_archived.status_code, 200)
             self.assertEqual(seller_client.get("/api/sales").json(), [])
 
         admin_sales = self.client.get("/api/sales").json()
