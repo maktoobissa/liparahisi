@@ -508,27 +508,33 @@ def is_demo_mode():
 
 def public_app_url(request_base_url=None):
     value = os.getenv("PUBLIC_APP_URL", "").strip()
-    if not value and request_base_url:
-        value = str(request_base_url).rstrip("/")
-    if not value:
-        raise HTTPException(
-            status_code=503,
-            detail="Mpangilio PUBLIC_APP_URL haujakamilika.",
-        )
-    value = value.rstrip("/")
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="PUBLIC_APP_URL lazima iwe origin kamili ya http au https bila path.",
-        )
-    return value
+    candidates = [
+        "https://liparahisi.onrender.com",
+        value,
+        str(request_base_url).rstrip("/") if request_base_url else "",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = candidate.rstrip("/")
+        parsed = urlsplit(candidate)
+        host = parsed.hostname or ""
+        if (
+            parsed.scheme == "https"
+            and parsed.netloc
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+            and not host.startswith("192.")
+            and not host.startswith("10.")
+            and not host.startswith("172.")
+            and host not in {"127.0.0.1", "localhost"}
+        ):
+            return candidate
+    raise HTTPException(
+        status_code=503,
+        detail="PUBLIC_APP_URL haukubali: tumia HTTPS origin ya tovuti ya umma.",
+    )
 
 
 def commission_amount(amount):

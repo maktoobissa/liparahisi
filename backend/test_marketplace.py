@@ -228,6 +228,25 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.assertEqual(archived_sale["platform_fee"], 250)
         self.assertIsNotNone(archived_sale["archived_at"])
 
+    def test_public_qr_url_rejects_lan_address(self):
+        with patch.dict(
+            os.environ,
+            {"PUBLIC_APP_URL": "http://192.168.1.11:8000"},
+        ):
+            self.assertEqual(
+                main.public_app_url("http://192.168.1.11:8000"),
+                "https://liparahisi.onrender.com",
+            )
+
+        with patch.dict(
+            os.environ,
+            {"PUBLIC_APP_URL": "https://liparahisi.onrender.com"},
+        ):
+            self.assertEqual(
+                main.public_app_url("http://192.168.1.11:8000"),
+                "https://liparahisi.onrender.com",
+            )
+
     def test_existing_sqlite_products_and_orders_are_migrated(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
         connection = sqlite3.connect(legacy_path)
