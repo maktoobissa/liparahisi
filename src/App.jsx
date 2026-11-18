@@ -207,7 +207,7 @@ function ProductTile({ product, onArchive, canArchive }) {
   useEffect(() => {
     let active = true;
     QRCode.toDataURL(product.qr_url, {
-      width: 190,
+      width: 320,
       margin: 1,
       errorCorrectionLevel: "M",
       color: { dark: "#17251f", light: "#ffffff" },

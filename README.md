@@ -68,7 +68,9 @@ service remains in demo-payment mode.
 5. Sellers register from the app; the administrator approves each seller.
 
 The service's `DATABASE_URL` is connected to the managed Postgres resource.
-The QR contains a product URL; it does not contain payment credentials.
+The QR contains a public product URL at `PUBLIC_APP_URL`; scanning it opens
+the product name, price, and available checkout methods. It does not contain
+payment credentials.
 
 ## Verify
 

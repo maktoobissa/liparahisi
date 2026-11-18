@@ -107,12 +107,24 @@ class MarketplaceFlowTests(unittest.TestCase):
                 json={"email": "seller@example.com", "password": "seller-password-long"},
             )
             self.assertEqual(login.status_code, 200)
-            product = seller_client.post(
-                "/api/products",
-                json={"name": "Kikombe cha kahawa", "amount": 5000, "cost_amount": 2500},
-            )
+            with patch.dict(
+                os.environ,
+                {"PUBLIC_APP_URL": "https://liparahisi.onrender.com"},
+            ):
+                product = seller_client.post(
+                    "/api/products",
+                    json={"name": "Kikombe cha kahawa", "amount": 5000, "cost_amount": 2500},
+                )
             self.assertEqual(product.status_code, 201)
-            product_id = product.json()["id"]
+            product_data = product.json()
+            product_id = product_data["id"]
+            self.assertEqual(
+                product_data["qr_url"],
+                f"https://liparahisi.onrender.com/p/{product_id}",
+            )
+            public_product = seller_client.get(f"/api/products/{product_id}").json()
+            self.assertEqual(public_product["name"], "Kikombe cha kahawa")
+            self.assertEqual(public_product["amount"], 5000)
 
             other_seller_id = self.client.post(
                 "/api/auth/register",
