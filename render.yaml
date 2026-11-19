@@ -9,8 +9,6 @@ services:
         value: "true"
       - key: PUBLIC_APP_URL
         value: https://liparahisi.onrender.com
-      - key: SELCOM_LIVE_ENABLED
-        value: "false"
       - key: SELCOM_BASE_URL
         value: ""
       - key: SELCOM_API_KEY
@@ -19,8 +17,14 @@ services:
         sync: false
       - key: SELCOM_VENDOR
         sync: false
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
       - key: SMTP_HOST
-        value: ""
+        value: smtp.gmail.com
       - key: SMTP_PORT
         value: "587"
       - key: SMTP_USERNAME
@@ -28,7 +32,7 @@ services:
       - key: SMTP_PASSWORD
         sync: false
       - key: SMTP_FROM
-        value: ""
+        sync: false
       - key: SMTP_USE_SSL
         value: "false"
       - key: DATABASE_URL
@@ -37,6 +41,24 @@ services:
           property: connectionString
       - key: ADMIN_SETUP_TOKEN
         generateValue: true
+      - key: ADMIN_SERVICE_TOKEN
+        generateValue: true
+      - key: ADMIN_SERVICE_URL
+        value: ""
+      - key: CATALOG_SERVICE_TOKEN
+        generateValue: true
+      - key: CATALOG_SERVICE_URL
+        value: ""
+      - key: IDENTITY_SERVICE_TOKEN
+        generateValue: true
+      - key: IDENTITY_SERVICE_URL
+        value: ""
+      - key: ORDERS_SERVICE_TOKEN
+        generateValue: true
+      - key: ORDERS_SERVICE_URL
+        value: ""
+      - key: NOTIFICATION_SERVICE_URL
+        value: ""
 
 databases:
   - name: liparahisi-db

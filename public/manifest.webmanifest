@@ -1,10 +1,23 @@
 {
-  "name": "LipaRahisi",
+  "id": "/",
+  "name": "LipaRahisi Marketplace",
   "short_name": "LipaRahisi",
-  "description": "Marketplace ya wauzaji na malipo ya bidhaa",
+  "description": "Marketplace ya wauzaji na malipo ya bidhaa.",
+  "lang": "sw-TZ",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
   "background_color": "#f6f7f4",
   "theme_color": "#16835d",
-  "icons": []
+  "orientation": "portrait-primary",
+  "categories": ["shopping", "finance"],
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
 }

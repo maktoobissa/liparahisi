@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -8,16 +9,23 @@ import sqlite3
 import time
 import csv
 import io
-import smtplib
+import unicodedata
 from contextlib import asynccontextmanager, contextmanager
-from email.message import EmailMessage
+from datetime import date
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlsplit
 
+import httpx
 import psycopg
+from backend.email_delivery import (
+    EmailDeliveryError,
+    deliver_email,
+    email_is_configured,
+    email_provider,
+)
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
@@ -26,6 +34,7 @@ from pydantic import BaseModel, Field, validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+logger = logging.getLogger(__name__)
 
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(PROJECT_ROOT / "backend" / "data.sqlite3")))
 FRONTEND_DIST = PROJECT_ROOT / "dist"
@@ -33,8 +42,10 @@ SESSION_COOKIE = "liparahisi_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
+MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
 PAYMENT_METHODS = {
     "M-Pesa",
+    "Halo Pesa",
     "Tigo Pesa",
     "Airtel Money",
     "NMB",
@@ -134,6 +145,9 @@ def initialize_db():
                 role TEXT NOT NULL,
                 status TEXT NOT NULL,
                 shop_name TEXT NOT NULL DEFAULT '',
+                store_slug TEXT NOT NULL DEFAULT '',
+                store_description TEXT NOT NULL DEFAULT '',
+                store_image_url TEXT NOT NULL DEFAULT '',
                 phone TEXT NOT NULL DEFAULT '',
                 email_verified INTEGER NOT NULL DEFAULT 0,
                 verification_token_hash TEXT NOT NULL DEFAULT '',
@@ -152,12 +166,27 @@ def initialize_db():
             CREATE TABLE IF NOT EXISTS products (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                image_url TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
                 amount INTEGER NOT NULL CHECK (amount > 0),
                 seller_id TEXT REFERENCES users(id),
                 cost_amount INTEGER NOT NULL DEFAULT 0,
                 stock_quantity INTEGER NOT NULL DEFAULT 0,
+                low_stock_threshold INTEGER NOT NULL DEFAULT 5,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS product_images (
+                product_id TEXT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL,
+                image_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
+                updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS categories (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id TEXT PRIMARY KEY,
@@ -184,8 +213,14 @@ def initialize_db():
                 buyer_name TEXT NOT NULL DEFAULT '',
                 buyer_email TEXT NOT NULL DEFAULT '',
                 buyer_phone TEXT NOT NULL DEFAULT '',
+                buyer_id TEXT REFERENCES users(id) ON DELETE SET NULL,
                 payment_method TEXT NOT NULL DEFAULT '',
                 bank_branch TEXT NOT NULL DEFAULT '',
+                delivery_address TEXT NOT NULL DEFAULT '',
+                delivery_status TEXT NOT NULL DEFAULT 'UNFULFILLED',
+                tracking_code TEXT NOT NULL DEFAULT '',
+                delivered_at {timestamp_type},
+                cancelled_at {timestamp_type},
                 payment_status TEXT NOT NULL DEFAULT 'PENDING',
                 checkout_url TEXT,
                 product_cost INTEGER NOT NULL DEFAULT 0,
@@ -213,16 +248,70 @@ def initialize_db():
                 password TEXT NOT NULL,
                 phone TEXT
             );
+            CREATE TABLE IF NOT EXISTS wishlists (
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, product_id)
+            );
+            CREATE TABLE IF NOT EXISTS reviews (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                buyer_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                comment TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (order_id, product_id, buyer_id)
+            );
+            CREATE TABLE IF NOT EXISTS inventory_movements (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                seller_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                actor_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                quantity_delta INTEGER NOT NULL CHECK (quantity_delta != 0),
+                reason TEXT NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS cancellation_requests (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL UNIQUE REFERENCES orders(order_id) ON DELETE CASCADE,
+                requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                admin_note TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                resolved_at {timestamp_type}
+            );
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id TEXT PRIMARY KEY,
+                user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                email TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                admin_response TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
         product_columns = {
             "seller_id": "TEXT",
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "image_url": "TEXT NOT NULL DEFAULT ''",
+            "category": "TEXT NOT NULL DEFAULT ''",
             "cost_amount": "INTEGER NOT NULL DEFAULT 0",
             "stock_quantity": "INTEGER NOT NULL DEFAULT 0",
+            "low_stock_threshold": "INTEGER NOT NULL DEFAULT 5",
             "is_active": "INTEGER NOT NULL DEFAULT 1",
         }
         user_columns = {
+            "store_slug": "TEXT NOT NULL DEFAULT ''",
+            "store_description": "TEXT NOT NULL DEFAULT ''",
+            "store_image_url": "TEXT NOT NULL DEFAULT ''",
             "email_verified": "INTEGER NOT NULL DEFAULT 0",
             "verification_token_hash": "TEXT NOT NULL DEFAULT ''",
             "reset_token_hash": "TEXT NOT NULL DEFAULT ''",
@@ -233,8 +322,14 @@ def initialize_db():
             "buyer_name": "TEXT NOT NULL DEFAULT ''",
             "buyer_email": "TEXT NOT NULL DEFAULT ''",
             "buyer_phone": "TEXT NOT NULL DEFAULT ''",
+            "buyer_id": "TEXT",
             "payment_method": "TEXT NOT NULL DEFAULT ''",
             "bank_branch": "TEXT NOT NULL DEFAULT ''",
+            "delivery_address": "TEXT NOT NULL DEFAULT ''",
+            "delivery_status": "TEXT NOT NULL DEFAULT 'UNFULFILLED'",
+            "tracking_code": "TEXT NOT NULL DEFAULT ''",
+            "delivered_at": timestamp_type,
+            "cancelled_at": timestamp_type,
             "product_cost": "INTEGER NOT NULL DEFAULT 0",
             "provider_fee": "INTEGER NOT NULL DEFAULT 0",
             "platform_fee": "INTEGER NOT NULL DEFAULT 0",
@@ -250,10 +345,27 @@ def initialize_db():
             ensure_column(connection, "products", column, declaration)
         for column, declaration in user_columns.items():
             ensure_column(connection, "users", column, declaration)
+        existing_sellers = connection.execute(
+            """
+            SELECT id, shop_name FROM users
+            WHERE role = 'SELLER' AND (store_slug IS NULL OR store_slug = '')
+            """
+        ).fetchall()
+        for seller in existing_sellers:
+            connection.execute(
+                "UPDATE users SET store_slug = ? WHERE id = ?",
+                (make_store_slug(seller["shop_name"], seller["id"]), seller["id"]),
+            )
         for column, declaration in order_columns.items():
             ensure_column(connection, "orders", column, declaration)
         connection.execute(
             "CREATE INDEX IF NOT EXISTS products_seller_idx ON products(seller_id)"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS users_store_slug_idx
+            ON users(store_slug) WHERE store_slug <> ''
+            """
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS orders_seller_status_idx ON orders(seller_id, payment_status)"
@@ -293,6 +405,13 @@ class SellerRegistrationInput(BaseModel):
     phone: str | None = Field(default=None, max_length=20)
 
 
+class CustomerRegistrationInput(BaseModel):
+    full_name: str = Field(min_length=2, max_length=100)
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=10, max_length=128)
+    phone: str | None = Field(default=None, max_length=20)
+
+
 class LoginInput(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     password: str = Field(min_length=1, max_length=128)
@@ -316,11 +435,19 @@ class SellerStatusInput(BaseModel):
     status: Literal["ACTIVE", "REJECTED", "SUSPENDED"]
 
 
+class CategoryInput(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+
+
 class ProductInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=2000)
+    image_url: str = Field(default="", max_length=2048)
+    category: str = Field(default="", max_length=60)
     amount: int = Field(gt=0, le=999999999)
     cost_amount: int = Field(default=0, ge=0, le=999999999)
     stock_quantity: int = Field(default=0, ge=0, le=999999999)
+    low_stock_threshold: int = Field(default=5, ge=0, le=999999999)
 
     @validator("name")
     def strip_product_name(cls, value):
@@ -329,12 +456,30 @@ class ProductInput(BaseModel):
             raise ValueError("Jina la bidhaa linahitajika.")
         return value
 
+    @validator("category")
+    def normalize_category(cls, value):
+        return value.strip()
+
+    @validator("image_url")
+    def validate_image_url(cls, value):
+        value = value.strip()
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Picha lazima iwe na URL ya HTTP au HTTPS.")
+        return value
+
 
 class ProductUpdateInput(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=2000)
+    image_url: str | None = Field(default=None, max_length=2048)
+    category: str | None = Field(default=None, max_length=60)
     amount: int | None = Field(default=None, gt=0, le=999999999)
     cost_amount: int | None = Field(default=None, ge=0, le=999999999)
     stock_quantity: int | None = Field(default=None, ge=0, le=999999999)
+    low_stock_threshold: int | None = Field(default=None, ge=0, le=999999999)
 
     @validator("name")
     def strip_product_name(cls, value):
@@ -345,6 +490,62 @@ class ProductUpdateInput(BaseModel):
             raise ValueError("Jina la bidhaa linahitajika.")
         return value
 
+    @validator("image_url")
+    def validate_image_url(cls, value):
+        if value is None or value == "":
+            return value
+        parsed = urlsplit(value.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Picha lazima iwe na URL ya HTTP au HTTPS.")
+        return value.strip()
+
+    @validator("category")
+    def normalize_category(cls, value):
+        return value.strip() if value is not None else None
+
+
+class ProductCsvInput(BaseModel):
+    csv_text: str = Field(min_length=1, max_length=1_000_000)
+
+
+class StorefrontInput(BaseModel):
+    shop_name: str = Field(min_length=2, max_length=100)
+    store_description: str = Field(default="", max_length=1000)
+    store_image_url: str = Field(default="", max_length=2048)
+
+
+class DeliveryUpdateInput(BaseModel):
+    delivery_status: Literal["PROCESSING", "SHIPPED", "DELIVERED"]
+    tracking_code: str = Field(default="", max_length=100)
+
+
+class CancellationInput(BaseModel):
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+class CancellationResolutionInput(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+    admin_note: str = Field(default="", max_length=1000)
+
+
+class ReviewInput(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    comment: str = Field(default="", max_length=1000)
+
+
+class ReviewModerationInput(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+
+
+class SupportTicketInput(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    subject: str = Field(min_length=3, max_length=120)
+    message: str = Field(min_length=10, max_length=4000)
+
+
+class SupportTicketUpdateInput(BaseModel):
+    status: Literal["OPEN", "IN_PROGRESS", "RESOLVED"]
+    admin_response: str = Field(default="", max_length=4000)
 
 class CheckoutInput(BaseModel):
     request_key: str = Field(min_length=32, max_length=64)
@@ -353,6 +554,7 @@ class CheckoutInput(BaseModel):
     buyer_phone: str = Field(min_length=9, max_length=20)
     payment_method: str
     bank_branch: str | None = Field(default=None, max_length=100)
+    delivery_address: str = Field(default="", max_length=500)
 
     @validator("buyer_name")
     def strip_buyer_name(cls, value):
@@ -401,6 +603,14 @@ def clean_identity(full_name, email):
     return name, address
 
 
+def make_store_slug(value, suffix=""):
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+    if suffix:
+        slug = f"{slug or 'duka'}-{suffix[:8].lower()}"
+    return slug[:80]
+
+
 def normalize_phone(value):
     if not value:
         return ""
@@ -425,32 +635,50 @@ def hash_password(password):
 
 
 def send_smtp_email(to_email, subject, text):
-    host = os.getenv("SMTP_HOST", "").strip()
-    port = int(os.getenv("SMTP_PORT", "587").strip() or "587")
-    username = os.getenv("SMTP_USERNAME", "").strip()
-    password = os.getenv("SMTP_PASSWORD", "").strip()
-    sender = os.getenv("SMTP_FROM", username).strip()
-    if not host or not username or not password or not sender:
-        raise HTTPException(
-            status_code=503,
-            detail="SMTP haijawekwa. Weka SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD na SMTP_FROM kwenye Render.",
-        )
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = sender
-    message["To"] = to_email
-    message.set_content(text)
-    if os.getenv("SMTP_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}:
-        server = smtplib.SMTP_SSL(host, port, timeout=20)
-    else:
-        server = smtplib.SMTP(host, port, timeout=20)
+    notification_service_url = os.getenv("NOTIFICATION_SERVICE_URL", "").strip()
+    if notification_service_url:
+        service_token = os.getenv("NOTIFICATION_SERVICE_TOKEN", "").strip()
+        if not service_token:
+            raise HTTPException(
+                status_code=503,
+                detail="NOTIFICATION_SERVICE_TOKEN haijawekwa.",
+            )
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                response = client.post(
+                    f"{notification_service_url.rstrip('/')}/internal/emails",
+                    headers={"X-Internal-Token": service_token},
+                    json={
+                        "to_email": to_email,
+                        "subject": subject,
+                        "text": text,
+                    },
+                )
+                response.raise_for_status()
+        except httpx.TimeoutException as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Huduma ya barua pepe haijajibu kwa wakati.",
+            ) from error
+        except httpx.HTTPStatusError as error:
+            raise HTTPException(
+                status_code=502,
+                detail="Huduma ya barua pepe imekataa ombi.",
+            ) from error
+        except httpx.RequestError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Imeshindikana kuwasiliana na huduma ya barua pepe.",
+            ) from error
+        return
+
     try:
-        with server:
-            server.starttls()
-            server.login(username, password)
-            server.send_message(message)
-    except (smtplib.SMTPException, TimeoutError, OSError) as error:
-        raise HTTPException(status_code=502, detail="Imeshindikana kutuma barua pepe.") from error
+        deliver_email(to_email, subject, text)
+    except EmailDeliveryError as error:
+        raise HTTPException(
+            status_code=502 if email_is_configured() else 503,
+            detail=str(error),
+        ) from error
 
 
 def verify_password(password, encoded):
@@ -472,6 +700,7 @@ def verify_password(password, encoded):
 
 
 def safe_user(user):
+    store_slug = user["store_slug"] if "store_slug" in user.keys() else ""
     return {
         "id": user["id"],
         "full_name": user["full_name"],
@@ -479,6 +708,7 @@ def safe_user(user):
         "role": user["role"],
         "status": user["status"],
         "shop_name": user["shop_name"],
+        "store_slug": store_slug,
         "phone": user["phone"],
     }
 
@@ -491,7 +721,8 @@ def get_current_user(request):
     with db_connection() as connection:
         user = connection.execute(
             """
-            SELECT u.id, u.full_name, u.email, u.role, u.status, u.shop_name, u.phone
+            SELECT u.id, u.full_name, u.email, u.role, u.status, u.shop_name,
+                   u.store_slug, u.phone
             FROM sessions s JOIN users u ON u.id = s.user_id
             WHERE s.token_hash = ? AND s.expires_at > ?
             """,
@@ -502,6 +733,17 @@ def get_current_user(request):
     if user["status"] != "ACTIVE":
         raise HTTPException(status_code=403, detail="Akaunti yako haijaidhinishwa.")
     return dict(user)
+
+
+def optional_current_user(request):
+    if not request.cookies.get(SESSION_COOKIE):
+        return None
+    try:
+        return get_current_user(request)
+    except HTTPException as error:
+        if error.status_code == 401:
+            return None
+        raise
 
 
 def require_admin(request):
@@ -515,6 +757,13 @@ def require_seller(request):
     user = get_current_user(request)
     if user["role"] != "SELLER":
         raise HTTPException(status_code=403, detail="Huduma hii ni ya akaunti ya muuzaji.")
+    return user
+
+
+def require_buyer(request):
+    user = get_current_user(request)
+    if user["role"] != "BUYER":
+        raise HTTPException(status_code=403, detail="Huduma hii ni ya akaunti ya mnunuzi.")
     return user
 
 
@@ -576,7 +825,8 @@ def get_product(product_id):
         product = connection.execute(
             """
             SELECT p.id, p.name, p.amount, p.cost_amount, p.stock_quantity, p.seller_id,
-                   u.shop_name, u.full_name AS seller_name
+                   p.description, p.image_url, p.category, p.low_stock_threshold,
+                   u.shop_name, u.full_name AS seller_name, u.store_slug
             FROM products p
             LEFT JOIN users u ON u.id = p.seller_id
             WHERE p.id = ? AND p.is_active = 1
@@ -690,6 +940,18 @@ def complete_demo_order(order_id):
                     )
                     if result.rowcount == 0:
                         raise HTTPException(status_code=409, detail="Stock ya bidhaa imeisha.")
+                    product = connection.execute(
+                        "SELECT seller_id FROM products WHERE id = ?",
+                        (item["product_id"],),
+                    ).fetchone()
+                    record_inventory_movement(
+                        connection,
+                        item["product_id"],
+                        product["seller_id"] if product else order["seller_id"],
+                        None,
+                        -item["quantity"],
+                        "ORDER_SALE",
+                    )
             else:
                 product = connection.execute(
                     "SELECT stock_quantity FROM products WHERE id = ?",
@@ -700,6 +962,18 @@ def complete_demo_order(order_id):
                 connection.execute(
                     "UPDATE products SET stock_quantity = stock_quantity - 1 WHERE id = ?",
                     (order["product_id"],),
+                )
+                product = connection.execute(
+                    "SELECT seller_id FROM products WHERE id = ?",
+                    (order["product_id"],),
+                ).fetchone()
+                record_inventory_movement(
+                    connection,
+                    order["product_id"],
+                    product["seller_id"] if product else order["seller_id"],
+                    None,
+                    -1,
+                    "ORDER_SALE",
                 )
             connection.execute(
                 """
@@ -727,23 +1001,561 @@ def integration_status():
         os.getenv(key, "").strip()
         for key in ("SELCOM_BASE_URL", "SELCOM_API_KEY", "SELCOM_API_SECRET", "SELCOM_VENDOR")
     )
-    smtp_configured = all(
-        os.getenv(key, "").strip()
-        for key in ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM")
-    )
-    live_enabled = (
-        os.getenv("SELCOM_LIVE_ENABLED", "false").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
+    notification_service_url = os.getenv("NOTIFICATION_SERVICE_URL", "").strip()
+    notification_service_available = False
+    configured_email_provider = email_provider()
+    email_configured = False
+    if notification_service_url:
+        notification_service_token = os.getenv(
+            "NOTIFICATION_SERVICE_TOKEN",
+            "",
+        ).strip()
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                response = client.get(
+                    f"{notification_service_url.rstrip('/')}/internal/status",
+                    headers={"X-Internal-Token": notification_service_token},
+                )
+                response.raise_for_status()
+                notification_status = response.json()
+            notification_service_available = True
+            configured_email_provider = notification_status.get(
+                "email_provider",
+                configured_email_provider,
+            )
+            email_configured = notification_status.get(
+                "email_configured",
+                notification_status.get("smtp_configured"),
+            ) is True
+        except (httpx.RequestError, ValueError):
+            email_configured = False
+        except httpx.HTTPStatusError:
+            email_configured = False
+    else:
+        email_configured = email_is_configured()
+    smtp_configured = configured_email_provider == "smtp" and email_configured
     return {
         "demo_mode": is_demo_mode(),
-        "live_payments_enabled": live_enabled,
+        "live_payments_enabled": False,
         "selcom_configured": selcom_configured,
         "smtp_configured": smtp_configured,
+        "email_configured": email_configured,
+        "email_provider": configured_email_provider,
+        "notification_service_available": notification_service_available,
     }
 
 
-@app.get("/api/auth/status")
+def create_internal_service_client(service_name: str):
+    service_url_key = f"{service_name.upper()}_SERVICE_URL"
+    if os.getenv(service_url_key, "").strip():
+        return httpx.AsyncClient(timeout=20.0)
+
+    service_app = IN_PROCESS_SERVICE_APPS.get(service_name)
+    if service_app is None:
+        return httpx.AsyncClient(timeout=20.0)
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=service_app,
+            raise_app_exceptions=False,
+        ),
+        base_url=f"http://{service_name}",
+        timeout=20.0,
+    )
+
+
+def create_admin_service_client():
+    return create_internal_service_client("admin")
+
+
+def create_catalog_service_client():
+    return create_internal_service_client("catalog")
+
+
+def create_identity_service_client():
+    return create_internal_service_client("identity")
+
+
+def create_orders_service_client():
+    return create_internal_service_client("orders")
+
+
+async def proxy_internal_api(
+    request: Request,
+    path: str,
+    service_name: str,
+    service_url_key: str,
+    service_token_key: str,
+    service_token_header: str,
+    create_client,
+):
+    service_url = os.getenv(service_url_key, "").strip().rstrip("/")
+    service_token = os.getenv(service_token_key, "").strip()
+    if not service_token or (
+        not service_url and service_name.lower() not in IN_PROCESS_SERVICE_APPS
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=f"{service_name} API haijawekwa.",
+        )
+
+    hop_by_hop_headers = {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "x-admin-service-token",
+        "x-catalog-service-token",
+        "x-identity-service-token",
+        "x-orders-service-token",
+    }
+    headers = {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower() not in hop_by_hop_headers
+    }
+    headers[service_token_header] = service_token
+
+    try:
+        async with create_client() as client:
+            upstream = await client.request(
+                request.method,
+                f"{service_url}/{path}" if service_url else f"/{path}",
+                params=request.query_params,
+                headers=headers,
+                content=await request.body(),
+            )
+    except httpx.TimeoutException as error:
+        logger.exception("%s API request timed out.", service_name)
+        raise HTTPException(
+            status_code=503,
+            detail=f"{service_name} API haijajibu kwa wakati.",
+        ) from error
+    except httpx.RequestError as error:
+        logger.exception("Could not reach %s API.", service_name)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Imeshindikana kuwasiliana na {service_name} API.",
+        ) from error
+
+    response_headers = {
+        name: value
+        for name, value in upstream.headers.items()
+        if name.lower() not in hop_by_hop_headers
+    }
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
+@app.api_route(
+    "/api/admin/{admin_path:path}",
+    methods=["GET", "PATCH"],
+)
+async def admin_api_gateway(admin_path: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        admin_path,
+        "Admin",
+        "ADMIN_SERVICE_URL",
+        "ADMIN_SERVICE_TOKEN",
+        "X-Admin-Service-Token",
+        create_admin_service_client,
+    )
+
+
+@app.api_route("/api/support-tickets", methods=["GET", "POST"])
+async def support_tickets_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "support-tickets",
+        "Admin",
+        "ADMIN_SERVICE_URL",
+        "ADMIN_SERVICE_TOKEN",
+        "X-Admin-Service-Token",
+        create_admin_service_client,
+    )
+
+
+@app.api_route("/api/products", methods=["GET", "POST"])
+async def catalog_collection_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "products",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/categories", methods=["GET", "POST"])
+async def catalog_categories_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "categories",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/products/import", methods=["POST"])
+async def catalog_products_import_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "products/import",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/products/export", methods=["GET"])
+async def catalog_products_export_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "products/export",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/storefront", methods=["PUT"])
+async def catalog_storefront_update_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "storefront",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/inventory/low-stock", methods=["GET"])
+async def catalog_low_stock_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "inventory/low-stock",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/movements",
+    methods=["GET"],
+)
+async def catalog_stock_movements_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/movements",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/storefronts/{store_slug}", methods=["GET"])
+async def catalog_storefront_gateway(store_slug: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"storefronts/{store_slug}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/wishlist", methods=["GET"])
+async def catalog_wishlist_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "wishlist",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/wishlist/{product_id}",
+    methods=["POST", "DELETE"],
+)
+async def catalog_wishlist_product_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"wishlist/{product_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/image",
+    methods=["GET", "POST", "DELETE"],
+)
+async def catalog_product_image_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/image",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}",
+    methods=["GET", "PUT", "DELETE"],
+)
+async def catalog_product_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/auth/{auth_path:path}",
+    methods=["GET", "POST", "PUT"],
+)
+async def identity_api_gateway(auth_path: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        auth_path,
+        "Identity",
+        "IDENTITY_SERVICE_URL",
+        "IDENTITY_SERVICE_TOKEN",
+        "X-Identity-Service-Token",
+        create_identity_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/checkout",
+    methods=["POST"],
+)
+async def order_product_checkout_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/checkout",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/cart/checkout", methods=["POST"])
+async def order_cart_checkout_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "cart/checkout",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route(
+    "/api/checkouts/{checkout_id}",
+    methods=["GET"],
+)
+async def order_cart_status_gateway(checkout_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"checkouts/{checkout_id}",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route(
+    "/api/checkouts/{checkout_id}/demo-complete",
+    methods=["POST"],
+)
+async def order_cart_demo_gateway(checkout_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"checkouts/{checkout_id}/demo-complete",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/orders/history", methods=["GET"])
+async def order_history_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "orders/history",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/orders/{order_id}", methods=["GET"])
+async def order_status_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/orders/{order_id}/delivery", methods=["PUT"])
+async def order_delivery_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}/delivery",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route(
+    "/api/orders/{order_id}/cancellation",
+    methods=["POST"],
+)
+async def order_cancellation_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}/cancellation",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route(
+    "/api/orders/{order_id}/products/{product_id}/review",
+    methods=["POST"],
+)
+async def order_review_gateway(order_id: str, product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}/products/{product_id}/review",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route(
+    "/api/orders/{order_id}/demo-complete",
+    methods=["POST"],
+)
+async def order_demo_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}/demo-complete",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/dashboard", methods=["GET"])
+async def order_dashboard_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "dashboard",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/sales", methods=["GET"])
+async def order_sales_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "sales",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/sales/{order_id}/archive", methods=["POST"])
+async def order_archive_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"sales/{order_id}/archive",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
 def auth_status(request: Request):
     with db_connection() as connection:
         admin = connection.execute(
@@ -762,7 +1574,6 @@ def auth_status(request: Request):
     }
 
 
-@app.post("/api/auth/setup")
 def setup_admin(payload: AdminSetupInput, request: Request, response: Response):
     expected_token = os.getenv("ADMIN_SETUP_TOKEN", "").strip()
     if not expected_token:
@@ -816,7 +1627,6 @@ def setup_admin(payload: AdminSetupInput, request: Request, response: Response):
     return {"user": {"id": user_id, "full_name": full_name, "email": email, "role": "ADMIN", "status": "ACTIVE", "shop_name": "LipaRahisi", "phone": ""}}
 
 
-@app.post("/api/auth/register", status_code=201)
 def register_seller(payload: SellerRegistrationInput, request: Request):
     full_name, email = clean_identity(payload.full_name, payload.email)
     shop_name = payload.shop_name.strip()
@@ -841,6 +1651,10 @@ def register_seller(payload: SellerRegistrationInput, request: Request):
                     phone,
                 ),
             )
+            connection.execute(
+                "UPDATE users SET store_slug = ? WHERE id = ?",
+                (make_store_slug(shop_name, user_id), user_id),
+            )
             verification_token = secrets.token_urlsafe(32)
             verification_hash = hashlib.sha256(verification_token.encode("utf-8")).hexdigest()
             connection.execute(
@@ -854,6 +1668,7 @@ def register_seller(payload: SellerRegistrationInput, request: Request):
                 detail="Barua pepe hii tayari imesajiliwa.",
             ) from error
         raise
+    email_delivery_notice = ""
     try:
         app_url = public_app_url(str(request.base_url))
         send_smtp_email(
@@ -861,15 +1676,51 @@ def register_seller(payload: SellerRegistrationInput, request: Request):
             "LipaRahisi — thibitisha akaunti",
             f"Thibitisha akaunti: {app_url}/verify-email?token={quote(verification_token, safe='')}",
         )
-    except HTTPException:
-        pass
+    except HTTPException as error:
+        logger.warning("Seller verification email was not sent: %s", error.detail)
+        email_delivery_notice = f" Barua pepe ya uthibitisho haikutumwa: {error.detail}"
     return {
         "status": "PENDING",
-        "message": "Usajili umepokelewa. Msimamizi mkuu ataidhinisha akaunti yako kabla ya kuuza.",
+        "message": (
+            "Usajili umehifadhiwa. Msimamizi mkuu ataidhinisha akaunti yako kabla ya kuuza."
+            + email_delivery_notice
+        ),
     }
 
 
-@app.post("/api/auth/login")
+def register_customer(payload: CustomerRegistrationInput):
+    full_name, email = clean_identity(payload.full_name, payload.email)
+    phone = normalize_phone(payload.phone)
+    user_id = secrets.token_hex(16)
+    try:
+        with db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO users
+                    (id, full_name, email, password_hash, role, status, phone)
+                VALUES (?, ?, ?, ?, 'BUYER', 'ACTIVE', ?)
+                """,
+                (
+                    user_id,
+                    full_name,
+                    email,
+                    hash_password(payload.password),
+                    phone,
+                ),
+            )
+    except Exception as error:
+        if is_integrity_error(error):
+            raise HTTPException(
+                status_code=409,
+                detail="Barua pepe hii tayari imesajiliwa.",
+            ) from error
+        raise
+    return {
+        "message": "Akaunti ya mnunuzi imefunguliwa. Sasa unaweza kuingia.",
+        "user_id": user_id,
+    }
+
+
 def login(payload: LoginInput, request: Request, response: Response):
     email = payload.email.strip().lower()
     with db_connection() as connection:
@@ -919,7 +1770,6 @@ def login(payload: LoginInput, request: Request, response: Response):
     return {"user": result}
 
 
-@app.post("/api/auth/logout")
 def logout(request: Request, response: Response):
     token = request.cookies.get(SESSION_COOKIE)
     if token:
@@ -930,8 +1780,7 @@ def logout(request: Request, response: Response):
     return {"message": "Umetoka kwenye akaunti."}
 
 
-@app.put("/api/auth/password")
-def change_password(payload: PasswordChangeInput, request: Request):
+def change_password(payload: PasswordChangeInput, request: Request, response: Response):
     user = get_current_user(request)
     with db_connection() as connection:
         row = connection.execute(
@@ -944,10 +1793,12 @@ def change_password(payload: PasswordChangeInput, request: Request):
             "UPDATE users SET password_hash = ? WHERE id = ?",
             (hash_password(payload.new_password), user["id"]),
         )
+        connection.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+        token = create_session(connection, user["id"])
+    set_session_cookie(response, request, token)
     return {"message": "Nenosiri limebadilishwa."}
 
 
-@app.post("/api/auth/password-reset/request")
 def request_password_reset(payload: PasswordResetRequestInput, request: Request):
     email = payload.email.strip().lower()
     with db_connection() as connection:
@@ -973,7 +1824,6 @@ def request_password_reset(payload: PasswordResetRequestInput, request: Request)
     return {"message": "Ikiwa akaunti ipo, link ya kubadilisha nenosiri imetumwa."}
 
 
-@app.post("/api/auth/password-reset/confirm")
 def confirm_password_reset(payload: PasswordResetInput):
     reset_hash = hashlib.sha256(payload.reset_token.encode("utf-8")).hexdigest()
     with db_connection() as connection:
@@ -987,10 +1837,10 @@ def confirm_password_reset(payload: PasswordResetInput):
             "UPDATE users SET password_hash = ?, reset_token_hash = '', reset_expires = 0 WHERE id = ?",
             (hash_password(payload.new_password), user["id"]),
         )
+        connection.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
     return {"message": "Nenosiri limebadilishwa."}
 
 
-@app.get("/api/auth/verify-email")
 def verify_email(token: str):
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with db_connection() as connection:
@@ -1007,11 +1857,76 @@ def verify_email(token: str):
     return {"message": "Barua pepe imethibitishwa."}
 
 
-@app.get("/api/products")
-def list_products(request: Request, q: str = "", seller: str = "", min_amount: int = 0, max_amount: int = 999999999):
-    user = get_current_user(request)
+def update_storefront(payload: StorefrontInput, request: Request):
+    user = require_seller(request)
+    shop_name = payload.shop_name.strip()
+    store_slug = make_store_slug(shop_name, user["id"])
+    image_url = payload.store_image_url.strip()
+    if image_url:
+        parsed = urlsplit(image_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise HTTPException(status_code=422, detail="Picha lazima iwe na URL ya HTTP au HTTPS.")
+    with db_connection() as connection:
+        connection.execute(
+            """
+            UPDATE users
+            SET shop_name = ?, store_slug = ?, store_description = ?, store_image_url = ?
+            WHERE id = ? AND role = 'SELLER'
+            """,
+            (
+                shop_name,
+                store_slug,
+                payload.store_description.strip(),
+                image_url,
+                user["id"],
+            ),
+        )
+    return {
+        "shop_name": shop_name,
+        "store_slug": store_slug,
+        "store_description": payload.store_description.strip(),
+        "store_image_url": image_url,
+    }
+
+
+def read_storefront(store_slug: str):
+    with db_connection() as connection:
+        seller = connection.execute(
+            """
+            SELECT id, full_name, shop_name, store_slug, store_description,
+                   store_image_url
+            FROM users
+            WHERE store_slug = ? AND role = 'SELLER' AND status = 'ACTIVE'
+            """,
+            (store_slug,),
+        ).fetchone()
+        if seller is None:
+            raise HTTPException(status_code=404, detail="Duka halikupatikana.")
+        products = connection.execute(
+            """
+            SELECT id, name, description, image_url, category, amount,
+                   stock_quantity, created_at
+            FROM products
+            WHERE seller_id = ? AND is_active = 1
+            ORDER BY created_at DESC
+            """,
+            (seller["id"],),
+        ).fetchall()
+    return {"store": dict(seller), "products": [dict(row) for row in products]}
+
+
+def list_products(
+    request: Request,
+    q: str = "",
+    seller: str = "",
+    min_amount: int = 0,
+    max_amount: int = 999999999,
+    category: str = "",
+):
+    user = optional_current_user(request)
     search = q.strip().lower()
     seller_search = seller.strip().lower()
+    category_search = category.strip().lower()
     terms = ["p.amount >= ?", "p.amount <= ?"]
     params = [max(0, min_amount), max(0, max_amount)]
     if search:
@@ -1020,12 +1935,16 @@ def list_products(request: Request, q: str = "", seller: str = "", min_amount: i
     if seller_search:
         terms.append("LOWER(COALESCE(u.shop_name, '')) LIKE ?")
         params.append(f"%{seller_search}%")
+    if category_search:
+        terms.append("LOWER(p.category) = ?")
+        params.append(category_search)
     where = " AND ".join(terms)
     with db_connection() as connection:
-        if user["role"] == "ADMIN":
+        if user and user["role"] == "ADMIN":
             rows = connection.execute(
                 """
-                SELECT p.id, p.name, p.amount, p.cost_amount, p.is_active,
+                SELECT p.id, p.name, p.description, p.image_url, p.category,
+                       p.amount, p.cost_amount, p.is_active, p.low_stock_threshold,
                        p.stock_quantity, p.seller_id, p.created_at, u.shop_name
                 FROM products p LEFT JOIN users u ON u.id = p.seller_id
                 WHERE """ + where + """
@@ -1033,16 +1952,31 @@ def list_products(request: Request, q: str = "", seller: str = "", min_amount: i
                 """,
                 tuple(params),
             ).fetchall()
-        else:
+        elif user and user["role"] == "SELLER":
             rows = connection.execute(
                 """
-                SELECT p.id, p.name, p.amount, p.cost_amount, p.is_active,
+                SELECT p.id, p.name, p.description, p.image_url, p.category,
+                       p.amount, p.cost_amount, p.is_active, p.low_stock_threshold,
                        p.stock_quantity, p.seller_id, p.created_at, '' AS shop_name
                 FROM products p LEFT JOIN users u ON u.id = p.seller_id
                 WHERE p.seller_id = ? AND """ + where + """
                 ORDER BY p.created_at DESC
                 """,
                 (user["id"], *params),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT p.id, p.name, p.description, p.image_url, p.category,
+                       p.amount, p.cost_amount, p.is_active, p.low_stock_threshold,
+                       p.stock_quantity, p.seller_id, p.created_at, u.shop_name
+                FROM products p LEFT JOIN users u ON u.id = p.seller_id
+                WHERE p.is_active = 1
+                  AND (p.seller_id IS NULL OR u.status = 'ACTIVE')
+                  AND """ + where + """
+                ORDER BY p.created_at DESC
+                """,
+                tuple(params),
             ).fetchall()
     app_url = public_app_url(str(request.base_url))
     return [
@@ -1055,7 +1989,255 @@ def list_products(request: Request, q: str = "", seller: str = "", min_amount: i
     ]
 
 
-@app.post("/api/products", status_code=201)
+def record_inventory_movement(
+    connection,
+    product_id,
+    seller_id,
+    actor_id,
+    quantity_delta,
+    reason,
+):
+    if not quantity_delta:
+        return
+    connection.execute(
+        """
+        INSERT INTO inventory_movements
+            (id, product_id, seller_id, actor_id, quantity_delta, reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            secrets.token_hex(16),
+            product_id,
+            seller_id,
+            actor_id,
+            quantity_delta,
+            reason,
+        ),
+    )
+
+
+def list_categories():
+    with db_connection() as connection:
+        rows = connection.execute(
+            "SELECT id, name FROM categories ORDER BY name"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_category(payload: CategoryInput, request: Request):
+    actor = require_admin(request)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Jina la kundi linahitajika.")
+    category_id = secrets.token_hex(16)
+    try:
+        with db_connection() as connection:
+            connection.execute(
+                "INSERT INTO categories (id, name) VALUES (?, ?)",
+                (category_id, name),
+            )
+    except Exception as error:
+        if is_integrity_error(error):
+            raise HTTPException(status_code=409, detail="Kundi hili tayari lipo.") from error
+        raise
+    record_audit("CATEGORY_CREATED", "category", category_id, name, actor=actor, request=request)
+    return {"id": category_id, "name": name}
+
+
+def low_stock_products(request: Request):
+    user = get_current_user(request)
+    seller_filter = "" if user["role"] == "ADMIN" else "AND p.seller_id = ?"
+    parameters = () if user["role"] == "ADMIN" else (user["id"],)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT p.id, p.name, p.category, p.stock_quantity,
+                   p.low_stock_threshold, p.seller_id, u.shop_name
+            FROM products p
+            LEFT JOIN users u ON u.id = p.seller_id
+            WHERE p.is_active = 1
+              AND p.stock_quantity <= p.low_stock_threshold
+            """ + seller_filter + """
+            ORDER BY p.stock_quantity ASC, p.name
+            """,
+            parameters,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def product_inventory_movements(product_id: str, request: Request):
+    user = get_current_user(request)
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or (
+            user["role"] != "ADMIN" and product["seller_id"] != user["id"]
+        ):
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        rows = connection.execute(
+            """
+            SELECT id, quantity_delta, reason, created_at
+            FROM inventory_movements
+            WHERE product_id = ?
+            ORDER BY created_at DESC
+            """,
+            (product_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_to_wishlist(product_id: str, request: Request):
+    user = require_buyer(request)
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT id FROM products WHERE id = ? AND is_active = 1",
+            (product_id,),
+        ).fetchone()
+        if product is None:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        connection.execute(
+            """
+            INSERT INTO wishlists (user_id, product_id) VALUES (?, ?)
+            ON CONFLICT (user_id, product_id) DO NOTHING
+            """,
+            (user["id"], product_id),
+        )
+    return {"message": "Bidhaa imeongezwa kwenye vipendwa."}
+
+
+def remove_from_wishlist(product_id: str, request: Request):
+    user = require_buyer(request)
+    with db_connection() as connection:
+        connection.execute(
+            "DELETE FROM wishlists WHERE user_id = ? AND product_id = ?",
+            (user["id"], product_id),
+        )
+    return {"message": "Bidhaa imeondolewa kwenye vipendwa."}
+
+
+def list_wishlist(request: Request):
+    user = require_buyer(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT p.id, p.name, p.description, p.image_url, p.category,
+                   p.amount, p.stock_quantity, u.shop_name
+            FROM wishlists w
+            JOIN products p ON p.id = w.product_id
+            LEFT JOIN users u ON u.id = p.seller_id
+            WHERE w.user_id = ? AND p.is_active = 1
+            ORDER BY w.created_at DESC
+            """,
+            (user["id"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def export_products(request: Request):
+    user = get_current_user(request)
+    with db_connection() as connection:
+        if user["role"] == "ADMIN":
+            rows = connection.execute(
+                """
+                SELECT id, name, description, image_url, category, amount,
+                       cost_amount, stock_quantity, low_stock_threshold
+                FROM products ORDER BY created_at DESC
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT id, name, description, image_url, category, amount,
+                       cost_amount, stock_quantity, low_stock_threshold
+                FROM products WHERE seller_id = ? ORDER BY created_at DESC
+                """,
+                (user["id"],),
+            ).fetchall()
+    output = io.StringIO()
+    fields = [
+        "id", "name", "description", "image_url", "category", "amount",
+        "cost_amount", "stock_quantity", "low_stock_threshold",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({
+            key: spreadsheet_safe_cell(value)
+            for key, value in dict(row).items()
+        })
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=liparahisi-products.csv"},
+    )
+
+
+def spreadsheet_safe_cell(value):
+    if not isinstance(value, str):
+        return value
+    trimmed = value.lstrip(" \t\r\n")
+    if value.startswith(("\t", "\r", "\n")) or (
+        trimmed and trimmed[0] in "=+-@"
+    ):
+        return "'" + value
+    return value
+
+
+def import_products(payload: ProductCsvInput, request: Request):
+    user = require_seller(request)
+    csv_text = payload.csv_text
+    if len(csv_text.encode("utf-8")) > 1_000_000:
+        raise HTTPException(status_code=413, detail="Faili ya bidhaa imezidi 1 MB.")
+    try:
+        reader = csv.DictReader(io.StringIO(csv_text))
+        required = {"name", "amount"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            raise ValueError("CSV lazima iwe na safu za name na amount.")
+        rows = list(reader)
+        if not rows or len(rows) > 500:
+            raise ValueError("CSV iwe na bidhaa 1 hadi 500.")
+        payloads = [ProductInput(**row) for row in rows]
+    except (csv.Error, ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail=f"CSV si sahihi: {error}") from error
+    imported = []
+    with db_connection() as connection:
+        for payload in payloads:
+            product_id = secrets.token_hex(16)
+            connection.execute(
+                """
+                INSERT INTO products
+                    (id, name, description, image_url, category, amount,
+                     seller_id, cost_amount, stock_quantity, low_stock_threshold)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    product_id,
+                    payload.name,
+                    payload.description.strip(),
+                    payload.image_url.strip(),
+                    payload.category,
+                    payload.amount,
+                    user["id"],
+                    payload.cost_amount,
+                    payload.stock_quantity,
+                    payload.low_stock_threshold,
+                ),
+            )
+            if payload.stock_quantity:
+                record_inventory_movement(
+                    connection,
+                    product_id,
+                    user["id"],
+                    user["id"],
+                    payload.stock_quantity,
+                    "CSV_IMPORT",
+                )
+            imported.append(product_id)
+    return {"imported_count": len(imported), "product_ids": imported}
+
+
 def create_product(payload: ProductInput, request: Request):
     user = get_current_user(request)
     if user["role"] != "SELLER":
@@ -1065,31 +2247,48 @@ def create_product(payload: ProductInput, request: Request):
         connection.execute(
             """
             INSERT INTO products
-                (id, name, amount, seller_id, cost_amount, stock_quantity)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (id, name, description, image_url, category, amount, seller_id,
+                 cost_amount, stock_quantity, low_stock_threshold)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 product_id,
                 payload.name,
+                payload.description.strip(),
+                payload.image_url.strip(),
+                payload.category,
                 payload.amount,
                 user["id"],
                 payload.cost_amount,
                 payload.stock_quantity,
+                payload.low_stock_threshold,
             ),
         )
+        if payload.stock_quantity:
+            record_inventory_movement(
+                connection,
+                product_id,
+                user["id"],
+                user["id"],
+                payload.stock_quantity,
+                "INITIAL_STOCK",
+            )
     record_audit("PRODUCT_CREATED", "product", product_id, payload.name, actor=user, request=request)
     app_url = public_app_url(str(request.base_url))
     return {
         "id": product_id,
         "name": payload.name,
+        "description": payload.description.strip(),
+        "image_url": payload.image_url.strip(),
+        "category": payload.category,
         "amount": payload.amount,
         "cost_amount": payload.cost_amount,
         "stock_quantity": payload.stock_quantity,
+        "low_stock_threshold": payload.low_stock_threshold,
         "qr_url": f"{app_url}/p/{product_id}",
     }
 
 
-@app.put("/api/products/{product_id}")
 def update_product(product_id: str, payload: ProductUpdateInput, request: Request):
     user = get_current_user(request)
     with db_connection() as connection:
@@ -1102,24 +2301,60 @@ def update_product(product_id: str, payload: ProductUpdateInput, request: Reques
         if user["role"] != "ADMIN" and product["seller_id"] != user["id"]:
             raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
         name = payload.name if payload.name is not None else product["name"]
+        description = payload.description if payload.description is not None else product["description"]
+        image_url = payload.image_url if payload.image_url is not None else product["image_url"]
+        category = payload.category if payload.category is not None else product["category"]
         amount = payload.amount if payload.amount is not None else product["amount"]
         cost_amount = payload.cost_amount if payload.cost_amount is not None else product["cost_amount"]
         stock_quantity = payload.stock_quantity if payload.stock_quantity is not None else product["stock_quantity"]
-        connection.execute(
-            "UPDATE products SET name = ?, amount = ?, cost_amount = ?, stock_quantity = ? WHERE id = ?",
-            (name, amount, cost_amount, stock_quantity, product_id),
+        low_stock_threshold = (
+            payload.low_stock_threshold
+            if payload.low_stock_threshold is not None
+            else product["low_stock_threshold"]
         )
+        connection.execute(
+            """
+            UPDATE products
+            SET name = ?, description = ?, image_url = ?, category = ?, amount = ?,
+                cost_amount = ?, stock_quantity = ?, low_stock_threshold = ?
+            WHERE id = ?
+            """,
+            (
+                name,
+                description,
+                image_url,
+                category,
+                amount,
+                cost_amount,
+                stock_quantity,
+                low_stock_threshold,
+                product_id,
+            ),
+        )
+        stock_delta = stock_quantity - product["stock_quantity"]
+        if stock_delta:
+            record_inventory_movement(
+                connection,
+                product_id,
+                product["seller_id"],
+                user["id"],
+                stock_delta,
+                "MANUAL_ADJUSTMENT",
+            )
     record_audit("PRODUCT_UPDATED", "product", product_id, f"{name} stock={stock_quantity}", actor=user, request=request)
     return {
         "id": product_id,
         "name": name,
+        "description": description,
+        "image_url": image_url,
+        "category": category,
         "amount": amount,
         "cost_amount": cost_amount,
         "stock_quantity": stock_quantity,
+        "low_stock_threshold": low_stock_threshold,
     }
 
 
-@app.delete("/api/products/{product_id}")
 def archive_product(product_id: str, request: Request):
     user = get_current_user(request)
     with db_connection() as connection:
@@ -1133,19 +2368,111 @@ def archive_product(product_id: str, request: Request):
     return {"message": "Bidhaa imeondolewa kwenye orodha ya mauzo."}
 
 
-@app.get("/api/products/{product_id}")
 def read_product(product_id: str):
     product = get_product(product_id)
     return {
         "id": product["id"],
         "name": product["name"],
+        "description": product["description"],
+        "image_url": product["image_url"],
+        "category": product["category"],
         "amount": product["amount"],
         "stock_quantity": product["stock_quantity"],
         "shop_name": product["shop_name"] or product["seller_name"] or "Muuzaji",
+        "store_slug": product["store_slug"] or "",
+        **list_product_reviews(product["id"]),
     }
 
 
-@app.post("/api/products/{product_id}/checkout")
+def upload_product_image(
+    product_id: str,
+    request: Request,
+    image: UploadFile = File(...),
+):
+    seller = require_seller(request)
+    declared_length = request.headers.get("content-length")
+    if declared_length and declared_length.isdigit() and int(declared_length) > MAX_PRODUCT_IMAGE_BYTES + 65536:
+        raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
+
+    content_type = (image.content_type or "").lower()
+    signatures = {
+        "image/jpeg": lambda data: data.startswith(b"\xff\xd8\xff"),
+        "image/png": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/webp": lambda data: len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+    }
+    if content_type not in signatures:
+        raise HTTPException(status_code=415, detail="Tumia picha ya JPEG, PNG au WebP.")
+    image_data = image.file.read(MAX_PRODUCT_IMAGE_BYTES + 1)
+    if len(image_data) > MAX_PRODUCT_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
+    if not image_data or not signatures[content_type](image_data):
+        raise HTTPException(status_code=422, detail="Faili halilingani na aina ya picha iliyochaguliwa.")
+
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        image_url = f"/api/products/{product_id}/image"
+        connection.execute(
+            """
+            INSERT INTO product_images (product_id, content_type, image_data)
+            VALUES (?, ?, ?)
+            ON CONFLICT (product_id) DO UPDATE SET
+                content_type = excluded.content_type,
+                image_data = excluded.image_data,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (product_id, content_type, image_data),
+        )
+        connection.execute(
+            "UPDATE products SET image_url = ? WHERE id = ?",
+            (image_url, product_id),
+        )
+    return {"product_id": product_id, "image_url": image_url}
+
+
+def read_product_image(product_id: str):
+    with db_connection() as connection:
+        image = connection.execute(
+            "SELECT content_type, image_data FROM product_images WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()
+    if image is None:
+        raise HTTPException(status_code=404, detail="Picha ya bidhaa haikupatikana.")
+    return Response(
+        content=image["image_data"],
+        media_type=image["content_type"],
+        headers={
+            "Cache-Control": "public, max-age=0, must-revalidate",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def delete_product_image(product_id: str, request: Request):
+    seller = require_seller(request)
+    image_url = f"/api/products/{product_id}/image"
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        connection.execute(
+            "DELETE FROM product_images WHERE product_id = ?",
+            (product_id,),
+        )
+        connection.execute(
+            "UPDATE products SET image_url = '' WHERE id = ? AND image_url = ?",
+            (product_id, image_url),
+        )
+    return {"product_id": product_id, "image_url": ""}
+
+
 def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
     if not is_demo_mode():
         raise HTTPException(
@@ -1174,15 +2501,18 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
             return {"order_id": order["order_id"], "payment_status": order["payment_status"], "demo": True}
 
     order_id = "DEMO" + secrets.token_hex(10).upper()
+    buyer = optional_current_user(request)
+    buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     try:
         with db_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO orders
                     (order_id, request_key, product_id, seller_id, amount,
-                     buyer_name, buyer_email, buyer_phone, payment_method, bank_branch,
+                     buyer_name, buyer_email, buyer_phone, buyer_id,
+                     payment_method, bank_branch, delivery_address,
                      product_cost, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -1193,8 +2523,10 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                     payload.buyer_name.strip(),
                     payload.buyer_email,
                     payload.buyer_phone,
+                    buyer_id,
                     payload.payment_method,
                     payload.bank_branch or "",
+                    payload.delivery_address.strip(),
                     product["cost_amount"],
                     time.time() + ORDER_TTL_SECONDS,
                 ),
@@ -1233,7 +2565,6 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
     return {"order_id": order_id, "checkout_url": checkout_url, "demo": True}
 
 
-@app.post("/api/cart/checkout")
 def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     if not is_demo_mode():
         raise HTTPException(
@@ -1244,6 +2575,8 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         raise HTTPException(status_code=422, detail="Chagua tawi la benki.")
 
     merged = {}
+    buyer = optional_current_user(request)
+    buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     with db_connection() as connection:
         for item in payload.items:
             product = connection.execute(
@@ -1271,7 +2604,7 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             (payload.request_key,),
         ).fetchone()
         if existing:
-            return get_cart_checkout(existing["checkout_id"])
+            return get_cart_checkout(existing["checkout_id"], request)
 
         checkout_id = "CART" + secrets.token_hex(16).upper()
         expires_at = time.time() + ORDER_TTL_SECONDS
@@ -1288,10 +2621,11 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                 """
                 INSERT INTO orders
                     (order_id, request_key, product_id, seller_id, amount,
-                     buyer_name, buyer_email, buyer_phone, payment_method, bank_branch,
+                     buyer_name, buyer_email, buyer_phone, buyer_id,
+                     payment_method, bank_branch, delivery_address,
                      product_cost, platform_fee, seller_payout, net_profit,
                      checkout_id, cart_request_key, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -1302,8 +2636,10 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     payload.buyer_name.strip(),
                     payload.buyer_email,
                     payload.buyer_phone,
+                    buyer_id,
                     payload.payment_method,
                     payload.bank_branch or "",
+                    payload.delivery_address.strip(),
                     product_cost,
                     fee,
                     payout,
@@ -1345,7 +2681,7 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     }
 
 
-def get_cart_checkout(checkout_id):
+def get_cart_checkout(checkout_id: str, request: Request):
     expire_pending_orders()
     with db_connection() as connection:
         orders = connection.execute(
@@ -1382,32 +2718,40 @@ def get_cart_checkout(checkout_id):
             "seller_payout": row["seller_payout"],
             "items": [dict(item) for item in items],
         })
-    return {
+    result = {
         "checkout_id": checkout_id,
         "payment_status": "COMPLETED" if all(split["payment_status"] == "COMPLETED" for split in splits)
         else "EXPIRED" if all(split["payment_status"] == "EXPIRED" for split in splits)
         else "PENDING",
-        "buyer_name": orders[0]["buyer_name"],
-        "buyer_email": orders[0]["buyer_email"],
-        "buyer_phone": orders[0]["buyer_phone"],
         "payment_method": orders[0]["payment_method"],
-        "bank_branch": orders[0]["bank_branch"],
         "expires_at": orders[0]["expires_at"],
         "demo": True,
+        "commission_percent": COMMISSION_PERCENT,
         "total_amount": sum(split["amount"] for split in splits),
         "platform_fee": sum(split["platform_fee"] for split in splits),
         "completed_at": next((row["completed_at"] for row in orders if row["completed_at"]), None),
         "splits": splits,
     }
+    buyer = optional_current_user(request)
+    if (
+        buyer
+        and buyer["role"] == "BUYER"
+        and all(order["buyer_id"] == buyer["id"] for order in orders)
+    ):
+        result.update({
+            "buyer_name": orders[0]["buyer_name"],
+            "buyer_email": orders[0]["buyer_email"],
+            "buyer_phone": orders[0]["buyer_phone"],
+            "bank_branch": orders[0]["bank_branch"],
+        })
+    return result
 
 
-@app.get("/api/checkouts/{checkout_id}")
-def read_cart_checkout(checkout_id: str):
-    return get_cart_checkout(checkout_id)
+def read_cart_checkout(checkout_id: str, request: Request):
+    return get_cart_checkout(checkout_id, request)
 
 
-@app.post("/api/checkouts/{checkout_id}/demo-complete")
-def complete_cart_checkout(checkout_id: str):
+def complete_cart_checkout(checkout_id: str, request: Request):
     if not is_demo_mode():
         raise HTTPException(status_code=404, detail="Endpoint ya majaribio imezimwa.")
     expire_pending_orders()
@@ -1422,11 +2766,10 @@ def complete_cart_checkout(checkout_id: str):
         raise HTTPException(status_code=410, detail="Kikapu hiki kimekwisha muda; anzisha oda mpya.")
     for order in orders:
         complete_demo_order(order["order_id"])
-    return get_cart_checkout(checkout_id)
+    return get_cart_checkout(checkout_id, request)
 
 
-@app.get("/api/orders/{order_id}")
-def order_status(order_id: str):
+def order_status(order_id: str, request: Request):
     order = get_order(order_id)
     if not is_demo_mode():
         raise HTTPException(status_code=503, detail="Hali ya malipo halisi haijaunganishwa.")
@@ -1435,22 +2778,401 @@ def order_status(order_id: str):
             "SELECT name FROM products WHERE id = ?",
             (order["product_id"],),
         ).fetchone()
-    return {
+    result = {
         "order_id": order_id,
         "payment_status": order["payment_status"],
         "amount": order["amount"],
         "product_name": product["name"] if product else "Bidhaa",
-        "buyer_name": order["buyer_name"],
         "payment_method": order["payment_method"],
-        "bank_branch": order["bank_branch"],
         "completed_at": order["completed_at"],
         "platform_fee": order["platform_fee"],
         "seller_payout": order["seller_payout"],
+        "commission_percent": COMMISSION_PERCENT,
         "demo": True,
+    }
+    buyer = optional_current_user(request)
+    if buyer and buyer["role"] == "BUYER" and buyer["id"] == order["buyer_id"]:
+        result.update({
+            "buyer_name": order["buyer_name"],
+            "bank_branch": order["bank_branch"],
+            "delivery_address": order["delivery_address"],
+            "delivery_status": order["delivery_status"],
+            "tracking_code": order["tracking_code"],
+        })
+    return result
+
+
+def order_history(request: Request):
+    buyer = require_buyer(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT o.order_id, o.product_id, o.amount, o.payment_status,
+                   o.delivery_status, o.tracking_code, o.delivery_address,
+                   o.created_at, o.completed_at, p.name AS product_name,
+                   p.image_url, u.shop_name
+            FROM orders o
+            JOIN products p ON p.id = o.product_id
+            LEFT JOIN users u ON u.id = o.seller_id
+            WHERE o.buyer_id = ?
+            ORDER BY o.created_at DESC
+            LIMIT 200
+            """,
+            (buyer["id"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Request):
+    actor = get_current_user(request)
+    with db_connection() as connection:
+        order = connection.execute(
+            "SELECT seller_id, payment_status, delivery_status FROM orders WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if order is None or (
+            actor["role"] != "ADMIN" and order["seller_id"] != actor["id"]
+        ):
+            raise HTTPException(status_code=404, detail="Oda haikupatikana.")
+        if order["payment_status"] != "COMPLETED":
+            raise HTTPException(status_code=409, detail="Delivery huanza oda ikikamilika.")
+        transitions = {
+            "UNFULFILLED": {"PROCESSING"},
+            "PROCESSING": {"SHIPPED"},
+            "SHIPPED": {"DELIVERED"},
+            "DELIVERED": set(),
+        }
+        if (
+            payload.delivery_status != order["delivery_status"]
+            and payload.delivery_status not in transitions.get(order["delivery_status"], set())
+        ):
+            raise HTTPException(status_code=409, detail="Hatua ya delivery haiwezi kurukwa au kurudishwa nyuma.")
+        connection.execute(
+            """
+            UPDATE orders
+            SET delivery_status = ?, tracking_code = ?,
+                delivered_at = CASE WHEN ? = 'DELIVERED' THEN CURRENT_TIMESTAMP ELSE delivered_at END
+            WHERE order_id = ?
+            """,
+            (payload.delivery_status, payload.tracking_code.strip(), payload.delivery_status, order_id),
+        )
+    record_audit(
+        "DELIVERY_STATUS_UPDATED",
+        "order",
+        order_id,
+        payload.delivery_status,
+        actor=actor,
+        request=request,
+    )
+    return {
+        "order_id": order_id,
+        "delivery_status": payload.delivery_status,
+        "tracking_code": payload.tracking_code.strip(),
     }
 
 
-@app.post("/api/orders/{order_id}/demo-complete")
+def request_cancellation(order_id: str, payload: CancellationInput, request: Request):
+    buyer = require_buyer(request)
+    with db_connection() as connection:
+        order = connection.execute(
+            "SELECT buyer_id, payment_status, cancelled_at FROM orders WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if order is None or order["buyer_id"] != buyer["id"]:
+            raise HTTPException(status_code=404, detail="Oda haikupatikana.")
+        if order["cancelled_at"] or order["payment_status"] not in {"PENDING", "COMPLETED"}:
+            raise HTTPException(status_code=409, detail="Oda hii haiwezi kuombewa kughairiwa.")
+        existing = connection.execute(
+            "SELECT status FROM cancellation_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="Ombi la kughairi oda hii limeshatumwa.")
+        request_id = secrets.token_hex(16)
+        connection.execute(
+            """
+            INSERT INTO cancellation_requests (id, order_id, requester_id, reason)
+            VALUES (?, ?, ?, ?)
+            """,
+            (request_id, order_id, buyer["id"], payload.reason.strip()),
+        )
+    return {"id": request_id, "status": "PENDING"}
+
+
+def resolve_cancellation(
+    cancellation_id: str,
+    payload: CancellationResolutionInput,
+    request: Request,
+):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        cancellation = connection.execute(
+            """
+            SELECT c.order_id, c.status, o.payment_status, o.product_id,
+                   o.seller_id
+            FROM cancellation_requests c
+            JOIN orders o ON o.order_id = c.order_id
+            WHERE c.id = ?
+            """,
+            (cancellation_id,),
+        ).fetchone()
+        if cancellation is None:
+            raise HTTPException(status_code=404, detail="Ombi halikupatikana.")
+        if cancellation["status"] != "PENDING":
+            raise HTTPException(status_code=409, detail="Ombi hili limeshughulikiwa tayari.")
+        if payload.status == "APPROVED":
+            if cancellation["payment_status"] == "COMPLETED":
+                if not is_demo_mode():
+                    raise HTTPException(status_code=409, detail="Refund ya malipo halisi haijaunganishwa.")
+                items = connection.execute(
+                    "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                    (cancellation["order_id"],),
+                ).fetchall()
+                if items:
+                    for item in items:
+                        connection.execute(
+                            "UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?",
+                            (item["quantity"], item["product_id"]),
+                        )
+                        record_inventory_movement(
+                            connection,
+                            item["product_id"],
+                            cancellation["seller_id"],
+                            actor["id"],
+                            item["quantity"],
+                            "ORDER_CANCELLED",
+                        )
+                else:
+                    connection.execute(
+                        "UPDATE products SET stock_quantity = stock_quantity + 1 WHERE id = ?",
+                        (cancellation["product_id"],),
+                    )
+                    record_inventory_movement(
+                        connection,
+                        cancellation["product_id"],
+                        cancellation["seller_id"],
+                        actor["id"],
+                        1,
+                        "ORDER_CANCELLED",
+                    )
+            connection.execute(
+                """
+                UPDATE orders
+                SET payment_status = 'CANCELLED', cancelled_at = CURRENT_TIMESTAMP
+                WHERE order_id = ?
+                """,
+                (cancellation["order_id"],),
+            )
+        connection.execute(
+            """
+            UPDATE cancellation_requests
+            SET status = ?, admin_note = ?, resolved_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (payload.status, payload.admin_note.strip(), cancellation_id),
+        )
+    record_audit(
+        "CANCELLATION_RESOLVED",
+        "order",
+        cancellation["order_id"],
+        payload.status,
+        actor=actor,
+        request=request,
+    )
+    return {"id": cancellation_id, "order_id": cancellation["order_id"], "status": payload.status}
+
+
+def list_cancellations(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT c.id, c.order_id, c.reason, c.status, c.admin_note,
+                   c.created_at, o.amount, o.payment_status,
+                   u.full_name AS buyer_name, u.email AS buyer_email
+            FROM cancellation_requests c
+            JOIN orders o ON o.order_id = c.order_id
+            JOIN users u ON u.id = c.requester_id
+            ORDER BY c.created_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_review(order_id: str, product_id: str, payload: ReviewInput, request: Request):
+    buyer = require_buyer(request)
+    with db_connection() as connection:
+        order = connection.execute(
+            """
+            SELECT payment_status FROM orders
+            WHERE order_id = ? AND buyer_id = ?
+            """,
+            (order_id, buyer["id"]),
+        ).fetchone()
+        if order is None or order["payment_status"] != "COMPLETED":
+            raise HTTPException(status_code=403, detail="Unaweza kutoa maoni baada ya oda kukamilika.")
+        item = connection.execute(
+            "SELECT 1 FROM order_items WHERE order_id = ? AND product_id = ?",
+            (order_id, product_id),
+        ).fetchone()
+        if item is None:
+            raise HTTPException(status_code=404, detail="Bidhaa haipo kwenye oda hii.")
+        review_id = secrets.token_hex(16)
+        try:
+            connection.execute(
+                """
+                INSERT INTO reviews
+                    (id, order_id, product_id, buyer_id, rating, comment)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id,
+                    order_id,
+                    product_id,
+                    buyer["id"],
+                    payload.rating,
+                    payload.comment.strip(),
+                ),
+            )
+        except Exception as error:
+            if is_integrity_error(error):
+                raise HTTPException(status_code=409, detail="Tayari umetoa maoni kwa bidhaa hii kwenye oda hiyo.") from error
+            raise
+    return {"id": review_id, "status": "PENDING"}
+
+
+def list_product_reviews(product_id: str):
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT r.rating, r.comment, r.created_at, u.full_name AS buyer_name
+            FROM reviews r
+            JOIN users u ON u.id = r.buyer_id
+            WHERE r.product_id = ? AND r.status = 'APPROVED'
+            ORDER BY r.created_at DESC
+            """,
+            (product_id,),
+        ).fetchall()
+    reviews = [dict(row) for row in rows]
+    return {
+        "average_rating": round(sum(row["rating"] for row in reviews) / len(reviews), 1)
+        if reviews else None,
+        "review_count": len(reviews),
+        "reviews": reviews,
+    }
+
+
+def list_reviews(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT r.id, r.order_id, r.product_id, p.name AS product_name,
+                   r.rating, r.comment, r.status, r.created_at,
+                   u.full_name AS buyer_name
+            FROM reviews r
+            JOIN products p ON p.id = r.product_id
+            JOIN users u ON u.id = r.buyer_id
+            ORDER BY r.created_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def moderate_review(
+    review_id: str,
+    payload: ReviewModerationInput,
+    request: Request,
+):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            "UPDATE reviews SET status = ? WHERE id = ?",
+            (payload.status, review_id),
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Maoni hayakupatikana.")
+    record_audit(
+        "REVIEW_MODERATED",
+        "review",
+        review_id,
+        payload.status,
+        actor=actor,
+        request=request,
+    )
+    return {"id": review_id, "status": payload.status}
+
+
+def create_support_ticket(payload: SupportTicketInput, request: Request):
+    email = payload.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Barua pepe si sahihi.")
+    user = optional_current_user(request)
+    ticket_id = secrets.token_hex(16)
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO support_tickets (id, user_id, email, subject, message)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                ticket_id,
+                user["id"] if user else None,
+                email,
+                payload.subject.strip(),
+                payload.message.strip(),
+            ),
+        )
+    return {"id": ticket_id, "status": "OPEN"}
+
+
+def list_support_tickets(request: Request):
+    user = get_current_user(request)
+    with db_connection() as connection:
+        if user["role"] == "ADMIN":
+            rows = connection.execute(
+                """
+                SELECT id, user_id, email, subject, message, status,
+                       admin_response, created_at, updated_at
+                FROM support_tickets ORDER BY created_at DESC LIMIT 500
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT id, email, subject, message, status, admin_response,
+                       created_at, updated_at
+                FROM support_tickets WHERE user_id = ?
+                ORDER BY created_at DESC LIMIT 100
+                """,
+                (user["id"],),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_support_ticket(
+    ticket_id: str,
+    payload: SupportTicketUpdateInput,
+    request: Request,
+):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE support_tickets
+            SET status = ?, admin_response = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (payload.status, payload.admin_response.strip(), ticket_id),
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Tiketi haikupatikana.")
+    record_audit("SUPPORT_TICKET_UPDATED", "ticket", ticket_id, payload.status, actor=actor, request=request)
+    return {"id": ticket_id, "status": payload.status}
+
+
 def demo_complete(order_id: str):
     if not is_demo_mode():
         raise HTTPException(status_code=404, detail="Endpoint ya malipo ya majaribio imezimwa.")
@@ -1465,7 +3187,6 @@ def demo_complete(order_id: str):
     }
 
 
-@app.get("/api/dashboard")
 def dashboard(request: Request):
     user = get_current_user(request)
     where = "" if user["role"] == "ADMIN" else "AND seller_id = ?"
@@ -1498,31 +3219,60 @@ def dashboard(request: Request):
     }
 
 
-@app.get("/api/sales")
-def list_sales(request: Request):
+def list_sales(
+    request: Request,
+    start_date: str = "",
+    end_date: str = "",
+    status: str = "",
+):
     user = get_current_user(request)
     base = """
         SELECT o.order_id, o.product_id, o.seller_id, o.amount, o.buyer_name,
                o.buyer_email, o.payment_method, o.payment_status, o.product_cost,
                o.provider_fee, o.platform_fee, o.seller_payout, o.net_profit,
-               o.completed_at, o.archived_at, o.created_at, p.name AS product_name,
+               o.delivery_address, o.delivery_status, o.tracking_code,
+               o.completed_at, o.archived_at,
+               o.created_at, p.name AS product_name,
                u.shop_name
         FROM orders o
         JOIN products p ON p.id = o.product_id
         LEFT JOIN users u ON u.id = o.seller_id
     """
     if user["role"] == "ADMIN":
-        query = base + " ORDER BY o.created_at DESC"
-        parameters = ()
+        conditions = []
+        parameters = []
     else:
-        query = base + " WHERE o.seller_id = ? AND o.archived_at IS NULL ORDER BY o.created_at DESC"
-        parameters = (user["id"],)
+        conditions = ["o.seller_id = ?", "o.archived_at IS NULL"]
+        parameters = [user["id"]]
+    for label, value, operator in (
+        ("start_date", start_date, ">="),
+        ("end_date", end_date, "<="),
+    ):
+        if value:
+            try:
+                date.fromisoformat(value)
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label} lazima iwe tarehe ya YYYY-MM-DD.",
+                ) from error
+            conditions.append(
+                f"SUBSTR(CAST(o.created_at AS TEXT), 1, 10) {operator} ?"
+            )
+            parameters.append(value)
+    if status:
+        if status not in {"PENDING", "COMPLETED", "EXPIRED", "CANCELLED"}:
+            raise HTTPException(status_code=422, detail="Hali ya mauzo si sahihi.")
+        conditions.append("o.payment_status = ?")
+        parameters.append(status)
+    if conditions:
+        base += " WHERE " + " AND ".join(conditions)
+    query = base + " ORDER BY o.created_at DESC"
     with db_connection() as connection:
-        rows = connection.execute(query, parameters).fetchall()
+        rows = connection.execute(query, tuple(parameters)).fetchall()
     return [dict(row) for row in rows]
 
 
-@app.post("/api/sales/{order_id}/archive")
 def archive_sale(order_id: str, request: Request):
     user = require_seller(request)
     with db_connection() as connection:
@@ -1540,7 +3290,6 @@ def archive_sale(order_id: str, request: Request):
     return {"message": "Rekodi imefichwa kwenye historia yako; admin bado anaiona."}
 
 
-@app.get("/api/admin/sellers")
 def list_sellers(request: Request):
     require_admin(request)
     with db_connection() as connection:
@@ -1559,7 +3308,6 @@ def list_sellers(request: Request):
     return [dict(row) for row in rows]
 
 
-@app.patch("/api/admin/sellers/{seller_id}")
 def update_seller_status(seller_id: str, payload: SellerStatusInput, request: Request):
     actor = require_admin(request)
     status = payload.status
@@ -1574,7 +3322,6 @@ def update_seller_status(seller_id: str, payload: SellerStatusInput, request: Re
     return {"id": seller_id, "status": status}
 
 
-@app.get("/api/admin/audit")
 def list_audit(request: Request):
     require_admin(request)
     with db_connection() as connection:
@@ -1590,7 +3337,6 @@ def list_audit(request: Request):
     return [dict(row) for row in rows]
 
 
-@app.get("/api/admin/export/sales")
 def export_sales(request: Request):
     require_admin(request)
     with db_connection() as connection:
@@ -1613,7 +3359,10 @@ def export_sales(request: Request):
     ])
     writer.writeheader()
     for row in rows:
-        writer.writerow(dict(row))
+        writer.writerow({
+            key: spreadsheet_safe_cell(value)
+            for key, value in dict(row).items()
+        })
     record_audit("SALES_EXPORTED", "export", "sales.csv", "Admin exported sales", actor=require_admin(request), request=request)
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -1640,10 +3389,37 @@ if FRONTEND_DIST.is_dir():
         response.headers["Cache-Control"] = "no-store"
         return response
 
+
     @app.get("/{path:path}")
     def frontend_fallback(path: str):
         if path.startswith("api/"):
             raise HTTPException(status_code=404, detail="API endpoint haikupatikana.")
+        frontend_root = FRONTEND_DIST.resolve()
+        requested_file = (frontend_root / path).resolve()
+        if requested_file.is_relative_to(frontend_root) and requested_file.is_file():
+            return FileResponse(requested_file)
         response = FileResponse(FRONTEND_DIST / "index.html")
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+from services.admin.main import app as admin_service_app
+from services.catalog.main import app as catalog_service_app
+from services.identity.main import app as identity_service_app
+from services.orders.main import app as orders_service_app
+
+IN_PROCESS_SERVICE_APPS = {
+    "admin": admin_service_app,
+    "catalog": catalog_service_app,
+    "identity": identity_service_app,
+    "orders": orders_service_app,
+}
+
+for service_name in IN_PROCESS_SERVICE_APPS:
+    service_url_key = f"{service_name.upper()}_SERVICE_URL"
+    service_token_key = f"{service_name.upper()}_SERVICE_TOKEN"
+    if (
+        not os.getenv(service_url_key, "").strip()
+        and not os.getenv(service_token_key, "").strip()
+    ):
+        os.environ[service_token_key] = secrets.token_urlsafe(32)

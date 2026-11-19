@@ -12,8 +12,10 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY backend ./backend
+COPY services ./services
 COPY --from=frontend /app/dist ./dist
+ENV APP_MODULE=backend.main:app
 ENV DEMO_MODE=true
 ENV PORT=8000
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT}"]

@@ -1,0 +1,206 @@
+services:
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: marketplace
+      POSTGRES_USER: marketplace
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:-local-only-change-me}
+    volumes:
+      - marketplace_database:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketplace -d marketplace"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  notifications:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "services.notifications.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      NOTIFICATIONS_DATABASE_URL: postgresql://marketplace:${LOCAL_DB_PASSWORD:-local-only-change-me}@database:5432/notifications
+      NOTIFICATION_SERVICE_TOKEN: ${NOTIFICATION_SERVICE_TOKEN:-local-dev-token-change-me}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-smtp}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
+    depends_on:
+      database:
+        condition: service_healthy
+    expose:
+      - "8001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DEMO_MODE: ${DEMO_MODE:-true}
+      DATABASE_URL: postgresql://marketplace:${LOCAL_DB_PASSWORD:-local-only-change-me}@database:5432/marketplace
+      NOTIFICATION_SERVICE_URL: http://notifications:8001
+      NOTIFICATION_SERVICE_TOKEN: ${NOTIFICATION_SERVICE_TOKEN:-local-dev-token-change-me}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-smtp}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      ADMIN_SERVICE_URL: http://admin:8002
+      ADMIN_SERVICE_TOKEN: ${ADMIN_SERVICE_TOKEN:-local-admin-api-token-change-me}
+      CATALOG_SERVICE_URL: http://catalog:8003
+      CATALOG_SERVICE_TOKEN: ${CATALOG_SERVICE_TOKEN:-local-catalog-api-token-change-me}
+      IDENTITY_SERVICE_URL: http://identity:8004
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_SERVICE_TOKEN:-local-identity-api-token-change-me}
+      ORDERS_SERVICE_URL: http://orders:8005
+      ORDERS_SERVICE_TOKEN: ${ORDERS_SERVICE_TOKEN:-local-orders-api-token-change-me}
+      ADMIN_SETUP_TOKEN: ${ADMIN_SETUP_TOKEN:-}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-https://liparahisi.onrender.com}
+    depends_on:
+      database:
+        condition: service_healthy
+      notifications:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      orders:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  catalog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "services.catalog.main:app", "--host", "0.0.0.0", "--port", "8003"]
+    environment:
+      DATABASE_URL: postgresql://marketplace:${LOCAL_DB_PASSWORD:-local-only-change-me}@database:5432/marketplace
+      CATALOG_SERVICE_TOKEN: ${CATALOG_SERVICE_TOKEN:-local-catalog-api-token-change-me}
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "8003"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "services.admin.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      DATABASE_URL: postgresql://marketplace:${LOCAL_DB_PASSWORD:-local-only-change-me}@database:5432/marketplace
+      ADMIN_SERVICE_TOKEN: ${ADMIN_SERVICE_TOKEN:-local-admin-api-token-change-me}
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "8002"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  identity:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "services.identity.main:app", "--host", "0.0.0.0", "--port", "8004"]
+    environment:
+      DATABASE_URL: postgresql://marketplace:${LOCAL_DB_PASSWORD:-local-only-change-me}@database:5432/marketplace
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_SERVICE_TOKEN:-local-identity-api-token-change-me}
+      ADMIN_SETUP_TOKEN: ${ADMIN_SETUP_TOKEN:-}
+      NOTIFICATION_SERVICE_URL: http://notifications:8001
+      NOTIFICATION_SERVICE_TOKEN: ${NOTIFICATION_SERVICE_TOKEN:-local-dev-token-change-me}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-https://liparahisi.onrender.com}
+    depends_on:
+      database:
+        condition: service_healthy
+      notifications:
+        condition: service_healthy
+    expose:
+      - "8004"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  orders:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "services.orders.main:app", "--host", "0.0.0.0", "--port", "8005"]
+    environment:
+      DATABASE_URL: postgresql://marketplace:${LOCAL_DB_PASSWORD:-local-only-change-me}@database:5432/marketplace
+      ORDERS_SERVICE_TOKEN: ${ORDERS_SERVICE_TOKEN:-local-orders-api-token-change-me}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-https://liparahisi.onrender.com}
+    depends_on:
+      database:
+        condition: service_healthy
+    expose:
+      - "8005"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  marketplace_database:

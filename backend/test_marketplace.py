@@ -1,13 +1,68 @@
+import hashlib
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from backend import main
+from services.admin.main import app as admin_app
+from services.catalog.main import app as catalog_app
+from services.identity.main import app as identity_app
+from services.orders.main import app as orders_app
+
+
+class InProcessAdminClient:
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=admin_app),
+            base_url="http://admin",
+        )
+        return await self.client.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await self.client.__aexit__(exc_type, exc_value, traceback)
+
+
+class InProcessCatalogClient:
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=catalog_app),
+            base_url="http://catalog",
+        )
+        return await self.client.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await self.client.__aexit__(exc_type, exc_value, traceback)
+
+
+class InProcessIdentityClient:
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=identity_app),
+            base_url="http://identity",
+        )
+        return await self.client.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await self.client.__aexit__(exc_type, exc_value, traceback)
+
+
+class InProcessOrdersClient:
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=orders_app),
+            base_url="http://orders",
+        )
+        return await self.client.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await self.client.__aexit__(exc_type, exc_value, traceback)
 
 
 class MarketplaceFlowTests(unittest.TestCase):
@@ -19,20 +74,201 @@ class MarketplaceFlowTests(unittest.TestCase):
             os.environ,
             {
                 "ADMIN_SETUP_TOKEN": "test-admin-setup-token-long-enough",
+                "ADMIN_SERVICE_TOKEN": "test-admin-service-token",
+                "ADMIN_SERVICE_URL": "http://admin",
+                "CATALOG_SERVICE_TOKEN": "test-catalog-service-token",
+                "CATALOG_SERVICE_URL": "http://catalog",
+                "IDENTITY_SERVICE_TOKEN": "test-identity-service-token",
+                "IDENTITY_SERVICE_URL": "http://identity",
+                "ORDERS_SERVICE_TOKEN": "test-orders-service-token",
+                "ORDERS_SERVICE_URL": "http://orders",
                 "DATABASE_URL": "",
                 "DEMO_MODE": "true",
             },
             clear=False,
         )
         self.environment.start()
+        self.admin_client_patch = patch(
+            "backend.main.create_admin_service_client",
+            InProcessAdminClient,
+        )
+        self.admin_client_patch.start()
+        self.catalog_client_patch = patch(
+            "backend.main.create_catalog_service_client",
+            InProcessCatalogClient,
+        )
+        self.catalog_client_patch.start()
+        self.identity_client_patch = patch(
+            "backend.main.create_identity_service_client",
+            InProcessIdentityClient,
+        )
+        self.identity_client_patch.start()
+        self.orders_client_patch = patch(
+            "backend.main.create_orders_service_client",
+            InProcessOrdersClient,
+        )
+        self.orders_client_patch.start()
         self.client_context = TestClient(main.app)
         self.client = self.client_context.__enter__()
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
+        self.orders_client_patch.stop()
+        self.identity_client_patch.stop()
+        self.admin_client_patch.stop()
+        self.catalog_client_patch.stop()
         self.environment.stop()
         main.DATABASE_PATH = self.original_database_path
         self.temp_dir.cleanup()
+
+    def test_frontend_public_files_are_served(self):
+        for path in ("manifest.webmanifest", "sw.js"):
+            expected = (main.FRONTEND_DIST / path).read_bytes()
+            response = self.client.get(f"/{path}")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, expected)
+
+    def test_single_service_gateway_uses_in_process_apis(self):
+        service_patches = (
+            self.admin_client_patch,
+            self.catalog_client_patch,
+            self.identity_client_patch,
+            self.orders_client_patch,
+        )
+        for service_patch in service_patches:
+            service_patch.stop()
+
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "ADMIN_SERVICE_URL": "",
+                    "CATALOG_SERVICE_URL": "",
+                    "IDENTITY_SERVICE_URL": "",
+                    "ORDERS_SERVICE_URL": "",
+                },
+            ):
+                with TestClient(main.app) as client:
+                    status = client.get("/api/auth/status")
+                    products = client.get("/api/products?category=Vifaa")
+                    categories = client.get("/api/categories")
+                    admin = client.get("/api/admin/sellers")
+                    orders = client.get("/api/orders/history")
+                    setup = client.post(
+                        "/api/auth/setup",
+                        json={
+                            "setup_token": "test-admin-setup-token-long-enough",
+                            "full_name": "Main Admin",
+                            "email": "admin@example.com",
+                            "password": "admin-password-long",
+                        },
+                    )
+                    login = client.post(
+                        "/api/auth/login",
+                        json={
+                            "email": "admin@example.com",
+                            "password": "admin-password-long",
+                        },
+                    )
+                    admin_after_login = client.get("/api/admin/sellers")
+
+            self.assertEqual(status.status_code, 200)
+            self.assertTrue(status.json()["setup_required"])
+            self.assertEqual(products.status_code, 200)
+            self.assertEqual(categories.status_code, 200)
+            self.assertEqual(admin.status_code, 401)
+            self.assertEqual(orders.status_code, 401)
+            self.assertEqual(setup.status_code, 200, setup.text)
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(admin_after_login.status_code, 200)
+        finally:
+            for service_patch in service_patches:
+                service_patch.start()
+
+    def test_password_changes_and_resets_revoke_sessions(self):
+        registration = self.client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Buyer One",
+                "email": "buyer@example.com",
+                "password": "buyer-password-long",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+
+        current_client = TestClient(main.app)
+        other_client = TestClient(main.app)
+        with current_client, other_client:
+            for client in (current_client, other_client):
+                self.assertEqual(
+                    client.post(
+                        "/api/auth/login",
+                        json={
+                            "email": "buyer@example.com",
+                            "password": "buyer-password-long",
+                        },
+                    ).status_code,
+                    200,
+                )
+
+            old_token = current_client.cookies.get(main.SESSION_COOKIE)
+            changed = current_client.put(
+                "/api/auth/password",
+                json={
+                    "current_password": "buyer-password-long",
+                    "new_password": "buyer-new-password-long",
+                },
+            )
+            self.assertEqual(changed.status_code, 200)
+            self.assertNotEqual(
+                old_token,
+                current_client.cookies.get(main.SESSION_COOKIE),
+            )
+            self.assertIsNotNone(
+                current_client.get("/api/auth/status").json()["user"]
+            )
+            self.assertIsNone(other_client.get("/api/auth/status").json()["user"])
+
+            reset_token = "test-reset-token-" + ("x" * 32)
+            reset_hash = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
+            with main.db_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE users
+                    SET reset_token_hash = ?, reset_expires = ?
+                    WHERE email = ?
+                    """,
+                    (reset_hash, time.time() + 3600, "buyer@example.com"),
+                )
+
+            reset = current_client.post(
+                "/api/auth/password-reset/confirm",
+                json={
+                    "reset_token": reset_token,
+                    "new_password": "buyer-reset-password-long",
+                },
+            )
+            self.assertEqual(reset.status_code, 200)
+            self.assertIsNone(current_client.get("/api/auth/status").json()["user"])
+
+    def test_csv_formula_cells_are_neutralized(self):
+        dangerous_values = (
+            "=1+1",
+            "+SUM(A1:A2)",
+            "-1+2",
+            "@SUM(A1:A2)",
+            " \t=1+1",
+            "\t=1+1",
+            "\r=1+1",
+            "\n=1+1",
+        )
+        for value in dangerous_values:
+            with self.subTest(value=value):
+                self.assertEqual(main.spreadsheet_safe_cell(value), "'" + value)
+
+        self.assertEqual(main.spreadsheet_safe_cell(-125), -125)
+        self.assertEqual(main.spreadsheet_safe_cell("Kifaa salama"), "Kifaa salama")
 
     def test_integration_status_and_password_reset(self):
         status = self.client.get("/api/config/integrations").json()
@@ -227,7 +463,7 @@ class MarketplaceFlowTests(unittest.TestCase):
                 order_id = checkout.json()["order_id"]
                 receipt = buyer_client.get(f"/api/orders/{order_id}").json()
                 self.assertEqual(receipt["payment_status"], "PENDING")
-                self.assertEqual(receipt["bank_branch"], "Mwanza")
+                self.assertNotIn("bank_branch", receipt)
                 completed = buyer_client.post(f"/api/orders/{order_id}/demo-complete")
                 self.assertEqual(completed.status_code, 200)
                 self.assertEqual(completed.json()["platform_fee"], 250)
@@ -267,6 +503,378 @@ class MarketplaceFlowTests(unittest.TestCase):
                 main.public_app_url("http://192.168.1.11:8000"),
                 "https://liparahisi.onrender.com",
             )
+
+    def test_buyer_catalog_storefront_orders_and_support_features(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        category = self.client.post("/api/categories", json={"name": "Vifaa"})
+        self.assertEqual(category.status_code, 200)
+
+        registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Seller One",
+                "email": "seller@example.com",
+                "password": "seller-password-long",
+                "shop_name": "Duka la Kwanza",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        seller = self.client.get("/api/admin/sellers").json()[0]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+        seller_client = TestClient(main.app)
+        with seller_client:
+            login = seller_client.post(
+                "/api/auth/login",
+                json={"email": "seller@example.com", "password": "seller-password-long"},
+            )
+            self.assertEqual(login.status_code, 200)
+            product = seller_client.post(
+                "/api/products",
+                json={
+                    "name": "Kifaa cha majaribio",
+                    "description": "Maelezo ya bidhaa",
+                    "image_url": "https://images.example.com/item.png",
+                    "category": "Vifaa",
+                    "amount": 3000,
+                    "stock_quantity": 6,
+                    "low_stock_threshold": 6,
+                },
+            )
+            self.assertEqual(product.status_code, 201)
+            product_id = product.json()["id"]
+            store = seller_client.put(
+                "/api/storefront",
+                json={
+                    "shop_name": "Duka la Kwanza",
+                    "store_description": "Bidhaa nzuri",
+                    "store_image_url": "",
+                },
+            )
+            self.assertEqual(store.status_code, 200)
+            storefront = seller_client.get(
+                f"/api/storefronts/{store.json()['store_slug']}"
+            )
+            self.assertEqual(storefront.status_code, 200)
+            self.assertEqual(storefront.json()["products"][0]["id"], product_id)
+            self.assertIn("name,description", seller_client.get("/api/products/export").text)
+            self.assertEqual(
+                seller_client.post(
+                    "/api/products/import",
+                    json={"csv_text": "name,amount,category\nCSV item,500,Vifaa\n"},
+                ).json()["imported_count"],
+                1,
+            )
+            low_stock_ids = {
+                item["id"] for item in seller_client.get("/api/inventory/low-stock").json()
+            }
+            self.assertIn(product_id, low_stock_ids)
+
+        guest_client = TestClient(main.app)
+        public_products = guest_client.get("/api/products?category=Vifaa")
+        self.assertEqual(public_products.status_code, 200)
+        self.assertIn(product_id, {item["id"] for item in public_products.json()})
+
+        buyer_registration = guest_client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Buyer One",
+                "email": "buyer@example.com",
+                "password": "buyer-password-long",
+            },
+        )
+        self.assertEqual(buyer_registration.status_code, 201)
+        buyer_client = TestClient(main.app)
+        with buyer_client:
+            self.assertEqual(
+                buyer_client.post(
+                    "/api/auth/login",
+                    json={"email": "buyer@example.com", "password": "buyer-password-long"},
+                ).status_code,
+                200,
+            )
+            checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    "request_key": "d" * 32,
+                    "buyer_name": "Buyer One",
+                    "buyer_email": "buyer@example.com",
+                    "buyer_phone": "0712345678",
+                    "payment_method": "M-Pesa",
+                    "delivery_address": "Dar es Salaam",
+                },
+            )
+            self.assertEqual(checkout.status_code, 200)
+            order_id = checkout.json()["order_id"]
+            self.assertEqual(
+                buyer_client.post(f"/api/orders/{order_id}/demo-complete").status_code,
+                200,
+            )
+            buyer_order_status = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(buyer_order_status["buyer_name"], "Buyer One")
+            self.assertEqual(buyer_order_status["delivery_address"], "Dar es Salaam")
+            guest_order_status = guest_client.get(f"/api/orders/{order_id}").json()
+            for field in ("buyer_name", "delivery_address", "tracking_code"):
+                self.assertNotIn(field, guest_order_status)
+            history = buyer_client.get("/api/orders/history")
+            self.assertEqual(history.status_code, 200)
+            self.assertEqual(history.json()[0]["order_id"], order_id)
+            self.assertEqual(
+                buyer_client.post(
+                    f"/api/orders/{order_id}/products/{product_id}/review",
+                    json={"rating": 5, "comment": "Nzuri"},
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                buyer_client.post(
+                    "/api/support-tickets",
+                    json={
+                        "email": "buyer@example.com",
+                        "subject": "Swali kuhusu oda",
+                        "message": "Nahitaji msaada kuhusu ufuatiliaji wa oda yangu.",
+                    },
+                ).status_code,
+                201,
+            )
+
+        with seller_client:
+            delivery = seller_client.put(
+                f"/api/orders/{order_id}/delivery",
+                json={"delivery_status": "PROCESSING", "tracking_code": ""},
+            )
+            self.assertEqual(delivery.status_code, 200)
+            invalid_delivery = seller_client.put(
+                f"/api/orders/{order_id}/delivery",
+                json={"delivery_status": "DELIVERED", "tracking_code": "TRACK-1"},
+            )
+            self.assertEqual(invalid_delivery.status_code, 409)
+            sales = seller_client.get("/api/sales?status=COMPLETED")
+            self.assertEqual(sales.status_code, 200)
+            self.assertEqual(sales.json()[0]["delivery_status"], "PROCESSING")
+            self.assertEqual(sales.json()[0]["delivery_address"], "Dar es Salaam")
+            dated_sales = seller_client.get(
+                "/api/sales?start_date=2020-01-01&end_date=2099-12-31"
+            )
+            self.assertEqual(dated_sales.status_code, 200)
+            self.assertEqual(dated_sales.json()[0]["order_id"], order_id)
+            invalid_date = seller_client.get(
+                "/api/sales?start_date=not-a-date"
+            )
+            self.assertEqual(invalid_date.status_code, 422)
+
+        cart_response = buyer_client.post(
+            "/api/cart/checkout",
+            json={
+                "request_key": "e" * 32,
+                "buyer_name": "Buyer One",
+                "buyer_email": "buyer@example.com",
+                "buyer_phone": "0712345678",
+                "payment_method": "Halo Pesa",
+                "items": [{"product_id": product_id, "quantity": 3}],
+            },
+        )
+        self.assertEqual(cart_response.status_code, 200)
+        cart_status = buyer_client.get(
+            f"/api/checkouts/{cart_response.json()['checkout_id']}"
+        ).json()
+        self.assertEqual(cart_status["total_amount"], 9000)
+        self.assertEqual(cart_status["platform_fee"], 450)
+        self.assertEqual(cart_status["commission_percent"], 5)
+        self.assertEqual(cart_status["payment_method"], "Halo Pesa")
+        self.assertEqual(cart_status["buyer_email"], "buyer@example.com")
+        guest_cart_status = guest_client.get(
+            f"/api/checkouts/{cart_response.json()['checkout_id']}"
+        ).json()
+        for field in ("buyer_name", "buyer_email", "buyer_phone", "bank_branch"):
+            self.assertNotIn(field, guest_cart_status)
+        cart_completed = buyer_client.post(
+            f"/api/checkouts/{cart_response.json()['checkout_id']}/demo-complete"
+        )
+        self.assertEqual(cart_completed.status_code, 200)
+        self.assertEqual(cart_completed.json()["splits"][0]["seller_payout"], 8550)
+
+        cancellation = buyer_client.post(
+            f"/api/orders/{order_id}/cancellation",
+            json={"reason": "Nimebadilisha uamuzi kuhusu oda."},
+        )
+        self.assertEqual(cancellation.status_code, 200)
+        cancellation_row = self.client.get("/api/admin/cancellations").json()[0]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/cancellations/{cancellation_row['id']}",
+                json={"status": "APPROVED", "admin_note": "Imeidhinishwa demo."},
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            buyer_client.get(f"/api/orders/{order_id}").json()["payment_status"],
+            "CANCELLED",
+        )
+        pending_reviews = self.client.get("/api/admin/reviews")
+        self.assertEqual(pending_reviews.status_code, 200)
+        review_id = pending_reviews.json()[0]["id"]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/reviews/{review_id}",
+                json={"status": "APPROVED"},
+            ).status_code,
+            200,
+        )
+        product_details = guest_client.get(f"/api/products/{product_id}").json()
+        self.assertEqual(product_details["average_rating"], 5)
+
+        admin_tickets = self.client.get("/api/admin/support-tickets")
+        self.assertEqual(admin_tickets.status_code, 200)
+        ticket_id = admin_tickets.json()[0]["id"]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/support-tickets/{ticket_id}",
+                json={"status": "RESOLVED", "admin_response": "Tumeangalia."},
+            ).status_code,
+            200,
+        )
+
+    def test_product_image_upload_validation_and_seller_ownership(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Seller One",
+                "email": "seller@example.com",
+                "password": "seller-password-long",
+                "shop_name": "Duka la Kwanza",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        seller = self.client.get("/api/admin/sellers").json()[0]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+
+        seller_client = TestClient(main.app)
+        with seller_client:
+            self.assertEqual(
+                seller_client.post(
+                    "/api/auth/login",
+                    json={"email": "seller@example.com", "password": "seller-password-long"},
+                ).status_code,
+                200,
+            )
+            product = seller_client.post(
+                "/api/products",
+                json={"name": "Bidhaa yenye picha", "amount": 1000, "stock_quantity": 1},
+            )
+            self.assertEqual(product.status_code, 201)
+            product_id = product.json()["id"]
+            image_data = bytes.fromhex(
+                "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+                "0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082"
+            )
+
+            upload = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("product.png", image_data, "image/png")},
+            )
+            self.assertEqual(upload.status_code, 200)
+            self.assertEqual(
+                seller_client.get(f"/api/products/{product_id}").json()["image_url"],
+                f"/api/products/{product_id}/image",
+            )
+
+            public_client = TestClient(main.app)
+            public_image = public_client.get(f"/api/products/{product_id}/image")
+            self.assertEqual(public_image.status_code, 200)
+            self.assertEqual(public_image.headers["content-type"], "image/png")
+            self.assertEqual(public_image.content, image_data)
+
+            invalid_signature = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("invalid.png", b"not a png", "image/png")},
+            )
+            self.assertEqual(invalid_signature.status_code, 422)
+            invalid_type = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("invalid.txt", b"file", "text/plain")},
+            )
+            self.assertEqual(invalid_type.status_code, 415)
+            oversized = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={
+                    "image": (
+                        "large.png",
+                        b"\x89PNG\r\n\x1a\n" + b"x" * main.MAX_PRODUCT_IMAGE_BYTES,
+                        "image/png",
+                    )
+                },
+            )
+            self.assertEqual(oversized.status_code, 413)
+
+        second_registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Seller Two",
+                "email": "seller2@example.com",
+                "password": "seller2-password-long",
+                "shop_name": "Duka la Pili",
+            },
+        )
+        self.assertEqual(second_registration.status_code, 201)
+        second_seller = next(
+            item
+            for item in self.client.get("/api/admin/sellers").json()
+            if item["email"] == "seller2@example.com"
+        )
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{second_seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+        other_client = TestClient(main.app)
+        with other_client:
+            self.assertEqual(
+                other_client.post(
+                    "/api/auth/login",
+                    json={"email": "seller2@example.com", "password": "seller2-password-long"},
+                ).status_code,
+                200,
+            )
+            denied_upload = other_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("product.png", image_data, "image/png")},
+            )
+            self.assertEqual(denied_upload.status_code, 404)
+            denied_delete = other_client.delete(f"/api/products/{product_id}/image")
+            self.assertEqual(denied_delete.status_code, 404)
 
     def test_existing_sqlite_products_and_orders_are_migrated(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
