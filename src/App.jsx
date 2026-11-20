@@ -1928,8 +1928,8 @@ function CheckoutPage({ productId }) {
           </section>
         )}
         {orderId && isCompleted && (
-            <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />
           <section className="checkout-card receipt-card">
+            <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />
             <div className="receipt-success" aria-hidden="true">✓</div>
             <p className="receipt-kicker">{order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
             <h1>Oda imekamilika</h1>
