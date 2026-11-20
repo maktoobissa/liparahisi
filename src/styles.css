@@ -475,6 +475,22 @@ button {
   font-size: 9px;
 }
 
+.checkout-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 15px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.checkout-consent input {
+  flex: 0 0 auto;
+  margin: 2px 0 0;
+  accent-color: var(--green);
+}
+
 .generate-button {
   width: 100%;
   height: 44px;

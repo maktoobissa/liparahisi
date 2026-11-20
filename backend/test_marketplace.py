@@ -997,6 +997,193 @@ class MarketplaceFlowTests(unittest.TestCase):
                 "https://liparahisi.onrender.com",
             )
 
+    def test_abandoned_checkout_reminders_require_consent_and_can_unsubscribe(self):
+        with main.db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO users
+                    (id, full_name, email, password_hash, role, status, shop_name)
+                VALUES ('reminder-seller', 'Reminder Seller', 'reminder-seller@example.com',
+                        'unused', 'SELLER', 'ACTIVE', 'Reminder Shop')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO products (id, name, amount, seller_id, stock_quantity)
+                VALUES ('reminder-product', 'Sample Product', 5000,
+                        'reminder-seller', 10)
+                """
+            )
+
+        payload = {
+            "buyer_name": "Reminder Buyer",
+            "buyer_email": "buyer@example.com",
+            "buyer_phone": "0712345678",
+            "payment_method": "M-Pesa",
+        }
+        no_consent = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={**payload, "request_key": "n" * 32},
+        )
+        self.assertEqual(no_consent.status_code, 200, no_consent.text)
+        with main.db_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM abandoned_checkout_reminders"
+                ).fetchone()["count"],
+                0,
+            )
+
+        consented = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={
+                **payload,
+                "request_key": "a" * 32,
+                "abandoned_checkout_consent": True,
+            },
+        )
+        self.assertEqual(consented.status_code, 200, consented.text)
+        pending = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={
+                **payload,
+                "request_key": "b" * 32,
+                "abandoned_checkout_consent": True,
+            },
+        )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        completed = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={
+                **payload,
+                "request_key": "d" * 32,
+                "abandoned_checkout_consent": True,
+            },
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        completed_order = self.client.post(
+            f"/api/orders/{completed.json()['order_id']}/demo-complete"
+        )
+        self.assertEqual(completed_order.status_code, 200, completed_order.text)
+        self.email_sender.reset_mock()
+        cart = self.client.post(
+            "/api/cart/checkout",
+            json={
+                **payload,
+                "request_key": "c" * 32,
+                "abandoned_checkout_consent": True,
+                "items": [{"product_id": "reminder-product", "quantity": 1}],
+            },
+        )
+        self.assertEqual(cart.status_code, 200, cart.text)
+
+        with main.db_connection() as connection:
+            reminders = connection.execute(
+                """
+                SELECT checkout_type, checkout_key, status, send_at
+                FROM abandoned_checkout_reminders
+                ORDER BY checkout_type, checkout_key
+                """
+            ).fetchall()
+            self.assertEqual(len(reminders), 4)
+            self.assertEqual(
+                sum(row["checkout_type"] == "CART" for row in reminders),
+                1,
+            )
+            consented_reminder = connection.execute(
+                """
+                SELECT send_at FROM abandoned_checkout_reminders
+                WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                """,
+                (consented.json()["order_id"],),
+            ).fetchone()
+            self.assertAlmostEqual(
+                consented_reminder["send_at"] - time.time(),
+                main.ORDER_TTL_SECONDS,
+                delta=10,
+            )
+            completed_reminder = connection.execute(
+                """
+                SELECT status FROM abandoned_checkout_reminders
+                WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                """,
+                (completed.json()["order_id"],),
+            ).fetchone()
+            self.assertEqual(completed_reminder["status"], "CANCELLED")
+            connection.execute(
+                """
+                UPDATE orders SET expires_at = 0
+                WHERE order_id = ?
+                """,
+                (consented.json()["order_id"],),
+            )
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET send_at = 0, next_attempt_at = 0
+                WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                """,
+                (consented.json()["order_id"],),
+            )
+
+        with patch.dict(
+            os.environ,
+            {"PUBLIC_APP_URL": "https://liparahisi.example"},
+        ):
+            self.assertEqual(main.process_due_abandoned_checkout_reminders(), 1)
+        self.assertEqual(self.email_sender.call_count, 1)
+        reminder_text = self.email_sender.call_args.args[2]
+        token_match = re.search(
+            r"/api/email/reminders/unsubscribe\?token=([A-Za-z0-9_-]+)",
+            reminder_text,
+        )
+        self.assertIsNotNone(token_match)
+        token = token_match.group(1)
+        confirmation = self.client.get(
+            "/api/email/reminders/unsubscribe",
+            params={"token": token},
+        )
+        self.assertEqual(confirmation.status_code, 200)
+        with main.db_connection() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT opted_out_at FROM email_reminder_preferences
+                    WHERE email = ?
+                    """,
+                    ("buyer@example.com",),
+                ).fetchone()["opted_out_at"]
+            )
+
+        unsubscribe = self.client.post(
+            "/api/email/reminders/unsubscribe",
+            params={"token": token},
+        )
+        self.assertEqual(unsubscribe.status_code, 200)
+        with main.db_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT status FROM abandoned_checkout_reminders
+                    WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                    """,
+                    (pending.json()["order_id"],),
+                ).fetchone()["status"],
+                "UNSUBSCRIBED",
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT status FROM abandoned_checkout_reminders
+                    WHERE checkout_type = 'CART' AND checkout_key = ?
+                    """,
+                    (cart.json()["checkout_id"],),
+                ).fetchone()["status"],
+                "UNSUBSCRIBED",
+            )
+        self.assertEqual(main.process_due_abandoned_checkout_reminders(), 0)
+        self.assertEqual(self.email_sender.call_count, 1)
+
     def test_product_variants_track_checkout_and_cancellation_stock(self):
         setup = self.client.post(
             "/api/auth/setup",

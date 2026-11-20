@@ -2458,7 +2458,7 @@ function CheckoutPage({ productId }) {
   const { notify } = useNotification();
   const [product, setProduct] = useState(null);
   const [paymentConfig, setPaymentConfig] = useState(null);
-  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", abandoned_checkout_consent: false });
   const [couponCode, setCouponCode] = useState("");
   const [variantId, setVariantId] = useState("");
   const [orderId, setOrderId] = useState(new URLSearchParams(window.location.search).get("order_id") || "");
@@ -2564,6 +2564,7 @@ function CheckoutPage({ productId }) {
           payment_method: form.payment_method,
           coupon_code: couponCode,
           variant_id: variantId || null,
+          abandoned_checkout_consent: form.abandoned_checkout_consent,
           request_key: newRequestKey(),
         }),
       });
@@ -2684,6 +2685,14 @@ function CheckoutPage({ productId }) {
               <input id="buyer-phone" className="text-input" type="tel" inputMode="tel" autoComplete="tel" placeholder="Mf. 0712 345 678" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
               <label className="field-label" htmlFor="buyer-address">Anuani ya delivery (hiari)</label>
               <input id="buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
+              <label className="checkout-consent">
+                <input
+                  type="checkbox"
+                  checked={form.abandoned_checkout_consent}
+                  onChange={(event) => setForm({ ...form, abandoned_checkout_consent: event.target.checked })}
+                />
+                <span>{translate("Nataka kupokea ukumbusho mmoja wa checkout kupitia email baada ya saa 24 ikiwa sijalipa. Naweza kujiondoa kupitia link kwenye email.", language)}</span>
+              </label>
               <label className="field-label" htmlFor="checkout-coupon">Msimbo wa kuponi (demo pekee)</label>
               <input id="checkout-coupon" className="text-input" maxLength={32} autoComplete="off" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} />
               {isAblinerSelected && (
@@ -2792,7 +2801,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   const [checkoutId, setCheckoutId] = useState(initialCheckoutId);
   const [checkout, setCheckout] = useState(null);
   const previousCheckoutStatus = useRef(null);
-  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", abandoned_checkout_consent: false });
   const [couponCode, setCouponCode] = useState("");
   const [error, setError] = useFeedbackState("error");
   const [busy, setBusy] = useState(false);
@@ -2910,6 +2919,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
           coupon_code: couponCode,
+          abandoned_checkout_consent: form.abandoned_checkout_consent,
           items: items.map((item) => ({
             product_id: item.product_id,
             quantity: item.quantity,
@@ -3023,6 +3033,14 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <input id="cart-buyer-phone" className="text-input" type="tel" inputMode="tel" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
                   <label className="field-label" htmlFor="cart-buyer-address">Anuani ya delivery (hiari)</label>
                   <input id="cart-buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
+                  <label className="checkout-consent">
+                    <input
+                      type="checkbox"
+                      checked={form.abandoned_checkout_consent}
+                      onChange={(event) => setForm({ ...form, abandoned_checkout_consent: event.target.checked })}
+                    />
+                    <span>{translate("Nataka kupokea ukumbusho mmoja wa checkout kupitia email baada ya saa 24 ikiwa sijalipa. Naweza kujiondoa kupitia link kwenye email.", language)}</span>
+                  </label>
                   <label className="field-label" htmlFor="cart-coupon">Msimbo wa kuponi (demo pekee)</label>
                   <input id="cart-coupon" className="text-input" maxLength={32} autoComplete="off" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} />
                   {isAblinerSelected && (

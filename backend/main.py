@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -33,6 +34,7 @@ from backend.email_delivery import (
     email_provider,
 )
 from backend.email_templates import (
+    abandoned_checkout_email,
     password_changed_email,
     password_reset_email,
     payment_email,
@@ -42,7 +44,7 @@ from backend.email_templates import (
 )
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, validator
@@ -63,6 +65,10 @@ PRODUCT_LIST_CACHE_TTL_SECONDS = 15
 PUBLIC_PRODUCT_CACHE_PREFIX = "liparahisi:public-products:v2:"
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
+ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS = ORDER_TTL_SECONDS
+ABANDONED_CHECKOUT_REMINDER_POLL_SECONDS = 60
+ABANDONED_CHECKOUT_REMINDER_MAX_ATTEMPTS = 5
+ABANDONED_CHECKOUT_REMINDER_LEASE_SECONDS = 15 * 60
 RESET_TOKEN_TTL_SECONDS = 60 * 60
 PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
@@ -516,6 +522,34 @@ def initialize_db():
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (seller_id, payment_reference)
             );
+            CREATE TABLE IF NOT EXISTS email_reminder_preferences (
+                email TEXT PRIMARY KEY,
+                opted_out_at {timestamp_type},
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS abandoned_checkout_reminders (
+                id TEXT PRIMARY KEY,
+                checkout_type TEXT NOT NULL,
+                checkout_key TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                buyer_name TEXT NOT NULL DEFAULT '',
+                product_id TEXT NOT NULL DEFAULT '',
+                amount INTEGER NOT NULL DEFAULT 0,
+                send_at DOUBLE PRECISION NOT NULL,
+                next_attempt_at DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at {timestamp_type},
+                UNIQUE (checkout_type, checkout_key)
+            );
+            CREATE TABLE IF NOT EXISTS email_unsubscribe_tokens (
+                token_hash TEXT PRIMARY KEY,
+                email TEXT NOT NULL REFERENCES email_reminder_preferences(email) ON DELETE CASCADE,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS support_tickets (
                 id TEXT PRIMARY KEY,
                 user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -634,6 +668,12 @@ def initialize_db():
         )
         connection.execute(
             """
+            CREATE INDEX IF NOT EXISTS abandoned_checkout_reminders_due_idx
+            ON abandoned_checkout_reminders(status, next_attempt_at)
+            """
+        )
+        connection.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS orders_provider_reference_idx
             ON orders(provider_reference) WHERE provider_reference <> ''
             """
@@ -648,6 +688,7 @@ def initialize_db():
 
 @asynccontextmanager
 async def lifespan(_app):
+    reminder_worker = None
     try:
         database_url = os.getenv("DATABASE_URL", "").strip()
         if database_url:
@@ -655,8 +696,15 @@ async def lifespan(_app):
                 database_url = "postgresql://" + database_url[len("postgres://"):]
             get_database_pool(database_url)
         initialize_db()
+        reminder_worker = asyncio.create_task(abandoned_checkout_reminder_worker())
         yield
     finally:
+        if reminder_worker is not None:
+            reminder_worker.cancel()
+            try:
+                await reminder_worker
+            except asyncio.CancelledError:
+                pass
         close_database_pool()
         close_redis_client()
 
@@ -922,6 +970,7 @@ class CheckoutInput(BaseModel):
     delivery_address: str = Field(default="", max_length=500)
     coupon_code: str = Field(default="", max_length=32)
     variant_id: str | None = Field(default=None, max_length=64)
+    abandoned_checkout_consent: bool = False
 
     @validator("buyer_name")
     def strip_buyer_name(cls, value):
@@ -1091,6 +1140,441 @@ def send_app_email(event, to_email, content_builder, request_base_url=None):
         )
         return False
     return send_notification_email(event, to_email, content_builder(app_url))
+
+
+def schedule_abandoned_checkout_reminder(
+    connection,
+    checkout_type,
+    checkout_key,
+    recipient,
+    buyer_name,
+    amount,
+    product_id="",
+    consent=False,
+):
+    if not consent:
+        return
+    email = recipient.strip().lower()
+    now = time.time()
+    connection.execute(
+        """
+        INSERT INTO email_reminder_preferences (email)
+        VALUES (?)
+        ON CONFLICT(email) DO UPDATE SET
+            opted_out_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (email,),
+    )
+    connection.execute(
+        """
+        INSERT INTO abandoned_checkout_reminders
+            (id, checkout_type, checkout_key, recipient, buyer_name, product_id,
+             amount, send_at, next_attempt_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            secrets.token_hex(16),
+            checkout_type,
+            checkout_key,
+            email,
+            buyer_name.strip(),
+            product_id,
+            amount,
+            now + ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS,
+            now + ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS,
+        ),
+    )
+
+
+def cancel_checkout_reminders_for_order(connection, order):
+    connection.execute(
+        """
+        UPDATE abandoned_checkout_reminders
+        SET status = 'CANCELLED'
+        WHERE status IN ('PENDING', 'SENDING')
+          AND (
+              (checkout_type = 'ORDER' AND checkout_key = ?)
+              OR (
+                  ? <> ''
+                  AND checkout_type = 'CART'
+                  AND checkout_key = ?
+              )
+          )
+        """,
+        (
+            order["order_id"],
+            order.get("checkout_id") or "",
+            order.get("checkout_id") or "",
+        ),
+    )
+
+
+def claim_abandoned_checkout_reminder(now=None):
+    current_time = time.time() if now is None else now
+    with db_connection() as connection:
+        reminder = connection.execute(
+            """
+            SELECT id FROM abandoned_checkout_reminders
+            WHERE status IN ('PENDING', 'SENDING') AND next_attempt_at <= ?
+            ORDER BY next_attempt_at, created_at
+            LIMIT 1
+            """,
+            (current_time,),
+        ).fetchone()
+        if reminder is None:
+            return None
+        claimed = connection.execute(
+            """
+            UPDATE abandoned_checkout_reminders
+            SET status = 'SENDING',
+                attempts = CASE WHEN status = 'PENDING' THEN attempts + 1 ELSE attempts END,
+                next_attempt_at = ?
+            WHERE id = ? AND status IN ('PENDING', 'SENDING') AND next_attempt_at <= ?
+            """,
+            (
+                current_time + ABANDONED_CHECKOUT_REMINDER_LEASE_SECONDS,
+                reminder["id"],
+                current_time,
+            ),
+        )
+        if claimed.rowcount != 1:
+            return None
+        row = connection.execute(
+            "SELECT * FROM abandoned_checkout_reminders WHERE id = ?",
+            (reminder["id"],),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+
+def finish_abandoned_checkout_reminder(reminder_id, sent, now=None):
+    current_time = time.time() if now is None else now
+    with db_connection() as connection:
+        reminder = connection.execute(
+            """
+            SELECT attempts FROM abandoned_checkout_reminders
+            WHERE id = ? AND status = 'SENDING'
+            """,
+            (reminder_id,),
+        ).fetchone()
+        if reminder is None:
+            return
+        if sent:
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, last_error = ''
+                WHERE id = ? AND status = 'SENDING'
+                """,
+                (reminder_id,),
+            )
+        elif reminder["attempts"] >= ABANDONED_CHECKOUT_REMINDER_MAX_ATTEMPTS:
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET status = 'FAILED', last_error = 'Email delivery failed'
+                WHERE id = ? AND status = 'SENDING'
+                """,
+                (reminder_id,),
+            )
+        else:
+            retry_delay = min(60 * (2 ** reminder["attempts"]), 60 * 60)
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET status = 'PENDING', next_attempt_at = ?,
+                    last_error = 'Email delivery failed'
+                WHERE id = ? AND status = 'SENDING'
+                """,
+                (current_time + retry_delay, reminder_id),
+            )
+
+
+def process_due_abandoned_checkout_reminders(now=None, limit=20):
+    current_time = time.time() if now is None else now
+    expire_pending_orders()
+    processed = 0
+    while processed < limit:
+        reminder = claim_abandoned_checkout_reminder(current_time)
+        if reminder is None:
+            break
+        processed += 1
+
+        with db_connection() as connection:
+            preference = connection.execute(
+                """
+                SELECT opted_out_at FROM email_reminder_preferences
+                WHERE email = ?
+                """,
+                (reminder["recipient"],),
+            ).fetchone()
+            if preference is None or preference["opted_out_at"] is not None:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders
+                    SET status = 'UNSUBSCRIBED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+            if reminder["checkout_type"] == "ORDER":
+                orders = connection.execute(
+                    """
+                    SELECT order_id, payment_status, expires_at
+                    FROM orders WHERE order_id = ?
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+            else:
+                orders = connection.execute(
+                    """
+                    SELECT order_id, payment_status, expires_at
+                    FROM orders WHERE checkout_id = ?
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+
+            if not orders:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders SET status = 'CANCELLED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+            has_open_cancellation = any(
+                connection.execute(
+                    """
+                    SELECT 1 FROM cancellation_requests
+                    WHERE order_id = ? AND status IN ('PENDING', 'APPROVED')
+                    LIMIT 1
+                    """,
+                    (order["order_id"],),
+                ).fetchone()
+                for order in orders
+            )
+            if has_open_cancellation:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders SET status = 'CANCELLED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+            if any(order["payment_status"] != "EXPIRED" for order in orders):
+                if all(
+                    order["payment_status"] == "PENDING"
+                    and order["expires_at"] is not None
+                    and order["expires_at"] > current_time
+                    for order in orders
+                ):
+                    next_attempt_at = max(
+                        order["expires_at"] for order in orders
+                    ) + 1
+                    connection.execute(
+                        """
+                        UPDATE abandoned_checkout_reminders
+                        SET status = 'PENDING', next_attempt_at = ?,
+                            attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
+                        WHERE id = ? AND status = 'SENDING'
+                        """,
+                        (next_attempt_at, reminder["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE abandoned_checkout_reminders SET status = 'CANCELLED'
+                        WHERE id = ? AND status = 'SENDING'
+                        """,
+                        (reminder["id"],),
+                    )
+                continue
+
+            if reminder["checkout_type"] == "ORDER":
+                product_id = reminder["product_id"]
+                resume_url_path = f"/pay/{quote(product_id)}"
+                items = connection.execute(
+                    """
+                    SELECT p.name, oi.quantity
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.order_id
+                    LEFT JOIN products p ON p.id = oi.product_id
+                    WHERE o.order_id = ?
+                    ORDER BY o.created_at, p.name
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+            else:
+                resume_url_path = "/"
+                items = connection.execute(
+                    """
+                    SELECT p.name, oi.quantity
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.order_id
+                    LEFT JOIN products p ON p.id = oi.product_id
+                    WHERE o.checkout_id = ?
+                    ORDER BY o.created_at, p.name
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+
+            current_reminder = connection.execute(
+                "SELECT status FROM abandoned_checkout_reminders WHERE id = ?",
+                (reminder["id"],),
+            ).fetchone()
+            current_preference = connection.execute(
+                """
+                SELECT opted_out_at FROM email_reminder_preferences
+                WHERE email = ?
+                """,
+                (reminder["recipient"],),
+            ).fetchone()
+            if current_reminder is None or current_reminder["status"] != "SENDING":
+                continue
+            if current_preference is None or current_preference["opted_out_at"] is not None:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders
+                    SET status = 'UNSUBSCRIBED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+        product_names = ", ".join(
+            dict.fromkeys(
+                f"{item['name'] or 'Bidhaa'} x{item['quantity']}" for item in items
+            )
+        ) or "Bidhaa ulizochagua"
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO email_unsubscribe_tokens (token_hash, email)
+                VALUES (?, ?)
+                """,
+                (token_hash, reminder["recipient"]),
+            )
+
+        sent = send_app_email(
+            "abandoned_checkout_reminder",
+            reminder["recipient"],
+            lambda app_url: abandoned_checkout_email(
+                reminder["buyer_name"] or "Mteja",
+                product_names,
+                reminder["amount"],
+                f"{app_url.rstrip('/')}{resume_url_path}",
+                f"{app_url.rstrip('/')}/api/email/reminders/unsubscribe?token={quote(token)}",
+                app_url,
+            ),
+        )
+        finish_abandoned_checkout_reminder(reminder["id"], sent, current_time)
+    return processed
+
+
+async def abandoned_checkout_reminder_worker():
+    while True:
+        batch = asyncio.create_task(
+            asyncio.to_thread(process_due_abandoned_checkout_reminders)
+        )
+        try:
+            await asyncio.shield(batch)
+        except asyncio.CancelledError:
+            try:
+                await batch
+            except Exception:
+                logger.exception("Abandoned-checkout reminder batch failed during shutdown.")
+            raise
+        except Exception:
+            logger.exception("Abandoned-checkout reminder worker failed.")
+        await asyncio.sleep(ABANDONED_CHECKOUT_REMINDER_POLL_SECONDS)
+
+
+def unsubscribe_reminder_email(token):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db_connection() as connection:
+        token_row = connection.execute(
+            "SELECT email FROM email_unsubscribe_tokens WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        if token_row is None:
+            return None
+        email = token_row["email"]
+        connection.execute(
+            """
+            UPDATE email_reminder_preferences
+            SET opted_out_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE email = ?
+            """,
+            (email,),
+        )
+        connection.execute(
+            """
+            UPDATE abandoned_checkout_reminders
+            SET status = 'UNSUBSCRIBED'
+            WHERE recipient = ? AND status IN ('PENDING', 'SENDING')
+            """,
+            (email,),
+        )
+        return email
+
+
+@app.get("/api/email/reminders/unsubscribe", response_class=HTMLResponse)
+def confirm_reminder_unsubscribe(token: str):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db_connection() as connection:
+        token_row = connection.execute(
+            "SELECT 1 FROM email_unsubscribe_tokens WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+    if token_row is None:
+        return HTMLResponse(
+            "<html><body><p>Link si sahihi au muda wake umeisha.</p></body></html>",
+            status_code=404,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+    action_url = f"/api/email/reminders/unsubscribe?token={quote(token)}"
+    return HTMLResponse(
+        "<!doctype html><html lang='sw'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Simamisha vikumbusho | LipaRahisi</title>"
+        "<body style='font-family:Arial,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172554'>"
+        "<h1>Simamisha vikumbusho vya checkout</h1>"
+        "<p>Thibitisha kama hutaki tena kupokea vikumbusho vya checkout kupitia barua pepe.</p>"
+        f"<form method='post' action='{action_url}'>"
+        "<button type='submit' style='padding:12px 18px;background:#174DAA;color:white;border:0;border-radius:8px;cursor:pointer'>"
+        "Jiondoe kwenye vikumbusho</button></form></body></html>",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.post("/api/email/reminders/unsubscribe", response_class=HTMLResponse)
+def unsubscribe_reminder(token: str):
+    email = unsubscribe_reminder_email(token)
+    if email is None:
+        return HTMLResponse(
+            "<html><body><p>Link si sahihi au muda wake umeisha.</p></body></html>",
+            status_code=404,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+    return HTMLResponse(
+        "<!doctype html><html lang='sw'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Vikumbusho vimesimamishwa | LipaRahisi</title>"
+        "<body style='font-family:Arial,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172554'>"
+        "<h1>Vikumbusho vimesimamishwa</h1>"
+        "<p>Hatutatuma tena vikumbusho vya checkout kwenye barua pepe hii.</p>"
+        "</body></html>",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
 
 
 def verify_password(password, encoded):
@@ -1639,6 +2123,7 @@ def complete_order_group(order_ids, provider_verified=False, background_tasks=No
             )
             if claimed.rowcount == 0:
                 continue
+            cancel_checkout_reminders_for_order(connection, order)
             newly_completed_ids.append(order["order_id"])
             items = connection.execute(
                 """
@@ -4450,6 +4935,16 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     variant["variant_label"],
                 ),
             )
+            schedule_abandoned_checkout_reminder(
+                connection,
+                "ORDER",
+                order_id,
+                buyer_email,
+                payload.buyer_name,
+                amount,
+                product_id=product_id,
+                consent=payload.abandoned_checkout_consent,
+            )
     except Exception as error:
         if is_integrity_error(error):
             with db_connection() as connection:
@@ -4669,6 +5164,15 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     ),
                 )
             order_ids.append(order_id)
+        schedule_abandoned_checkout_reminder(
+            connection,
+            "CART",
+            checkout_id,
+            buyer_email,
+            payload.buyer_name,
+            subtotal - total_coupon_discount,
+            consent=payload.abandoned_checkout_consent,
+        )
 
     app_url = public_app_url(str(request.base_url))
     checkout_url = f"{app_url}/cart/{checkout_id}"
@@ -4980,7 +5484,7 @@ def resolve_cancellation(
         cancellation = connection.execute(
             """
             SELECT c.order_id, c.status, o.payment_status, o.product_id,
-                   o.seller_id
+                   o.seller_id, o.checkout_id
             FROM cancellation_requests c
             JOIN orders o ON o.order_id = c.order_id
             WHERE c.id = ?
@@ -5050,6 +5554,7 @@ def resolve_cancellation(
                 """,
                 (cancellation["order_id"],),
             )
+            cancel_checkout_reminders_for_order(connection, dict(cancellation))
         connection.execute(
             """
             UPDATE cancellation_requests

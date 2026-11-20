@@ -81,6 +81,7 @@ const translations = Object.fromEntries([
   ["Kuponi imeundwa.", "Coupon created.", "Coupon créé."],
   ["Hali ya kuponi imehifadhiwa.", "Coupon status saved.", "Statut du coupon enregistré."],
   ["Kuponi", "Coupons", "Coupons"],
+  ["Nataka kupokea ukumbusho mmoja wa checkout kupitia email baada ya saa 24 ikiwa sijalipa. Naweza kujiondoa kupitia link kwenye email.", "I agree to receive one checkout reminder email after 24 hours if I have not paid. I can unsubscribe using the link in the email.", "J’accepte de recevoir un seul rappel de paiement par e-mail après 24 heures si je n’ai pas payé. Je peux me désabonner grâce au lien dans l’e-mail."],
   ["Msimbo wa kuponi", "Coupon code", "Code de coupon"],
   ["Aina ya punguzo", "Discount type", "Type de remise"],
   ["Asilimia (%)", "Percentage (%)", "Pourcentage (%)"],

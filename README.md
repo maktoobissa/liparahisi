@@ -26,6 +26,9 @@ sales.
 - Seller payout ledger that reconciles completed-order earnings against
   admin-recorded partial payments; entries document external transfers and
   never initiate one.
+- Optional abandoned-checkout recovery: buyers can opt in to one reminder email
+  after 24 hours, with an unsubscribe link. Only unpaid, expired checkouts are
+  eligible; the email starts a new checkout because the old one has expired.
 - Verified-order reviews subject to administrator moderation.
 - Buyer support tickets with administrator responses.
 - Admin-managed marketplace-wide percentage or fixed-value coupons, limited to
@@ -52,7 +55,9 @@ open. Push delivery while the app is closed is not configured. Approved
 cancellation of a completed order restores stock only in demo mode; it does not
 issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
 checkout, but neither is connected to a live payment provider. Coupons are
-rejected when live payments are enabled.
+rejected when live payments are enabled. Abandoned-checkout reminders require
+buyer opt-in and an available email provider; Render Free service sleep or
+email-provider outages can delay delivery beyond 24 hours.
 
 ## Payments
 

@@ -18,6 +18,7 @@ def _render_email(
     button_label=None,
     button_url=None,
     details=(),
+    unsubscribe_url=None,
 ):
     name = full_name.strip() or "mteja"
     safe_name = escape(name)
@@ -28,6 +29,8 @@ def _render_email(
         text_parts.extend(f"{label}: {value}" for label, value in details)
     if button_label and button_url:
         text_parts.extend((button_label, button_url))
+    if unsubscribe_url:
+        text_parts.extend(("Acha kupokea vikumbusho vya vikapu:", unsubscribe_url))
     text_parts.append("LipaRahisi | Malipo na biashara kwa urahisi.")
     text = "\n\n".join(text_parts)
 
@@ -60,6 +63,14 @@ def _render_email(
             f'Kama kitufe hakifanyi kazi, tumia kiungo hiki: '
             f'<a href="{safe_button_url}" style="color:#174DAA;word-break:break-all">{safe_button_url}</a></p>'
         )
+    unsubscribe_html = ""
+    if unsubscribe_url:
+        safe_unsubscribe_url = escape(unsubscribe_url, quote=True)
+        unsubscribe_html = (
+            '<p style="margin:20px 0 0;color:#64748b;font-size:13px;line-height:1.5">'
+            'Hutaki kupokea vikumbusho hivi? '
+            f'<a href="{safe_unsubscribe_url}" style="color:#174DAA">Jiondoe hapa</a>.</p>'
+        )
     html = (
         '<!doctype html><html lang="sw"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -75,7 +86,7 @@ def _render_email(
         '<tr><td style="padding:30px 28px">'
         f'<p style="margin:0 0 10px;color:#334155">Habari {safe_name},</p>'
         f'<h1 style="margin:0 0 18px;color:#071B52;font-size:23px;line-height:1.3">{escape(heading)}</h1>'
-        f'{paragraph_html}{details_html}{button_html}'
+        f'{paragraph_html}{details_html}{button_html}{unsubscribe_html}'
         '<p style="margin:24px 0 0;color:#64748b;font-size:13px;line-height:1.5">'
         'Hujatambua ombi hili? Unaweza kupuuza ujumbe huu au kuwasiliana na timu ya LipaRahisi.</p>'
         '</td></tr>'
@@ -225,4 +236,32 @@ def seller_payment_email(full_name, orders, frontend_url, demo=False):
         "Fungua LipaRahisi",
         frontend_url.rstrip("/") + "/",
         details,
+    )
+
+
+def abandoned_checkout_email(
+    full_name,
+    product_names,
+    amount,
+    resume_url,
+    unsubscribe_url,
+    frontend_url,
+):
+    details = [
+        ("Bidhaa ulizochagua", product_names),
+        ("Jumla ya awali", f"TSh {int(amount):,}"),
+    ]
+    return _render_email(
+        "Umeacha bidhaa kwenye kikapu — LipaRahisi",
+        full_name,
+        "Ungependa kuendelea na bidhaa ulizochagua?",
+        [
+            "Checkout yako haikukamilika. Unaweza kurudi LipaRahisi na kuanzisha checkout mpya; bei na upatikanaji wa bidhaa vinaweza kuwa vimebadilika.",
+            "Umepokea ukumbusho huu kwa sababu ulikubali kupokea email moja ya kukukumbusha.",
+        ],
+        frontend_url,
+        "Rudi LipaRahisi",
+        resume_url,
+        details,
+        unsubscribe_url,
     )
