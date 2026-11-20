@@ -18,8 +18,9 @@ sales.
   CSV import/export, and date/status-filtered sales.
 - Product variants with separate stock counts; each variant uses its product's
   base price and can be selected in single-item or cart checkout.
-- Seller-uploaded MP4/WebM product videos (up to 20 MiB each, three per
-  product), with playback, add-to-cart, and direct checkout from the buyer feed.
+- Seller-uploaded MP4/WebM product videos during product creation or from its
+  product card (up to 20 MiB each, three per product), with playback,
+  add-to-cart, and direct checkout from the buyer feed.
 - Seller-managed delivery status, carrier, tracking code, and a separately
   collected delivery fee shown to buyers (not included in the product payment).
 - Buyer cancellation requests and return/refund requests for delivered orders,

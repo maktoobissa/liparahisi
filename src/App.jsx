@@ -886,6 +886,8 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [productVariants, setProductVariants] = useState([]);
   const [productImages, setProductImages] = useState([]);
   const productImageInputRef = useRef(null);
+  const [productVideos, setProductVideos] = useState([]);
+  const productVideoInputRef = useRef(null);
   const [productQuery, setProductQuery] = useState("");
   const [salesFilters, setSalesFilters] = useState({ start_date: "", end_date: "", status: "" });
   const [categoryName, setCategoryName] = useState("");
@@ -1062,6 +1064,10 @@ function MarketplaceDashboard({ user, onLogout }) {
         throw new Error(`Chagua picha zisizozidi ${maxProductGalleryImages} kwa bidhaa.`);
       }
       productImages.forEach(validateProductImage);
+      if (productVideos.length > maxProductVideos) {
+        throw new Error(translate("Bidhaa inaweza kuwa na video 3 tu.", language));
+      }
+      productVideos.forEach(validateProductVideo);
       const createdProduct = await api("/products", {
         method: "POST",
         body: JSON.stringify({
@@ -1082,7 +1088,9 @@ function MarketplaceDashboard({ user, onLogout }) {
       setProductForm({ name: "", description: "", image_url: "", category: "", amount: "", cost_amount: "", stock_quantity: "", low_stock_threshold: "5" });
       setProductVariants([]);
       setProductImages([]);
+      setProductVideos([]);
       if (productImageInputRef.current) productImageInputRef.current.value = "";
+      if (productVideoInputRef.current) productVideoInputRef.current.value = "";
       if (productImages.length) {
         try {
           await uploadProductGallery(createdProduct.id, productImages);
@@ -1092,9 +1100,24 @@ function MarketplaceDashboard({ user, onLogout }) {
           return;
         }
       }
-      setMessage(productImages.length
-        ? "Bidhaa na picha zake zimehifadhiwa."
-        : "Bidhaa imehifadhiwa. QR na barcode yake vipo kwenye orodha hapa chini.");
+      if (productVideos.length) {
+        try {
+          for (const file of productVideos) {
+            await uploadProductVideo(createdProduct.id, file);
+          }
+        } catch (uploadError) {
+          setError(`Bidhaa imehifadhiwa, lakini video hazikupakiwa: ${uploadError.message}`);
+          await refresh();
+          return;
+        }
+      }
+      setMessage(productImages.length && productVideos.length
+        ? "Bidhaa, picha na video zimehifadhiwa."
+        : productImages.length
+          ? "Bidhaa na picha zake zimehifadhiwa."
+          : productVideos.length
+            ? "Bidhaa na video zimehifadhiwa."
+            : "Bidhaa imehifadhiwa. QR na barcode yake vipo kwenye orodha hapa chini.");
       await refresh();
     } catch (requestError) {
       setError(requestError.message);
@@ -1549,6 +1572,17 @@ function MarketplaceDashboard({ user, onLogout }) {
                   onChange={(event) => setProductImages(Array.from(event.target.files || []))}
                 />
                 <p className="field-hint">Chagua hadi picha 8 za pembe tofauti. JPEG, PNG au WebP; kila picha hadi MB 5. Mnunuzi anaweza kuzizungusha.</p>
+                <label className="field-label" htmlFor="product-video-files">{translate("Pakia video za bidhaa (hiari)", language)}</label>
+                <input
+                  id="product-video-files"
+                  ref={productVideoInputRef}
+                  className="text-input"
+                  type="file"
+                  accept="video/mp4,video/webm"
+                  multiple
+                  onChange={(event) => setProductVideos(Array.from(event.target.files || []))}
+                />
+                <p className="field-hint">{translate("Chagua hadi video 3 za MP4 au WebM; kila video hadi MB 20.", language)}</p>
                 <label className="field-label" htmlFor="product-category">Kundi</label>
                 <input id="product-category" className="text-input" list="product-categories" maxLength={60} value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} />
                 <datalist id="product-categories">{categories.map((item) => <option key={item.id} value={item.name} />)}</datalist>
