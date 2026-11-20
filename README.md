@@ -18,6 +18,8 @@ sales.
   CSV import/export, and date/status-filtered sales.
 - Product variants with separate stock counts; each variant uses its product's
   base price and can be selected in single-item or cart checkout.
+- Seller-uploaded MP4/WebM product videos (up to 20 MiB each, three per
+  product), with playback, add-to-cart, and direct checkout from the buyer feed.
 - Seller-managed delivery status, carrier, tracking code, and a separately
   collected delivery fee shown to buyers (not included in the product payment).
 - Buyer cancellation requests and return/refund requests for delivered orders,
@@ -41,8 +43,11 @@ sales.
 - Installable PWA with a branded loading screen and offline-cached application
   shell. Marketplace data and checkout still require the API to be online.
 
-Uploaded product images are stored with marketplace data and served through the
-public catalog image endpoint; storefront images still use HTTP/HTTPS URLs.
+Uploaded product images and videos are stored in the marketplace database and
+served through public catalog endpoints; storefront images still use HTTP/HTTPS
+URLs. Videos are stored as PostgreSQL `BYTEA` (or SQLite `BLOB` locally), so
+their combined size counts against database storage; keep the configured
+database capacity and backups in mind when sellers upload videos.
 The interface supports all three languages; text without a translation entry
 falls back to its source language. Seller-entered product/store names and
 descriptions remain in the language provided by the seller and are not

@@ -18,6 +18,7 @@ from backend.main import (
     create_category,
     create_product,
     delete_product_image,
+    delete_product_video,
     delete_product_gallery_image,
     export_products,
     import_products,
@@ -28,6 +29,7 @@ from backend.main import (
     product_inventory_movements,
     read_product,
     read_product_image,
+    read_product_video,
     read_product_gallery_image,
     read_storefront,
     remove_from_wishlist,
@@ -35,6 +37,7 @@ from backend.main import (
     update_product_variant_stock,
     update_storefront,
     upload_product_image,
+    upload_product_video,
     upload_product_gallery,
 )
 
@@ -174,6 +177,24 @@ app.add_api_route(
 app.add_api_route(
     "/products/{product_id}/gallery/{image_id}",
     delete_product_gallery_image,
+    methods=["DELETE"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/videos",
+    upload_product_video,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/videos/{video_id}",
+    read_product_video,
+    methods=["GET"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/videos/{video_id}",
+    delete_product_video,
     methods=["DELETE"],
     dependencies=[Depends(verify_gateway_token)],
 )

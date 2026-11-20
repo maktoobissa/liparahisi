@@ -62,7 +62,7 @@ DATABASE_POOL_MIN_SIZE = 1
 DATABASE_POOL_MAX_SIZE = 5
 DATABASE_POOL_TIMEOUT_SECONDS = 10
 PRODUCT_LIST_CACHE_TTL_SECONDS = 15
-PUBLIC_PRODUCT_CACHE_PREFIX = "liparahisi:public-products:v2:"
+PUBLIC_PRODUCT_CACHE_PREFIX = "liparahisi:public-products:v3:"
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
 ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS = ORDER_TTL_SECONDS
@@ -73,6 +73,8 @@ RESET_TOKEN_TTL_SECONDS = 60 * 60
 PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_PRODUCT_GALLERY_IMAGES = 8
+MAX_PRODUCT_VIDEO_BYTES = 20 * 1024 * 1024
+MAX_PRODUCT_VIDEOS = 3
 ABLINER_PAYMENT_METHOD = "Abliner Mobile Money"
 PAYMENT_METHODS = {
     "M-Pesa",
@@ -384,6 +386,15 @@ def initialize_db():
             );
             CREATE INDEX IF NOT EXISTS product_gallery_by_product
                 ON product_gallery_images(product_id, sort_order, id);
+            CREATE TABLE IF NOT EXISTS product_videos (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL,
+                video_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS product_videos_by_product
+                ON product_videos(product_id, created_at, id);
             CREATE TABLE IF NOT EXISTS product_variants (
                 id TEXT PRIMARY KEY,
                 product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
@@ -1782,6 +1793,37 @@ def attach_product_gallery(products):
     return results
 
 
+def attach_product_videos(products):
+    results = [dict(product) for product in products]
+    product_ids = list(dict.fromkeys(product["id"] for product in results))
+    videos_by_product = {}
+    with db_connection() as connection:
+        for offset in range(0, len(product_ids), 400):
+            batch = product_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, product_id, content_type, created_at
+                FROM product_videos
+                WHERE product_id IN ({placeholders})
+                ORDER BY product_id, created_at, id
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                videos_by_product.setdefault(row["product_id"], []).append(
+                    {
+                        "id": row["id"],
+                        "url": f"/api/products/{row['product_id']}/videos/{row['id']}",
+                        "content_type": row["content_type"],
+                        "created_at": row["created_at"],
+                    }
+                )
+    for product in results:
+        product["videos"] = videos_by_product.get(product["id"], [])
+    return results
+
+
 def product_variants_for(connection, product_id):
     rows = connection.execute(
         """
@@ -2918,6 +2960,39 @@ async def catalog_product_gallery_gateway(product_id: str, request: Request):
     )
 
 
+@app.api_route("/api/products/{product_id}/videos", methods=["POST"])
+async def catalog_product_videos_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/videos",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/videos/{video_id}",
+    methods=["GET", "DELETE"],
+)
+async def catalog_product_video_gateway(
+    product_id: str,
+    video_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/videos/{video_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
 @app.api_route(
     "/api/products/{product_id}/gallery/{image_id}",
     methods=["GET", "DELETE"],
@@ -3687,7 +3762,9 @@ def read_storefront(store_slug: str):
         ).fetchall()
     return {
         "store": dict(seller),
-        "products": attach_product_gallery(products),
+        "products": attach_product_variants(
+            attach_product_videos(attach_product_gallery(products))
+        ),
     }
 
 
@@ -3787,9 +3864,9 @@ def list_products(
         }
         for row in rows
     ]
-    products = attach_product_gallery(products)
-    if user and user["role"] in {"ADMIN", "SELLER"}:
-        products = attach_product_variants(products)
+    products = attach_product_variants(
+        attach_product_videos(attach_product_gallery(products))
+    )
     if cache_key is not None:
         cache_product_list(cache_key, products)
     return products
@@ -4178,7 +4255,7 @@ def list_wishlist(request: Request):
             """,
             (user["id"],),
         ).fetchall()
-    return attach_product_gallery(rows)
+    return attach_product_videos(attach_product_gallery(rows))
 
 
 def export_products(request: Request):
@@ -4581,7 +4658,9 @@ def read_product(product_id: str):
         "store_slug": product["store_slug"] or "",
         **list_product_reviews(product["id"]),
     }
-    return attach_product_variants(attach_product_gallery([result]))[0]
+    return attach_product_variants(
+        attach_product_videos(attach_product_gallery([result]))
+    )[0]
 
 
 def read_uploaded_product_image(image):
@@ -4765,6 +4844,166 @@ def delete_product_gallery_image(product_id: str, image_id: str, request: Reques
             )
     invalidate_public_product_lists()
     return {"product_id": product_id, "image_id": image_id}
+
+
+def read_uploaded_product_video(video):
+    content_type = (video.content_type or "").lower().split(";", 1)[0].strip()
+    signatures = {
+        "video/mp4": lambda data: len(data) >= 12 and data[4:8] == b"ftyp",
+        "video/webm": lambda data: data.startswith(b"\x1a\x45\xdf\xa3"),
+    }
+    if content_type not in signatures:
+        raise HTTPException(status_code=415, detail="Tumia video ya MP4 au WebM.")
+    video_data = video.file.read(MAX_PRODUCT_VIDEO_BYTES + 1)
+    if len(video_data) > MAX_PRODUCT_VIDEO_BYTES:
+        raise HTTPException(status_code=413, detail="Video imezidi ukubwa wa MB 20.")
+    if not video_data or not signatures[content_type](video_data):
+        raise HTTPException(
+            status_code=422,
+            detail="Faili la video halilingani na aina iliyochaguliwa.",
+        )
+    return content_type, video_data
+
+
+def upload_product_video(
+    product_id: str,
+    request: Request,
+    video: UploadFile = File(...),
+):
+    seller = require_seller(request)
+    declared_length = request.headers.get("content-length")
+    if (
+        declared_length
+        and declared_length.isdigit()
+        and int(declared_length) > MAX_PRODUCT_VIDEO_BYTES + 65536
+    ):
+        raise HTTPException(status_code=413, detail="Video imezidi ukubwa wa MB 20.")
+
+    content_type, video_data = read_uploaded_product_video(video)
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ? AND is_active = 1",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        video_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM product_videos WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()["count"]
+        if video_count >= MAX_PRODUCT_VIDEOS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Bidhaa inaweza kuwa na video {MAX_PRODUCT_VIDEOS} tu.",
+            )
+        video_id = secrets.token_hex(16)
+        connection.execute(
+            """
+            INSERT INTO product_videos (id, product_id, content_type, video_data)
+            VALUES (?, ?, ?, ?)
+            """,
+            (video_id, product_id, content_type, video_data),
+        )
+    invalidate_public_product_lists()
+    return {
+        "product_id": product_id,
+        "video": {
+            "id": video_id,
+            "url": f"/api/products/{product_id}/videos/{video_id}",
+            "content_type": content_type,
+        },
+    }
+
+
+def read_product_video(product_id: str, video_id: str, request: Request):
+    with db_connection() as connection:
+        video = connection.execute(
+            """
+            SELECT v.content_type, v.video_data
+            FROM product_videos v
+            JOIN products p ON p.id = v.product_id
+            LEFT JOIN users u ON u.id = p.seller_id
+            WHERE v.product_id = ? AND v.id = ? AND p.is_active = 1
+              AND (p.seller_id IS NULL OR u.status = 'ACTIVE')
+            """,
+            (product_id, video_id),
+        ).fetchone()
+    if video is None:
+        raise HTTPException(status_code=404, detail="Video haikupatikana.")
+
+    video_data = video["video_data"]
+    total_bytes = len(video_data)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    }
+    range_header = request.headers.get("range")
+    if not range_header:
+        return Response(
+            content=video_data,
+            media_type=video["content_type"],
+            headers=headers,
+        )
+
+    normalized_range = range_header.strip()
+    match = (
+        re.fullmatch(r"bytes=(\d*)-(\d*)", normalized_range)
+        if len(normalized_range) <= 100
+        else None
+    )
+    if match is None or (not match.group(1) and not match.group(2)):
+        return Response(
+            status_code=416,
+            headers={**headers, "Content-Range": f"bytes */{total_bytes}"},
+        )
+    if not match.group(1):
+        suffix_bytes = int(match.group(2))
+        if suffix_bytes <= 0:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{total_bytes}"},
+            )
+        start = max(total_bytes - suffix_bytes, 0)
+        end = total_bytes - 1
+    else:
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else total_bytes - 1
+        if start >= total_bytes or start > end:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{total_bytes}"},
+            )
+        end = min(end, total_bytes - 1)
+
+    return Response(
+        content=video_data[start:end + 1],
+        status_code=206,
+        media_type=video["content_type"],
+        headers={
+            **headers,
+            "Content-Range": f"bytes {start}-{end}/{total_bytes}",
+        },
+    )
+
+
+def delete_product_video(product_id: str, video_id: str, request: Request):
+    seller = require_seller(request)
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        deleted = connection.execute(
+            "DELETE FROM product_videos WHERE product_id = ? AND id = ?",
+            (product_id, video_id),
+        )
+        if deleted.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Video haikupatikana.")
+    invalidate_public_product_lists()
+    return {"product_id": product_id, "video_id": video_id}
 
 
 def read_product_image(product_id: str):

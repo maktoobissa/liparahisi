@@ -1477,7 +1477,7 @@ class MarketplaceFlowTests(unittest.TestCase):
         ]
         product_list_cache = MagicMock()
         product_list_cache.scan_iter.return_value = iter(
-            ["liparahisi:public-products:v2:cached-list"]
+            ["liparahisi:public-products:v3:cached-list"]
         )
         with patch.object(main, "get_redis_client", return_value=product_list_cache):
             with seller_client:
@@ -1491,7 +1491,7 @@ class MarketplaceFlowTests(unittest.TestCase):
                     uploaded_gallery.text,
                 )
         product_list_cache.delete.assert_called_once_with(
-            "liparahisi:public-products:v2:cached-list"
+            "liparahisi:public-products:v3:cached-list"
         )
         public_product = guest_client.get(f"/api/products/{product_id}").json()
         self.assertEqual(len(public_product["gallery_images"]), 3)
@@ -1935,7 +1935,7 @@ class MarketplaceFlowTests(unittest.TestCase):
             200,
         )
 
-    def test_product_image_upload_validation_and_seller_ownership(self):
+    def test_product_media_upload_validation_and_seller_ownership(self):
         setup = self.client.post(
             "/api/auth/setup",
             json={
@@ -1984,6 +1984,7 @@ class MarketplaceFlowTests(unittest.TestCase):
                 "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
                 "0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082"
             )
+            video_data = b"\x00\x00\x00\x18ftypisom" + b"x" * 32
 
             upload = seller_client.post(
                 f"/api/products/{product_id}/image",
@@ -2000,6 +2001,85 @@ class MarketplaceFlowTests(unittest.TestCase):
             self.assertEqual(public_image.status_code, 200)
             self.assertEqual(public_image.headers["content-type"], "image/png")
             self.assertEqual(public_image.content, image_data)
+
+            uploaded_videos = []
+            for index in range(main.MAX_PRODUCT_VIDEOS):
+                upload_video = seller_client.post(
+                    f"/api/products/{product_id}/videos",
+                    files={
+                        "video": (
+                            f"product-{index}.mp4",
+                            video_data,
+                            "video/mp4",
+                        )
+                    },
+                )
+                self.assertEqual(upload_video.status_code, 200, upload_video.text)
+                uploaded_videos.append(upload_video.json()["video"])
+            video_limit = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("extra.mp4", video_data, "video/mp4")},
+            )
+            self.assertEqual(video_limit.status_code, 409)
+
+            public_product = public_client.get(
+                f"/api/products/{product_id}"
+            ).json()
+            self.assertEqual(len(public_product["videos"]), main.MAX_PRODUCT_VIDEOS)
+            public_products = public_client.get("/api/products").json()
+            listed_product = next(
+                item for item in public_products if item["id"] == product_id
+            )
+            self.assertEqual(len(listed_product["videos"]), main.MAX_PRODUCT_VIDEOS)
+            public_video = public_client.get(
+                uploaded_videos[0]["url"],
+                headers={"Range": "bytes=4-11"},
+            )
+            self.assertEqual(public_video.status_code, 206)
+            self.assertEqual(public_video.content, video_data[4:12])
+            self.assertEqual(public_video.headers["content-range"], f"bytes 4-11/{len(video_data)}")
+            self.assertEqual(public_video.headers["accept-ranges"], "bytes")
+            invalid_range = public_client.get(
+                uploaded_videos[0]["url"],
+                headers={"Range": f"bytes={'9' * 101}-"},
+            )
+            self.assertEqual(invalid_range.status_code, 416)
+            self.assertEqual(
+                invalid_range.headers["content-range"],
+                f"bytes */{len(video_data)}",
+            )
+
+            invalid_video_signature = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("invalid.mp4", b"not an mp4", "video/mp4")},
+            )
+            self.assertEqual(invalid_video_signature.status_code, 422)
+            invalid_video_type = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("invalid.txt", b"file", "text/plain")},
+            )
+            self.assertEqual(invalid_video_type.status_code, 415)
+            oversized_video = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={
+                    "video": (
+                        "large.mp4",
+                        b"\x00\x00\x00\x18ftypisom"
+                        + b"x" * main.MAX_PRODUCT_VIDEO_BYTES,
+                        "video/mp4",
+                    )
+                },
+            )
+            self.assertEqual(oversized_video.status_code, 413)
+
+            deleted_video = seller_client.delete(
+                f"/api/products/{product_id}/videos/{uploaded_videos[0]['id']}"
+            )
+            self.assertEqual(deleted_video.status_code, 200)
+            remaining_videos = public_client.get(
+                f"/api/products/{product_id}"
+            ).json()["videos"]
+            self.assertEqual(len(remaining_videos), main.MAX_PRODUCT_VIDEOS - 1)
 
             invalid_signature = seller_client.post(
                 f"/api/products/{product_id}/image",
@@ -2061,6 +2141,15 @@ class MarketplaceFlowTests(unittest.TestCase):
             self.assertEqual(denied_upload.status_code, 404)
             denied_delete = other_client.delete(f"/api/products/{product_id}/image")
             self.assertEqual(denied_delete.status_code, 404)
+            denied_video_upload = other_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("product.mp4", video_data, "video/mp4")},
+            )
+            self.assertEqual(denied_video_upload.status_code, 404)
+            denied_video_delete = other_client.delete(
+                f"/api/products/{product_id}/videos/{uploaded_videos[1]['id']}"
+            )
+            self.assertEqual(denied_video_delete.status_code, 404)
 
     def test_existing_sqlite_products_and_orders_are_migrated(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
