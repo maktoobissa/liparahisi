@@ -31,6 +31,12 @@ services:
         value: "false"
       - key: CLICKPESA_MANUAL_PAYOUTS_CONFIRMED
         value: "false"
+      - key: ABLINER_LIVE_ENABLED
+        value: "false"
+      - key: ABLINER_API_KEY
+        sync: false
+      - key: ABLINER_WEBHOOK_SECRET
+        sync: false
       - key: EMAIL_PROVIDER
         value: resend
       - key: RESEND_API_KEY

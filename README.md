@@ -46,7 +46,8 @@ in its ledger, but does **not** transfer money to sellers; the platform must
 pay them manually and reconcile those payouts.
 
 Demo mode remains the default (`DEMO_MODE=true`), and the Render Blueprint
-keeps live payments disabled. A successful demo checkout transfers no money.
+keeps ClickPesa and Abliner live payments disabled. A successful demo checkout
+transfers no money.
 Never ask buyers for their wallet PIN or OTP.
 
 ClickPesa requires merchant KYC and API access. Its public docs state that API
@@ -74,6 +75,30 @@ TZS 250,000. Mobile-money USSD Push fees are charged to the customer in
 addition to mobile-network fees; the exact fee should be confirmed in the
 ClickPesa payment flow. Fees and terms can change; confirm them with ClickPesa
 before accepting live payments.
+
+The app also supports Abliner Mobile Money deposits for product and cart
+checkout. Abliner's [official API documentation](https://abliner.net/docs)
+specifies a production-only API (no sandbox), signed deposit requests, and
+signed webhooks. Automated tests mock the API and never start real charges.
+The checkout sends the HTTPS callback URL
+`https://<your-app-domain>/api/webhooks/abliner` and uses an idempotency key
+per checkout. Abliner's published deposit range for TZS is TZS 500 to
+TZS 3,000,000 per transaction.
+
+To prepare Abliner without exposing credentials:
+
+1. Complete Abliner's business verification and generate both an API key and a
+   separate webhook signing secret in its dashboard. An API key alone is not
+   enough for deposits.
+2. Set `ABLINER_API_KEY` and `ABLINER_WEBHOOK_SECRET` as secrets in Render.
+   Never place either value in source control, frontend code, or chat.
+3. Keep `ABLINER_LIVE_ENABLED=false` until the account and callback are ready,
+   seller payouts are understood, and the app has a durable production
+   database with backups. The current Free Render database in this Blueprint
+   is for testing and must not be used for live financial records.
+4. Only after those requirements are met, set `ABLINER_LIVE_ENABLED=true`.
+   Abliner then sends a real mobile-money prompt; the API does not provide a
+   sandbox. `DEMO_MODE` can remain enabled for other payment methods.
 
 The current Selcom helper remains unused; setting Selcom credentials does not
 enable live payments.

@@ -21,6 +21,7 @@ from backend.main import (
     order_status,
     order_history,
     moderate_review,
+    process_abliner_webhook,
     process_clickpesa_webhook,
     read_cart_checkout,
     request_cancellation,
@@ -71,6 +72,11 @@ app.add_api_route(
 app.add_api_route(
     "/webhooks/clickpesa",
     process_clickpesa_webhook,
+    methods=["POST"],
+)
+app.add_api_route(
+    "/webhooks/abliner",
+    process_abliner_webhook,
     methods=["POST"],
 )
 app.add_api_route(

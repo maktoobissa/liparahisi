@@ -5,8 +5,15 @@ import { translate, useLanguage, useLocalize } from "./i18n.jsx";
 import { useFeedbackState, useNotification } from "./notifications.jsx";
 
 const API = "/api";
+const ABLINER_PAYMENT_METHOD = "Abliner Mobile Money";
 const productImageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
 const maxProductImageBytes = 5 * 1024 * 1024;
+const ablinerNetwork = {
+  value: ABLINER_PAYMENT_METHOD,
+  label: "Abliner Mobile Money",
+  short: "AB",
+  color: "bank",
+};
 const networks = [
   { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa" },
   { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo" },
@@ -18,6 +25,18 @@ const networks = [
   { value: "NMB Branch", label: "Tawi la NMB", short: "NT", color: "bank" },
   { value: "CRDB Branch", label: "Tawi la CRDB", short: "CT", color: "bank" },
 ];
+const clickpesaNetworkValues = new Set(["M-Pesa", "Halo Pesa", "Tigo Pesa", "Airtel Money"]);
+
+function paymentOptionsFor(config) {
+  if (config?.abliner_live_enabled !== true) return networks;
+  const methods = config.demo_mode
+    ? networks
+    : config.live_payments_enabled
+      ? networks.filter((method) => clickpesaNetworkValues.has(method.value))
+      : [];
+  return [...methods, ablinerNetwork];
+}
+
 const bankBranches = [
   "Dar es Salaam - Kariakoo",
   "Dar es Salaam - Posta",
@@ -1708,7 +1727,18 @@ function CheckoutPage({ productId }) {
     let active = true;
     api("/config/integrations")
       .then((config) => {
-        if (active) setPaymentConfig(config);
+        if (active) {
+          setPaymentConfig(config);
+          if (
+            config.abliner_live_enabled === true
+            && config.demo_mode !== true
+            && config.live_payments_enabled !== true
+          ) {
+            setForm((current) => current.payment_method === "M-Pesa"
+              ? { ...current, payment_method: ABLINER_PAYMENT_METHOD }
+              : current);
+          }
+        }
       })
       .catch((requestError) => {
         if (active) setError(requestError.message);
@@ -1842,6 +1872,9 @@ function CheckoutPage({ productId }) {
 
   const isCompleted = order?.payment_status === "COMPLETED";
   const isLivePayment = paymentConfig?.live_payments_enabled === true;
+  const isAblinerLive = paymentConfig?.abliner_live_enabled === true;
+  const isAblinerSelected = form.payment_method === ABLINER_PAYMENT_METHOD;
+  const paymentMethods = paymentOptionsFor(paymentConfig);
   const selectedMethod = networks.find((method) => method.value === form.payment_method);
   return localize(
     <main className="page-shell checkout-shell">
@@ -1864,13 +1897,17 @@ function CheckoutPage({ productId }) {
               <input id="buyer-phone" className="text-input" type="tel" inputMode="tel" autoComplete="tel" placeholder="Mf. 0712 345 678" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
               <label className="field-label" htmlFor="buyer-address">Anuani ya delivery (hiari)</label>
               <input id="buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
-              {isLivePayment ? (
+              {isAblinerSelected && (
+                <p className="field-hint">Abliner itatuma ombi la malipo kwenye simu yako. Thibitisha kwenye simu; usiweke PIN au OTP kwenye tovuti hii.</p>
+              )}
+              {isLivePayment && !isAblinerSelected && (
                 <p className="field-hint">ClickPesa itatuma ombi la USSD kwenye namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha malipo kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</p>
-              ) : (
+              )}
+              {(!isLivePayment || isAblinerLive) && (
                 <fieldset className="payment-fieldset">
                   <legend>Chagua mtandao wa malipo</legend>
                   <div className="method-grid">
-                    {networks.map((method) => (
+                    {paymentMethods.map((method) => (
                       <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value, bank_branch: method.value.endsWith("Branch") ? form.bank_branch : "", bank_branch_name: method.value.endsWith("Branch") ? form.bank_branch_name : "" })}>
                         <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
                       </button>
@@ -1898,22 +1935,24 @@ function CheckoutPage({ productId }) {
             </form>
             <button className="cart-secondary-button" type="button" onClick={addToCart}>Ongeza bidhaa nyingine kwenye kikapu</button>
             {cartCount > 0 && <a className="cart-link" href="/cart">Nenda kikapu ({cartCount})</a>}
-            <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : "Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji."}</p>
+            <p className="checkout-footnote">{isAblinerSelected ? "Malipo yatakusanywa kupitia Abliner kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : "Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji."}</p>
           </section>
         )}
         {orderId && order && !isCompleted && order.payment_status !== "FAILED" && (
           <section className="checkout-card">
-            <div className="eyebrow"><span /> {order.demo ? "MALIPO YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+            <div className="eyebrow"><span /> {order.demo ? "MALIPO YA MAJARIBIO" : order.payment_method === ABLINER_PAYMENT_METHOD ? "MALIPO YA ABLINER" : "MALIPO YA CLICKPESA"}</div>
             <h1>{order.demo ? "Thibitisha oda yako" : "Subiri ombi la malipo"}</h1>
             <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
             <div className="payment-result pending">
               <strong>Haijalipwa bado</strong>
               {order.demo ? (
                 <span>Bonyeza kitufe chini kuthibitisha demo. Hakuna pesa halisi itakayohamishwa.</span>
+              ) : order.payment_method === ABLINER_PAYMENT_METHOD ? (
+                <span>Ombi la malipo la Abliner limetumwa kwa namba uliyoingiza. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
               ) : (
                 <span>Ombi la malipo limetumwa kwa namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
               )}
-              <span>Njia ya malipo: {order.payment_method || selectedMethod?.label}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
+              <span>Njia ya malipo: {order.payment_method || (isAblinerSelected ? ABLINER_PAYMENT_METHOD : selectedMethod?.label)}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
             </div>
             {error && <p className="form-error" role="alert">{error}</p>}
             {order.demo && <button className="generate-button" type="button" disabled={busy} onClick={completeDemo}>{busy ? "Inathibitisha..." : "Thibitisha malipo ya majaribio"}</button>}
@@ -1979,7 +2018,18 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
     let active = true;
     api("/config/integrations")
       .then((config) => {
-        if (active) setPaymentConfig(config);
+        if (active) {
+          setPaymentConfig(config);
+          if (
+            config.abliner_live_enabled === true
+            && config.demo_mode !== true
+            && config.live_payments_enabled !== true
+          ) {
+            setForm((current) => current.payment_method === "M-Pesa"
+              ? { ...current, payment_method: ABLINER_PAYMENT_METHOD }
+              : current);
+          }
+        }
       })
       .catch((requestError) => {
         if (active) setError(requestError.message);
@@ -2110,6 +2160,9 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
 
   const total = products.reduce((sum, product) => sum + product.amount * (items.find((item) => item.product_id === product.id)?.quantity || 0), 0);
   const isLivePayment = paymentConfig?.live_payments_enabled === true;
+  const isAblinerLive = paymentConfig?.abliner_live_enabled === true;
+  const isAblinerSelected = form.payment_method === ABLINER_PAYMENT_METHOD;
+  const paymentMethods = paymentOptionsFor(paymentConfig);
 
   return localize(
     <main className="page-shell checkout-shell">
@@ -2138,13 +2191,17 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <input id="cart-buyer-phone" className="text-input" type="tel" inputMode="tel" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
                   <label className="field-label" htmlFor="cart-buyer-address">Anuani ya delivery (hiari)</label>
                   <input id="cart-buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
-                  {isLivePayment ? (
+                  {isAblinerSelected && (
+                    <p className="field-hint">Abliner itatuma ombi moja la malipo kwa jumla ya kikapu. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
+                  )}
+                  {isLivePayment && !isAblinerSelected && (
                     <p className="field-hint">ClickPesa itatuma ombi moja la USSD kwa jumla ya kikapu. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
-                  ) : (
+                  )}
+                  {(!isLivePayment || isAblinerLive) && (
                     <fieldset className="payment-fieldset">
                       <legend>Chagua mtandao wa malipo</legend>
                       <div className="method-grid">
-                        {networks.map((method) => (
+                        {paymentMethods.map((method) => (
                           <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
                             <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
                           </button>
@@ -2156,12 +2213,12 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}</button>
                 </form>
               )}
-              <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : "Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa."}</p>
+              <p className="checkout-footnote">{isAblinerSelected ? "Malipo yatakusanywa kupitia Abliner kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : "Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa."}</p>
             </>
           )}
           {checkoutId && checkout && (
             <>
-              <div className="eyebrow"><span /> {checkout.demo ? "ODA YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+              <div className="eyebrow"><span /> {checkout.demo ? "ODA YA MAJARIBIO" : checkout.payment_method === ABLINER_PAYMENT_METHOD ? "MALIPO YA ABLINER" : "MALIPO YA CLICKPESA"}</div>
               {checkout.payment_status === "COMPLETED" && <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />}
               <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : checkout.demo ? "Gawanya kwa wauzaji" : "Subiri ombi la malipo"}</h1>
               {checkout.splits.map((split) => (
@@ -2175,7 +2232,13 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               ))}
               <div className="checkout-amount">Jumla ya mteja: TZS {formatMoney(checkout.total_amount)}</div>
               <p className="field-hint">Kamisheni inakatwa kwenye mgao wa kila muuzaji; haiongezwi kwenye bili ya mnunuzi.</p>
-              {checkout.payment_status === "PENDING" && !checkout.demo && <p className="payment-result pending">Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti.</p>}
+              {checkout.payment_status === "PENDING" && !checkout.demo && (
+                <p className="payment-result pending">
+                  {checkout.payment_method === ABLINER_PAYMENT_METHOD
+                    ? "Ombi moja la Abliner limetumwa kwa jumla ya kikapu. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti."
+                    : "Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti."}
+                </p>
+              )}
               {checkout.payment_status === "PENDING" && checkout.demo && (
                 <button className="generate-button" type="button" disabled={busy} onClick={completeCart}>{busy ? "Inathibitisha..." : "Thibitisha demo kwa wauzaji wote"}</button>
               )}

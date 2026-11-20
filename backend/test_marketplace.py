@@ -1,4 +1,6 @@
 import hashlib
+import hmac
+import json
 import os
 import re
 import sqlite3
@@ -1338,6 +1340,182 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.assertEqual(len(sales), 1)
         self.assertEqual(sales[0]["order_id"], "OLD-ORDER")
         self.assertEqual(sales[0]["platform_fee"], 0)
+
+    def test_abliner_checkout_and_signed_webhook_are_idempotent(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ABLINER_LIVE_ENABLED": "false",
+                "ABLINER_API_KEY": "",
+                "ABLINER_WEBHOOK_SECRET": "",
+            },
+        ):
+            status = self.client.get("/api/config/integrations").json()
+        self.assertFalse(status["abliner_live_enabled"])
+
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+
+        seller_client = TestClient(main.app)
+        with seller_client:
+            registration = seller_client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": "Seller Abliner",
+                    "email": "abliner-seller@example.com",
+                    "password": "seller-password-long",
+                    "shop_name": "Duka Abliner",
+                    "phone": "0712345678",
+                },
+            )
+            self.assertEqual(registration.status_code, 201)
+            seller = self.client.get("/api/admin/sellers").json()[0]
+            approval = self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            )
+            self.assertEqual(approval.status_code, 200)
+            login = seller_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "abliner-seller@example.com",
+                    "password": "seller-password-long",
+                },
+            )
+            self.assertEqual(login.status_code, 200)
+            product = seller_client.post(
+                "/api/products",
+                json={
+                    "name": "Bidhaa ya Abliner",
+                    "amount": 5000,
+                    "cost_amount": 2500,
+                    "stock_quantity": 5,
+                },
+            )
+            self.assertEqual(product.status_code, 201, product.text)
+            product_id = product.json()["id"]
+
+        class FakeAblinerClient:
+            def __init__(self):
+                self.request = None
+
+            async def create_mobile_deposit(self, **kwargs):
+                self.request = kwargs
+                return {
+                    "id": "abliner-tx-1",
+                    "type": "deposit",
+                    "status": "pending",
+                    "amount": kwargs["amount"],
+                    "currency": "TZS",
+                    "customer_reference": kwargs["reference"],
+                }
+
+        fake_client = FakeAblinerClient()
+        buyer_client = TestClient(main.app)
+        with buyer_client, patch.dict(
+            os.environ,
+            {
+                "ABLINER_LIVE_ENABLED": "true",
+                "ABLINER_API_KEY": "test-api-key",
+                "ABLINER_WEBHOOK_SECRET": "test-webhook-secret",
+                "PUBLIC_APP_URL": "https://liparahisi.onrender.com",
+            },
+        ), patch("backend.main.get_abliner_client", return_value=fake_client):
+            checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    "request_key": "f" * 32,
+                    "buyer_name": "Buyer Abliner",
+                    "buyer_email": "buyer-abliner@example.com",
+                    "buyer_phone": "0712345678",
+                    "payment_method": "Abliner Mobile Money",
+                },
+            )
+            self.assertEqual(checkout.status_code, 200, checkout.text)
+            self.assertFalse(checkout.json()["demo"])
+            self.assertEqual(checkout.json()["payment_status"], "PENDING")
+            order_id = checkout.json()["order_id"]
+            order = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(order["payment_method"], "Abliner Mobile Money")
+            self.assertEqual(order["payment_status"], "PENDING")
+            self.assertEqual(fake_client.request["phone"], "255712345678")
+            self.assertEqual(
+                fake_client.request["callback_url"],
+                "https://liparahisi.onrender.com/api/webhooks/abliner",
+            )
+
+            with main.db_connection() as connection:
+                provider_reference = connection.execute(
+                    "SELECT provider_reference FROM orders WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()["provider_reference"]
+                stock_before = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()["stock_quantity"]
+
+            payload = {
+                "id": "evt_abliner_1",
+                "event": "transaction.completed",
+                "data": {
+                    "id": "abliner-tx-1",
+                    "type": "deposit",
+                    "amount": 5000,
+                    "currency": "TZS",
+                    "status": "completed",
+                    "customer_reference": provider_reference,
+                },
+            }
+            raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            timestamp = str(int(time.time()))
+            signature = hmac.new(
+                b"test-webhook-secret",
+                timestamp.encode("ascii") + b"." + raw_body,
+                hashlib.sha256,
+            ).hexdigest()
+            headers = {
+                "content-type": "application/json",
+                "x-webhook-timestamp": timestamp,
+                "x-webhook-signature": signature,
+            }
+            invalid_callback = buyer_client.post(
+                "/api/webhooks/abliner",
+                content=raw_body,
+                headers={**headers, "x-webhook-signature": "0" * 64},
+            )
+            self.assertEqual(invalid_callback.status_code, 401)
+
+            with patch("backend.main.send_payment_notification") as payment_notification:
+                callback = buyer_client.post(
+                    "/api/webhooks/abliner",
+                    content=raw_body,
+                    headers=headers,
+                )
+                self.assertEqual(callback.status_code, 200, callback.text)
+                repeated_callback = buyer_client.post(
+                    "/api/webhooks/abliner",
+                    content=raw_body,
+                    headers=headers,
+                )
+                self.assertEqual(repeated_callback.status_code, 200, repeated_callback.text)
+                self.assertEqual(payment_notification.call_count, 1)
+
+            completed = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(completed["payment_status"], "COMPLETED")
+            with main.db_connection() as connection:
+                stock_after = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()["stock_quantity"]
+            self.assertEqual(stock_after, stock_before - 1)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ import psycopg
 from redis import Redis
 from redis.exceptions import RedisError
 from psycopg_pool import ConnectionPool
+from backend.abliner import AblinerClient, AblinerError, verify_webhook_signature
 from backend.clickpesa import ClickPesaClient, ClickPesaError, verify_webhook_checksum
 from backend.email_delivery import (
     EmailDeliveryError,
@@ -40,7 +41,7 @@ from backend.email_templates import (
     welcome_email,
 )
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
@@ -64,6 +65,7 @@ ORDER_TTL_SECONDS = 60 * 60 * 24
 RESET_TOKEN_TTL_SECONDS = 60 * 60
 PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
+ABLINER_PAYMENT_METHOD = "Abliner Mobile Money"
 PAYMENT_METHODS = {
     "M-Pesa",
     "Halo Pesa",
@@ -74,6 +76,7 @@ PAYMENT_METHODS = {
     "NBC",
     "NMB Branch",
     "CRDB Branch",
+    ABLINER_PAYMENT_METHOD,
 }
 
 
@@ -1079,6 +1082,8 @@ def is_demo_mode():
 
 _clickpesa_client = None
 _clickpesa_client_credentials = None
+_abliner_client = None
+_abliner_client_credentials = None
 
 
 def clickpesa_is_configured():
@@ -1103,6 +1108,39 @@ def clickpesa_live_enabled():
     )
 
 
+def abliner_live_requested():
+    return os.getenv("ABLINER_LIVE_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def abliner_credentials_configured():
+    return all(
+        os.getenv(key, "").strip()
+        for key in ("ABLINER_API_KEY", "ABLINER_WEBHOOK_SECRET")
+    )
+
+
+def abliner_live_enabled():
+    return abliner_live_requested() and abliner_credentials_configured()
+
+
+def require_abliner_live():
+    if not abliner_live_requested():
+        raise HTTPException(
+            status_code=503,
+            detail="Malipo ya Abliner hayajawashwa kwenye Render.",
+        )
+    if not abliner_credentials_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Abliner inahitaji API key na webhook signing secret kwenye Render.",
+        )
+
+
 def get_clickpesa_client():
     global _clickpesa_client, _clickpesa_client_credentials
     credentials = (
@@ -1116,6 +1154,20 @@ def get_clickpesa_client():
         _clickpesa_client = ClickPesaClient(*credentials)
         _clickpesa_client_credentials = credentials
     return _clickpesa_client
+
+
+def get_abliner_client():
+    global _abliner_client, _abliner_client_credentials
+    credentials = (
+        os.getenv("ABLINER_API_KEY", "").strip(),
+        os.getenv("ABLINER_WEBHOOK_SECRET", "").strip(),
+    )
+    if not all(credentials):
+        raise AblinerError("Abliner credentials hazijawekwa.")
+    if credentials != _abliner_client_credentials:
+        _abliner_client = AblinerClient(*credentials)
+        _abliner_client_credentials = credentials
+    return _abliner_client
 
 
 def public_app_url(request_base_url=None):
@@ -1247,7 +1299,7 @@ def send_payment_notification(order_ids, failed=False, demo=False):
     return buyer_email_sent
 
 
-def complete_order_group(order_ids, provider_verified=False):
+def complete_order_group(order_ids, provider_verified=False, background_tasks=None):
     expire_pending_orders()
     newly_completed_ids = []
     with db_connection() as connection:
@@ -1342,10 +1394,17 @@ def complete_order_group(order_ids, provider_verified=False):
                 )
     completed_orders = [get_order(order_id) for order_id in order_ids]
     if newly_completed_ids:
-        send_payment_notification(
-            newly_completed_ids,
-            demo=not provider_verified,
-        )
+        if background_tasks is not None:
+            background_tasks.add_task(
+                send_payment_notification,
+                newly_completed_ids,
+                demo=not provider_verified,
+            )
+        else:
+            send_payment_notification(
+                newly_completed_ids,
+                demo=not provider_verified,
+            )
     return completed_orders
 
 
@@ -1354,7 +1413,7 @@ def complete_demo_order(order_id):
     return orders[0]
 
 
-def clickpesa_orders_for_reference(order_reference):
+def orders_for_provider_reference(order_reference):
     with db_connection() as connection:
         anchor = connection.execute(
             "SELECT order_id, checkout_id FROM orders WHERE provider_reference = ?",
@@ -1373,6 +1432,10 @@ def clickpesa_orders_for_reference(order_reference):
                 (anchor["order_id"],),
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def clickpesa_orders_for_reference(order_reference):
+    return orders_for_provider_reference(order_reference)
 
 
 def update_clickpesa_reference_status(order_reference, status, payment_id=""):
@@ -1472,6 +1535,179 @@ async def begin_clickpesa_payment(order_reference, phone_number, amount):
     return "PENDING"
 
 
+def validate_abliner_transaction(order_reference, amount, currency):
+    if currency != "TZS":
+        raise HTTPException(status_code=422, detail="Sarafu ya malipo ya Abliner si sahihi.")
+    orders = orders_for_provider_reference(order_reference)
+    if any(order["payment_method"] != ABLINER_PAYMENT_METHOD for order in orders):
+        raise HTTPException(status_code=422, detail="Rejea si ya oda ya Abliner.")
+    try:
+        collected_amount = Decimal(str(amount))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo ya Abliner si sahihi.")
+    expected_amount = sum(order["amount"] for order in orders)
+    if (
+        not collected_amount.is_finite()
+        or collected_amount != collected_amount.to_integral_value()
+        or collected_amount != expected_amount
+    ):
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo hakilingani na oda.")
+    return orders
+
+
+def update_abliner_reference_status(
+    order_reference,
+    status,
+    payment_id="",
+    background_tasks=None,
+):
+    orders = orders_for_provider_reference(order_reference)
+    if any(order["payment_method"] != ABLINER_PAYMENT_METHOD for order in orders):
+        raise HTTPException(status_code=422, detail="Rejea si ya oda ya Abliner.")
+    newly_failed_ids = []
+    with db_connection() as connection:
+        for order in orders:
+            updated = connection.execute(
+                """
+                UPDATE orders
+                SET payment_status = ?,
+                    provider_payment_id = CASE WHEN ? <> '' THEN ? ELSE provider_payment_id END
+                WHERE order_id = ? AND payment_status = 'PENDING'
+                """,
+                (status, payment_id, payment_id, order["order_id"]),
+            )
+            if status == "FAILED" and updated.rowcount:
+                newly_failed_ids.append(order["order_id"])
+    if newly_failed_ids:
+        if background_tasks is not None:
+            background_tasks.add_task(
+                send_payment_notification,
+                newly_failed_ids,
+                failed=True,
+            )
+        else:
+            send_payment_notification(newly_failed_ids, failed=True)
+
+
+async def begin_abliner_payment(order_reference, phone_number, amount, callback_url):
+    try:
+        result = await get_abliner_client().create_mobile_deposit(
+            amount=amount,
+            phone=phone_number,
+            reference=order_reference,
+            callback_url=callback_url,
+        )
+    except AblinerError as error:
+        logger.warning(
+            "Abliner deposit failed for reference %s (uncertain=%s).",
+            order_reference,
+            error.uncertain,
+        )
+        if not error.uncertain:
+            update_abliner_reference_status(order_reference, "FAILED")
+            return "FAILED"
+        return "PENDING"
+
+    orders = orders_for_provider_reference(order_reference)
+    with db_connection() as connection:
+        for order in orders:
+            connection.execute(
+                "UPDATE orders SET provider_payment_id = ? WHERE order_id = ?",
+                (result["id"], order["order_id"]),
+            )
+    return "PENDING"
+
+
+def complete_abliner_payment(
+    order_reference,
+    amount,
+    currency,
+    payment_id="",
+    background_tasks=None,
+):
+    orders = validate_abliner_transaction(order_reference, amount, currency)
+    if any(
+        order["payment_status"] not in {"PENDING", "COMPLETED", "EXPIRED"}
+        for order in orders
+    ):
+        raise HTTPException(status_code=409, detail="Oda hii haiwezi kukamilishwa tena.")
+    completed = complete_order_group(
+        [order["order_id"] for order in orders],
+        provider_verified=True,
+        background_tasks=background_tasks,
+    )
+    if payment_id:
+        with db_connection() as connection:
+            for order in orders:
+                connection.execute(
+                    "UPDATE orders SET provider_payment_id = ? WHERE order_id = ?",
+                    (payment_id, order["order_id"]),
+                )
+    return completed
+
+
+async def process_abliner_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    webhook_secret = os.getenv("ABLINER_WEBHOOK_SECRET", "").strip()
+    if not webhook_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Abliner webhook signing secret haijawekwa.",
+        )
+    raw_body = await request.body()
+    if len(raw_body) > 65536:
+        raise HTTPException(status_code=413, detail="Ombi la webhook ya Abliner ni kubwa mno.")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    signature = request.headers.get("x-webhook-signature", "")
+    if not verify_webhook_signature(raw_body, timestamp, signature, webhook_secret):
+        raise HTTPException(status_code=401, detail="Saini ya webhook ya Abliner si sahihi.")
+    try:
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Taarifa za webhook ya Abliner si sahihi.") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Taarifa za webhook ya Abliner si sahihi.")
+
+    event = payload.get("event")
+    if event not in {"transaction.completed", "transaction.failed"}:
+        return {"received": True, "ignored": True}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Taarifa za malipo ya Abliner si sahihi.")
+    if data.get("type") != "deposit":
+        return {"received": True, "ignored": True}
+    order_reference = data.get("customer_reference")
+    if not isinstance(order_reference, str) or not order_reference:
+        raise HTTPException(status_code=400, detail="Webhook ya Abliner haina rejea ya oda.")
+    if event == "transaction.failed":
+        if data.get("status") != "failed":
+            raise HTTPException(status_code=400, detail="Hali ya webhook ya Abliner si sahihi.")
+        validate_abliner_transaction(
+            order_reference,
+            data.get("amount"),
+            data.get("currency"),
+        )
+        update_abliner_reference_status(
+            order_reference,
+            "FAILED",
+            data.get("id", ""),
+            background_tasks,
+        )
+        return {"received": True}
+    if data.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Hali ya webhook ya Abliner si sahihi.")
+    complete_abliner_payment(
+        order_reference,
+        data.get("amount"),
+        data.get("currency"),
+        data.get("id", ""),
+        background_tasks,
+    )
+    return {"received": True}
+
+
 def process_clickpesa_webhook(payload: dict):
     checksum_key = os.getenv("CLICKPESA_CHECKSUM_KEY", "").strip()
     if not verify_webhook_checksum(payload, checksum_key):
@@ -1560,6 +1796,9 @@ def integration_status():
         "live_payments_enabled": clickpesa_live_enabled(),
         "clickpesa_configured": clickpesa_is_configured(),
         "clickpesa_live_enabled": clickpesa_live_enabled(),
+        "abliner_live_requested": abliner_live_requested(),
+        "abliner_credentials_configured": abliner_credentials_configured(),
+        "abliner_live_enabled": abliner_live_enabled(),
         "selcom_configured": selcom_configured,
         "smtp_configured": smtp_configured,
         "email_configured": email_configured,
@@ -1926,6 +2165,24 @@ async def clickpesa_webhook_gateway(request: Request):
     return await proxy_internal_api(
         request,
         "webhooks/clickpesa",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/webhooks/abliner", methods=["POST"])
+async def abliner_webhook_gateway(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    if not os.getenv("ORDERS_SERVICE_URL", "").strip():
+        return await process_abliner_webhook(request, background_tasks)
+    return await proxy_internal_api(
+        request,
+        "webhooks/abliner",
         "Orders",
         "ORDERS_SERVICE_URL",
         "ORDERS_SERVICE_TOKEN",
@@ -3101,12 +3358,15 @@ def delete_product_image(product_id: str, request: Request):
 
 async def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
     demo_mode = is_demo_mode()
-    if not demo_mode and not clickpesa_live_enabled():
+    abliner_mode = payload.payment_method == ABLINER_PAYMENT_METHOD
+    if abliner_mode:
+        require_abliner_live()
+    elif not demo_mode and not clickpesa_live_enabled():
         raise HTTPException(
             status_code=503,
             detail="Malipo ya ClickPesa hayajaanzishwa au hayajakamilisha mipangilio salama.",
         )
-    if not demo_mode and payload.payment_method not in {
+    if not demo_mode and not abliner_mode and payload.payment_method not in {
         "M-Pesa",
         "Halo Pesa",
         "Tigo Pesa",
@@ -3146,8 +3406,9 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                 "demo": not bool(order["provider_reference"]),
             }
 
-    order_id = ("DEMO" if demo_mode else "ORD") + secrets.token_hex(10).upper()
-    provider_reference = "" if demo_mode else "LR" + secrets.token_hex(9).upper()
+    demo_order = demo_mode and not abliner_mode
+    order_id = ("DEMO" if demo_order else "ORD") + secrets.token_hex(10).upper()
+    provider_reference = "" if demo_order else "LR" + secrets.token_hex(9).upper()
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     try:
@@ -3171,7 +3432,9 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     payload.buyer_email,
                     payload.buyer_phone,
                     buyer_id,
-                    payload.payment_method if demo_mode else "ClickPesa USSD Push",
+                    ABLINER_PAYMENT_METHOD
+                    if abliner_mode
+                    else payload.payment_method if demo_mode else "ClickPesa USSD Push",
                     payload.bank_branch or "",
                     payload.delivery_address.strip(),
                     provider_reference,
@@ -3206,7 +3469,7 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
     app_url = public_app_url(str(request.base_url))
     checkout_url = (
         f"{app_url}/pay/{product_id}?order_id={quote(order_id)}"
-        + ("&demo=1" if demo_mode else "")
+        + ("&demo=1" if demo_order else "")
     )
     with db_connection() as connection:
         connection.execute(
@@ -3214,7 +3477,14 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
             (checkout_url, order_id),
         )
     payment_status = "PENDING"
-    if not demo_mode:
+    if abliner_mode:
+        payment_status = await begin_abliner_payment(
+            provider_reference,
+            payload.buyer_phone,
+            product["amount"],
+            f"{app_url}/api/webhooks/abliner",
+        )
+    elif not demo_mode:
         payment_status = await begin_clickpesa_payment(
             provider_reference,
             payload.buyer_phone,
@@ -3224,18 +3494,21 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
         "order_id": order_id,
         "checkout_url": checkout_url,
         "payment_status": payment_status,
-        "demo": demo_mode,
+        "demo": demo_order,
     }
 
 
 async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     demo_mode = is_demo_mode()
-    if not demo_mode and not clickpesa_live_enabled():
+    abliner_mode = payload.payment_method == ABLINER_PAYMENT_METHOD
+    if abliner_mode:
+        require_abliner_live()
+    elif not demo_mode and not clickpesa_live_enabled():
         raise HTTPException(
             status_code=503,
             detail="Malipo ya ClickPesa hayajaanzishwa au hayajakamilisha mipangilio salama.",
         )
-    if not demo_mode and payload.payment_method not in {
+    if not demo_mode and not abliner_mode and payload.payment_method not in {
         "M-Pesa",
         "Halo Pesa",
         "Tigo Pesa",
@@ -3281,11 +3554,12 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             return get_cart_checkout(existing["checkout_id"], request)
 
         checkout_id = "CART" + secrets.token_hex(16).upper()
-        provider_reference = "" if demo_mode else "LR" + secrets.token_hex(9).upper()
+        demo_order = demo_mode and not abliner_mode
+        provider_reference = "" if demo_order else "LR" + secrets.token_hex(9).upper()
         expires_at = time.time() + ORDER_TTL_SECONDS
         order_ids = []
         for seller_index, (seller_id, seller_items) in enumerate(merged.items()):
-            order_id = ("DEMO" if demo_mode else "ORD") + secrets.token_hex(10).upper()
+            order_id = ("DEMO" if demo_order else "ORD") + secrets.token_hex(10).upper()
             amount = sum(product["amount"] * quantity for product, quantity in seller_items)
             product_cost = sum(product["cost_amount"] * quantity for product, quantity in seller_items)
             fee = commission_amount(amount)
@@ -3312,7 +3586,9 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     payload.buyer_email,
                     payload.buyer_phone,
                     buyer_id,
-                    payload.payment_method if demo_mode else "ClickPesa USSD Push",
+                    ABLINER_PAYMENT_METHOD
+                    if abliner_mode
+                    else payload.payment_method if demo_mode else "ClickPesa USSD Push",
                     payload.bank_branch or "",
                     payload.delivery_address.strip(),
                     provider_reference if seller_index == 0 else "",
@@ -3350,11 +3626,18 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             (checkout_url, checkout_id),
         )
     payment_status = "PENDING"
-    if not demo_mode:
-        total_amount = sum(
-            sum(product["amount"] * quantity for product, quantity in seller_items)
-            for seller_items in merged.values()
+    total_amount = sum(
+        sum(product["amount"] * quantity for product, quantity in seller_items)
+        for seller_items in merged.values()
+    )
+    if abliner_mode:
+        payment_status = await begin_abliner_payment(
+            provider_reference,
+            payload.buyer_phone,
+            total_amount,
+            f"{app_url}/api/webhooks/abliner",
         )
+    elif not demo_mode:
         payment_status = await begin_clickpesa_payment(
             provider_reference,
             payload.buyer_phone,
@@ -3365,7 +3648,7 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         "checkout_url": checkout_url,
         "order_ids": order_ids,
         "payment_status": payment_status,
-        "demo": demo_mode,
+        "demo": demo_order,
     }
 
 
