@@ -7,6 +7,7 @@ from backend.main import (
     CancellationInput,
     CancellationResolutionInput,
     DeliveryUpdateInput,
+    ReturnRequestInput,
     ReviewInput,
     archive_sale,
     complete_cart_checkout,
@@ -25,6 +26,7 @@ from backend.main import (
     process_clickpesa_webhook,
     read_cart_checkout,
     request_cancellation,
+    request_return,
     resolve_cancellation,
     update_delivery,
     connect_db,
@@ -112,6 +114,12 @@ app.add_api_route(
 app.add_api_route(
     "/orders/{order_id}/cancellation",
     request_cancellation,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/orders/{order_id}/return",
+    request_return,
     methods=["POST"],
     dependencies=[Depends(verify_gateway_token)],
 )

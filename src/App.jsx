@@ -801,6 +801,7 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [stockProductId, setStockProductId] = useState("");
   const [stockMovements, setStockMovements] = useState([]);
   const [cancellations, setCancellations] = useState([]);
+  const [returnRequests, setReturnRequests] = useState([]);
   const [reviews, setReviews] = useState([]);
   const [tickets, setTickets] = useState([]);
   const [coupons, setCoupons] = useState([]);
@@ -858,15 +859,17 @@ function MarketplaceDashboard({ user, onLogout }) {
     setLowStock(await api("/inventory/low-stock"));
     if (isAdmin) setAuditRows(await api("/admin/audit"));
     if (isAdmin) {
-      const [sellerRows, cancellationRows, reviewRows, ticketRows, couponRows] = await Promise.all([
+      const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows, couponRows] = await Promise.all([
         api("/admin/sellers"),
         api("/admin/cancellations"),
+        api("/admin/returns"),
         api("/admin/reviews"),
         api("/admin/support-tickets"),
         api("/admin/coupons"),
       ]);
       setSellers(sellerRows);
       setCancellations(cancellationRows);
+      setReturnRequests(returnRows);
       setReviews(reviewRows);
       setTickets(ticketRows);
       setCoupons(couponRows);
@@ -874,6 +877,7 @@ function MarketplaceDashboard({ user, onLogout }) {
         seenAdminEventsRef.current = new Set(adminEventKeys([
           ["seller", sellerRows],
           ["cancellation", cancellationRows],
+          ["return", returnRows],
           ["review", reviewRows],
           ["ticket", ticketRows],
         ]));
@@ -899,6 +903,7 @@ function MarketplaceDashboard({ user, onLogout }) {
           isAdmin ? Promise.all([
             api("/admin/sellers"),
             api("/admin/cancellations"),
+            api("/admin/returns"),
             api("/admin/reviews"),
             api("/admin/support-tickets"),
           ]) : Promise.resolve(null),
@@ -912,14 +917,16 @@ function MarketplaceDashboard({ user, onLogout }) {
           seenSalesRef.current = knownSales;
           if (newSales.length) notify("Oda mpya imepokelewa.", "info");
           if (adminData) {
-            const [sellerRows, cancellationRows, reviewRows, ticketRows] = adminData;
+            const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows] = adminData;
             setSellers(sellerRows);
             setCancellations(cancellationRows);
+            setReturnRequests(returnRows);
             setReviews(reviewRows);
             setTickets(ticketRows);
             const eventRows = [
               ["seller", sellerRows],
               ["cancellation", cancellationRows],
+              ["return", returnRows],
               ["review", reviewRows],
               ["ticket", ticketRows],
             ];
@@ -1256,6 +1263,19 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function resolveReturnRequest(id, status) {
+    try {
+      await api(`/admin/returns/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, admin_note: "" }),
+      });
+      setMessage("Uamuzi wa marejesho umehifadhiwa; hakuna pesa iliyohamishwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function moderateReview(id, status) {
     try {
       await api(`/admin/reviews/${id}`, {
@@ -1316,7 +1336,7 @@ function MarketplaceDashboard({ user, onLogout }) {
     ["sales", "Mauzo"],
     ...(!isAdmin ? [["storefront", "Duka lako"], ["stock", "Stock"]] : []),
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
-    ...(isAdmin ? [["categories", "Makundi"], ["coupons", "Kuponi"], ["cancellations", "Kughairi"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
+    ...(isAdmin ? [["categories", "Makundi"], ["coupons", "Kuponi"], ["cancellations", "Kughairi"], ["returns", "Marejesho"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
     ...(isAdmin ? [["audit", "Audit"]] : []),
     ["settings", "Akaunti"],
   ];
@@ -1581,6 +1601,15 @@ function MarketplaceDashboard({ user, onLogout }) {
           {cancellations.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.order_id} · {item.buyer_name}</strong><span>{item.reason} · TZS {formatMoney(item.amount)}</span><small>{item.status} · {item.payment_status}</small></div>{item.status === "PENDING" && <div className="seller-actions"><button type="button" onClick={() => resolveCancellation(item.id, "APPROVED")}>Idhinisha</button><button type="button" className="danger-action" onClick={() => resolveCancellation(item.id, "REJECTED")}>Kataa</button></div>}</article>)}
           {!cancellations.length && <p className="empty-state">Hakuna ombi la kughairi.</p>}
           <p className="field-hint">Kughairi oda iliyokamilika ni demo pekee: stock hurejeshwa, lakini refund ya pesa halisi haijatekelezwa.</p>
+        </section>
+      )}
+
+      {tab === "returns" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <h2>Maombi ya kurejesha bidhaa/refund</h2>
+          {returnRequests.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.order_id} · {item.buyer_name}</strong><span>{item.reason} · TZS {formatMoney(item.amount)}</span><small><span>{item.status}</span> · <span>{item.payment_status}</span> · <span>{item.delivery_status}</span></small>{item.admin_note && <small>{item.admin_note}</small>}</div>{item.status === "PENDING" && <div className="seller-actions"><button type="button" onClick={() => resolveReturnRequest(item.id, "APPROVED")}>Idhinisha</button><button type="button" className="danger-action" onClick={() => resolveReturnRequest(item.id, "REJECTED")}>Kataa</button></div>}</article>)}
+          {!returnRequests.length && <p className="empty-state">Hakuna ombi la marejesho.</p>}
+          <p className="field-hint">Uidhinishaji ni uamuzi tu; mfumo hautoi pesa wala kubadilisha hali ya malipo. Refund halisi ishughulikiwe nje ya mfumo.</p>
         </section>
       )}
 
@@ -2082,9 +2111,18 @@ function BuyerDashboard({ user, onLogout }) {
 function BuyerOrderRow({ order, onAction }) {
   const localize = useLocalize();
   const [reason, setReason] = useState("");
+  const [returnReason, setReturnReason] = useState("");
   const [rating, setRating] = useState("5");
   const [comment, setComment] = useState("");
-  const canCancel = ["PENDING", "COMPLETED"].includes(order.payment_status);
+  const cancellationInProgress = ["PENDING", "APPROVED"].includes(order.cancellation_status);
+  const canCancel = ["PENDING", "COMPLETED"].includes(order.payment_status)
+    && order.delivery_status !== "DELIVERED"
+    && !order.return_status
+    && !cancellationInProgress;
+  const canRequestReturn = order.payment_status === "COMPLETED"
+    && order.delivery_status === "DELIVERED"
+    && !order.return_status
+    && !cancellationInProgress;
   return localize(
     <tr>
       <td><strong>{order.order_id}</strong><small>{order.created_at}</small></td>
@@ -2101,12 +2139,19 @@ function BuyerOrderRow({ order, onAction }) {
             Ada ya delivery inalipwa moja kwa moja kwa muuzaji; haijajumuishwa kwenye malipo ya bidhaa.
           </small>
         )}
+        {order.return_status && (
+          <small>
+            <span>Hali ya ombi la kurejesha:</span> {order.return_status}
+            {order.return_reason && ` · ${order.return_reason}`}
+          </small>
+        )}
         {order.delivery_address && <small>{order.delivery_address}</small>}
       </td>
       <td>TZS {formatMoney(order.amount)}</td>
       <td>
         <a className="table-action" href={`/pay/${order.product_id}?order_id=${encodeURIComponent(order.order_id)}`}>Fungua</a>
         {canCancel && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/cancellation`, { method: "POST", body: JSON.stringify({ reason }) }), "Ombi la kughairi limetumwa."); }}><input aria-label="Sababu ya kughairi" className="text-input" minLength={5} placeholder="Sababu ya kughairi" required value={reason} onChange={(event) => setReason(event.target.value)} /><button className="table-action" type="submit">Omba kughairi</button></form>}
+        {canRequestReturn && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/return`, { method: "POST", body: JSON.stringify({ reason: returnReason }) }), "Ombi la kurejesha limetumwa; hakuna refund itakayotekelezwa na mfumo."); }}><input aria-label="Sababu ya kurejesha" className="text-input" minLength={5} maxLength={1000} placeholder="Sababu ya kurejesha bidhaa/refund" required value={returnReason} onChange={(event) => setReturnReason(event.target.value)} /><button className="table-action" type="submit">Omba marejesho</button></form>}
         {order.payment_status === "COMPLETED" && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/products/${order.product_id}/review`, { method: "POST", body: JSON.stringify({ rating: Number(rating), comment }) }), "Maoni yametumwa kwa ukaguzi."); }}><select aria-label="Alama" className="text-input" value={rating} onChange={(event) => setRating(event.target.value)}>{[5, 4, 3, 2, 1].map((value) => <option key={value} value={value}>{value} / 5</option>)}</select><input aria-label="Maoni kuhusu bidhaa" className="text-input" maxLength={1000} placeholder="Maoni (hiari)" value={comment} onChange={(event) => setComment(event.target.value)} /><button className="table-action" type="submit">Tuma maoni</button></form>}
       </td>
     </tr>

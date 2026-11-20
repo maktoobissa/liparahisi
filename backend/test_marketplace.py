@@ -1486,6 +1486,11 @@ class MarketplaceFlowTests(unittest.TestCase):
             self.assertEqual(delivery.json()["delivery_carrier"], "DHL")
             self.assertEqual(delivery.json()["tracking_code"], "TRACK-1")
             self.assertEqual(delivery.json()["delivery_fee"], 3500)
+            premature_return = buyer_client.post(
+                f"/api/orders/{order_id}/return",
+                json={"reason": "Bidhaa imeharibika"},
+            )
+            self.assertEqual(premature_return.status_code, 409)
             invalid_delivery = seller_client.put(
                 f"/api/orders/{order_id}/delivery",
                 json={
@@ -1521,6 +1526,79 @@ class MarketplaceFlowTests(unittest.TestCase):
             buyer_history = buyer_client.get("/api/orders/history").json()
             self.assertEqual(buyer_history[0]["delivery_carrier"], "DHL")
             self.assertEqual(buyer_history[0]["delivery_fee"], 3500)
+            for next_status in ("SHIPPED", "DELIVERED"):
+                updated_delivery = seller_client.put(
+                    f"/api/orders/{order_id}/delivery",
+                    json={
+                        "delivery_status": next_status,
+                        "delivery_carrier": "DHL",
+                        "tracking_code": "TRACK-1",
+                        "delivery_fee": 3500,
+                    },
+                )
+                self.assertEqual(updated_delivery.status_code, 200)
+            return_request = buyer_client.post(
+                f"/api/orders/{order_id}/return",
+                json={"reason": "Bidhaa ilifika ikiwa imeharibika"},
+            )
+            self.assertEqual(return_request.status_code, 200)
+            self.assertEqual(return_request.json()["status"], "PENDING")
+            overlapping_cancellation = buyer_client.post(
+                f"/api/orders/{order_id}/cancellation",
+                json={"reason": "Bidhaa ilifika ikiwa imeharibika"},
+            )
+            self.assertEqual(overlapping_cancellation.status_code, 409)
+            duplicate_return = buyer_client.post(
+                f"/api/orders/{order_id}/return",
+                json={"reason": "Nataka kujaribu kutuma ombi tena"},
+            )
+            self.assertEqual(duplicate_return.status_code, 409)
+            self.assertEqual(
+                guest_client.post(
+                    f"/api/orders/{order_id}/return",
+                    json={"reason": "Bidhaa ilifika ikiwa imeharibika"},
+                ).status_code,
+                401,
+            )
+            return_rows = self.client.get("/api/admin/returns")
+            self.assertEqual(return_rows.status_code, 200)
+            self.assertEqual(return_rows.json()[0]["id"], return_request.json()["id"])
+            with main.db_connection() as connection:
+                stock_before_approval = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()["stock_quantity"]
+            return_decision = self.client.patch(
+                f"/api/admin/returns/{return_request.json()['id']}",
+                json={"status": "APPROVED", "admin_note": "Shughulikia nje ya mfumo"},
+            )
+            self.assertEqual(return_decision.status_code, 200)
+            self.assertFalse(return_decision.json()["refund_issued"])
+            self.assertEqual(
+                self.client.patch(
+                    f"/api/admin/returns/{return_request.json()['id']}",
+                    json={"status": "REJECTED"},
+                ).status_code,
+                409,
+            )
+            resolved_order = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(resolved_order["payment_status"], "COMPLETED")
+            self.assertEqual(resolved_order["return_status"], "APPROVED")
+            self.assertEqual(
+                resolved_order["return_reason"],
+                "Bidhaa ilifika ikiwa imeharibika",
+            )
+            resolved_history = buyer_client.get("/api/orders/history").json()
+            self.assertEqual(resolved_history[0]["return_status"], "APPROVED")
+            guest_return_status = guest_client.get(f"/api/orders/{order_id}").json()
+            self.assertNotIn("return_status", guest_return_status)
+            self.assertNotIn("return_reason", guest_return_status)
+            with main.db_connection() as connection:
+                stock_after_approval = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()["stock_quantity"]
+            self.assertEqual(stock_after_approval, stock_before_approval)
             dated_sales = seller_client.get(
                 "/api/sales?start_date=2020-01-01&end_date=2099-12-31"
             )
@@ -1562,8 +1640,9 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.assertEqual(cart_completed.status_code, 200)
         self.assertEqual(cart_completed.json()["splits"][0]["seller_payout"], 8550)
 
+        cart_order_id = cart_completed.json()["splits"][0]["order_id"]
         cancellation = buyer_client.post(
-            f"/api/orders/{order_id}/cancellation",
+            f"/api/orders/{cart_order_id}/cancellation",
             json={"reason": "Nimebadilisha uamuzi kuhusu oda."},
         )
         self.assertEqual(cancellation.status_code, 200)
@@ -1576,7 +1655,7 @@ class MarketplaceFlowTests(unittest.TestCase):
             200,
         )
         self.assertEqual(
-            buyer_client.get(f"/api/orders/{order_id}").json()["payment_status"],
+            buyer_client.get(f"/api/orders/{cart_order_id}").json()["payment_status"],
             "CANCELLED",
         )
         pending_reviews = self.client.get("/api/admin/reviews")

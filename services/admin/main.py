@@ -7,6 +7,7 @@ from backend.main import (
     CancellationResolutionInput,
     CouponInput,
     CouponStatusInput,
+    ReturnResolutionInput,
     ReviewModerationInput,
     SellerStatusInput,
     SupportTicketUpdateInput,
@@ -20,9 +21,11 @@ from backend.main import (
     list_coupons,
     list_reviews,
     list_sellers,
+    list_return_requests,
     list_support_tickets,
     moderate_review,
     resolve_cancellation,
+    resolve_return_request,
     update_seller_status,
     set_coupon_status,
     update_support_ticket,
@@ -119,6 +122,23 @@ def cancellation_decision(
     request: Request,
 ):
     return resolve_cancellation(cancellation_id, payload, request)
+
+
+@app.get("/returns", dependencies=[Depends(verify_gateway_token)])
+def return_requests(request: Request):
+    return list_return_requests(request)
+
+
+@app.patch(
+    "/returns/{return_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def return_decision(
+    return_id: str,
+    payload: ReturnResolutionInput,
+    request: Request,
+):
+    return resolve_return_request(return_id, payload, request)
 
 
 @app.get("/reviews", dependencies=[Depends(verify_gateway_token)])

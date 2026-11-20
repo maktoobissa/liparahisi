@@ -20,8 +20,10 @@ sales.
   base price and can be selected in single-item or cart checkout.
 - Seller-managed delivery status, carrier, tracking code, and a separately
   collected delivery fee shown to buyers (not included in the product payment).
-  Also includes buyer cancellation requests and verified-order reviews subject
-  to administrator moderation.
+- Buyer cancellation requests and return/refund requests for delivered orders,
+  with administrator resolution. Return approval records a decision only; no
+  payment is refunded or transferred by the system.
+- Verified-order reviews subject to administrator moderation.
 - Buyer support tickets with administrator responses.
 - Admin-managed marketplace-wide percentage or fixed-value coupons, limited to
   demo checkout and one completed redemption per buyer.

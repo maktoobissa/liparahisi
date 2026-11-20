@@ -495,6 +495,16 @@ def initialize_db():
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 resolved_at {timestamp_type}
             );
+            CREATE TABLE IF NOT EXISTS return_requests (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL UNIQUE REFERENCES orders(order_id) ON DELETE CASCADE,
+                requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                admin_note TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                resolved_at {timestamp_type}
+            );
             CREATE TABLE IF NOT EXISTS support_tickets (
                 id TEXT PRIMARY KEY,
                 user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -812,6 +822,22 @@ class CancellationInput(BaseModel):
 
 
 class CancellationResolutionInput(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+    admin_note: str = Field(default="", max_length=1000)
+
+
+class ReturnRequestInput(BaseModel):
+    reason: str = Field(min_length=5, max_length=1000)
+
+    @validator("reason")
+    def normalize_reason(cls, value):
+        normalized = value.strip()
+        if len(normalized) < 5:
+            raise ValueError("Sababu lazima iwe na angalau herufi 5.")
+        return normalized
+
+
+class ReturnResolutionInput(BaseModel):
     status: Literal["APPROVED", "REJECTED"]
     admin_note: str = Field(default="", max_length=1000)
 
@@ -2611,6 +2637,19 @@ async def order_cancellation_gateway(order_id: str, request: Request):
     return await proxy_internal_api(
         request,
         f"orders/{order_id}/cancellation",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/orders/{order_id}/return", methods=["POST"])
+async def order_return_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}/return",
         "Orders",
         "ORDERS_SERVICE_URL",
         "ORDERS_SERVICE_TOKEN",
@@ -4708,13 +4747,17 @@ def order_status(order_id: str, request: Request):
     with db_connection() as connection:
         product = connection.execute(
             """
-            SELECT p.name, oi.variant_label
+            SELECT p.name, oi.variant_label,
+                   rr.status AS return_status, rr.reason AS return_reason,
+                   cr.status AS cancellation_status
             FROM products p
             LEFT JOIN order_items oi
               ON oi.product_id = p.id AND oi.order_id = ?
+            LEFT JOIN return_requests rr ON rr.order_id = ?
+            LEFT JOIN cancellation_requests cr ON cr.order_id = ?
             WHERE p.id = ?
             """,
-            (order_id, order["product_id"]),
+            (order_id, order_id, order_id, order["product_id"]),
         ).fetchone()
     result = {
         "order_id": order_id,
@@ -4741,6 +4784,9 @@ def order_status(order_id: str, request: Request):
             "delivery_carrier": order["delivery_carrier"],
             "tracking_code": order["tracking_code"],
             "delivery_fee": order["delivery_fee"],
+            "return_status": product["return_status"] if product else None,
+            "return_reason": product["return_reason"] if product else None,
+            "cancellation_status": product["cancellation_status"] if product else None,
         })
     return result
 
@@ -4754,12 +4800,16 @@ def order_history(request: Request):
                    o.delivery_status, o.delivery_carrier, o.tracking_code,
                    o.delivery_fee, o.delivery_address,
                    o.created_at, o.completed_at, p.name AS product_name,
-                   p.image_url, u.shop_name, oi.variant_label
+                   p.image_url, u.shop_name, oi.variant_label,
+                   rr.status AS return_status, rr.reason AS return_reason,
+                   cr.status AS cancellation_status
             FROM orders o
             JOIN products p ON p.id = o.product_id
             LEFT JOIN users u ON u.id = o.seller_id
             LEFT JOIN order_items oi
               ON oi.order_id = o.order_id AND oi.product_id = o.product_id
+            LEFT JOIN return_requests rr ON rr.order_id = o.order_id
+            LEFT JOIN cancellation_requests cr ON cr.order_id = o.order_id
             WHERE o.buyer_id = ?
             ORDER BY o.created_at DESC
             LIMIT 200
@@ -4830,6 +4880,10 @@ def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Reques
 def request_cancellation(order_id: str, payload: CancellationInput, request: Request):
     buyer = require_buyer(request)
     with db_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET order_id = order_id WHERE order_id = ? AND buyer_id = ?",
+            (order_id, buyer["id"]),
+        )
         order = connection.execute(
             "SELECT buyer_id, payment_status, cancelled_at FROM orders WHERE order_id = ?",
             (order_id,),
@@ -4838,6 +4892,15 @@ def request_cancellation(order_id: str, payload: CancellationInput, request: Req
             raise HTTPException(status_code=404, detail="Oda haikupatikana.")
         if order["cancelled_at"] or order["payment_status"] not in {"PENDING", "COMPLETED"}:
             raise HTTPException(status_code=409, detail="Oda hii haiwezi kuombewa kughairiwa.")
+        return_request = connection.execute(
+            "SELECT status FROM return_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if return_request and return_request["status"] in {"PENDING", "APPROVED"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Oda hii ina ombi la kurejesha linalosubiri au limeidhinishwa.",
+            )
         existing = connection.execute(
             "SELECT status FROM cancellation_requests WHERE order_id = ?",
             (order_id,),
@@ -4970,6 +5033,135 @@ def list_cancellations(request: Request):
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def request_return(order_id: str, payload: ReturnRequestInput, request: Request):
+    buyer = require_buyer(request)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET order_id = order_id WHERE order_id = ? AND buyer_id = ?",
+            (order_id, buyer["id"]),
+        )
+        order = connection.execute(
+            """
+            SELECT payment_status, delivery_status, cancelled_at
+            FROM orders
+            WHERE order_id = ? AND buyer_id = ?
+            """,
+            (order_id, buyer["id"]),
+        ).fetchone()
+        if order is None:
+            raise HTTPException(status_code=404, detail="Oda haikupatikana.")
+        if (
+            order["payment_status"] != "COMPLETED"
+            or order["delivery_status"] != "DELIVERED"
+            or order["cancelled_at"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Ombi la kurejesha linapatikana baada ya oda iliyolipiwa kufikishwa.",
+            )
+        cancellation = connection.execute(
+            "SELECT status FROM cancellation_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if cancellation and cancellation["status"] in {"PENDING", "APPROVED"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Ombi la kughairi oda hii linasubiri au tayari limeidhinishwa.",
+            )
+        if connection.execute(
+            "SELECT 1 FROM return_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="Ombi la kurejesha oda hii limeshatumwa.")
+        request_id = secrets.token_hex(16)
+        try:
+            connection.execute(
+                """
+                INSERT INTO return_requests (id, order_id, requester_id, reason)
+                VALUES (?, ?, ?, ?)
+                """,
+                (request_id, order_id, buyer["id"], payload.reason.strip()),
+            )
+        except Exception as error:
+            if is_integrity_error(error):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ombi la kurejesha oda hii limeshatumwa.",
+                ) from error
+            raise
+    record_audit(
+        "RETURN_REQUESTED",
+        "order",
+        order_id,
+        payload.reason.strip(),
+        actor=buyer,
+        request=request,
+    )
+    return {"id": request_id, "order_id": order_id, "status": "PENDING"}
+
+
+def list_return_requests(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT r.id, r.order_id, r.reason, r.status, r.admin_note,
+                   r.created_at, o.amount, o.payment_status,
+                   o.delivery_status, u.full_name AS buyer_name,
+                   u.email AS buyer_email
+            FROM return_requests r
+            JOIN orders o ON o.order_id = r.order_id
+            JOIN users u ON u.id = r.requester_id
+            ORDER BY r.created_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resolve_return_request(
+    return_id: str,
+    payload: ReturnResolutionInput,
+    request: Request,
+):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE return_requests
+            SET status = ?, admin_note = ?, resolved_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'PENDING'
+            """,
+            (payload.status, payload.admin_note.strip(), return_id),
+        )
+        if result.rowcount == 0:
+            exists = connection.execute(
+                "SELECT 1 FROM return_requests WHERE id = ?",
+                (return_id,),
+            ).fetchone()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Ombi la kurejesha halikupatikana.")
+            raise HTTPException(status_code=409, detail="Ombi hili limeshughulikiwa tayari.")
+        order_id = connection.execute(
+            "SELECT order_id FROM return_requests WHERE id = ?",
+            (return_id,),
+        ).fetchone()["order_id"]
+    record_audit(
+        "RETURN_REQUEST_RESOLVED",
+        "order",
+        order_id,
+        f"{payload.status}; no payment was transferred",
+        actor=actor,
+        request=request,
+    )
+    return {
+        "id": return_id,
+        "order_id": order_id,
+        "status": payload.status,
+        "refund_issued": False,
+    }
 
 
 def create_review(order_id: str, product_id: str, payload: ReviewInput, request: Request):
