@@ -1,11 +1,13 @@
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import csv
 import io
@@ -19,6 +21,9 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 import psycopg
+from redis import Redis
+from redis.exceptions import RedisError
+from psycopg_pool import ConnectionPool
 from backend.clickpesa import ClickPesaClient, ClickPesaError, verify_webhook_checksum
 from backend.email_delivery import (
     EmailDeliveryError,
@@ -50,6 +55,10 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(PROJECT_ROOT / "backend" / "
 FRONTEND_DIST = PROJECT_ROOT / "dist"
 SESSION_COOKIE = "liparahisi_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
+DATABASE_POOL_MIN_SIZE = 1
+DATABASE_POOL_MAX_SIZE = 5
+DATABASE_POOL_TIMEOUT_SECONDS = 10
+PRODUCT_LIST_CACHE_TTL_SECONDS = 15
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
 RESET_TOKEN_TTL_SECONDS = 60 * 60
@@ -68,10 +77,35 @@ PAYMENT_METHODS = {
 }
 
 
+_database_pool = None
+_database_pool_url = None
+_database_pool_lock = threading.Lock()
+_redis_client = None
+_redis_client_address = None
+_redis_client_lock = threading.Lock()
+
+
 class DatabaseConnection:
-    def __init__(self, connection, postgres=False):
+    def __init__(self, connection, postgres=False, release=None):
         self.connection = connection
         self.postgres = postgres
+        self.release = release
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, _exception, _traceback):
+        try:
+            if (
+                exception_type is None
+                and _exception is None
+                and _traceback is None
+            ):
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
 
     def execute(self, query, parameters=()):
         if self.postgres:
@@ -93,7 +127,119 @@ class DatabaseConnection:
         self.connection.rollback()
 
     def close(self):
-        self.connection.close()
+        if self.release:
+            self.release(self.connection)
+        else:
+            self.connection.close()
+
+
+class CachedStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+            )
+        return response
+
+
+def get_database_pool(database_url):
+    global _database_pool, _database_pool_url
+    with _database_pool_lock:
+        if _database_pool_url != database_url:
+            if _database_pool is not None:
+                _database_pool.close()
+            _database_pool = ConnectionPool(
+                database_url,
+                min_size=DATABASE_POOL_MIN_SIZE,
+                max_size=DATABASE_POOL_MAX_SIZE,
+                timeout=DATABASE_POOL_TIMEOUT_SECONDS,
+                kwargs={"row_factory": dict_row},
+            )
+            _database_pool_url = database_url
+        return _database_pool
+
+
+def close_database_pool():
+    global _database_pool, _database_pool_url
+    with _database_pool_lock:
+        pool = _database_pool
+        _database_pool = None
+        _database_pool_url = None
+    if pool is not None:
+        pool.close()
+
+
+def get_redis_client():
+    global _redis_client, _redis_client_address
+    host = os.getenv("REDIS_HOST", "").strip()
+    port = os.getenv("REDIS_PORT", "").strip()
+    if not host and not port:
+        return None
+    if not host or not port:
+        raise RuntimeError("REDIS_HOST and REDIS_PORT must be set together.")
+
+    address = (host, port)
+    with _redis_client_lock:
+        if _redis_client_address != address:
+            if _redis_client is not None:
+                _redis_client.close()
+            _redis_client = Redis(
+                host=host,
+                port=int(port),
+                decode_responses=True,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+                max_connections=10,
+            )
+            _redis_client_address = address
+        return _redis_client
+
+
+def close_redis_client():
+    global _redis_client, _redis_client_address
+    with _redis_client_lock:
+        client = _redis_client
+        _redis_client = None
+        _redis_client_address = None
+    if client is not None:
+        client.close()
+
+
+def cached_product_list(cache_key):
+    client = get_redis_client()
+    if client is None:
+        return None
+    try:
+        cached = client.get(cache_key)
+    except RedisError as error:
+        logger.warning("Redis cache read failed (%s)", type(error).__name__)
+        return None
+    if cached is None:
+        return None
+    try:
+        products = json.loads(cached)
+    except json.JSONDecodeError:
+        logger.warning("Ignoring invalid Redis product cache entry")
+        return None
+    if not isinstance(products, list):
+        logger.warning("Ignoring invalid Redis product cache entry")
+        return None
+    return products
+
+
+def cache_product_list(cache_key, products):
+    client = get_redis_client()
+    if client is None:
+        return
+    try:
+        client.setex(
+            cache_key,
+            PRODUCT_LIST_CACHE_TTL_SECONDS,
+            json.dumps(products, default=str, separators=(",", ":")),
+        )
+    except RedisError as error:
+        logger.warning("Redis cache write failed (%s)", type(error).__name__)
 
 
 def connect_db():
@@ -101,9 +247,11 @@ def connect_db():
     if database_url:
         if database_url.startswith("postgres://"):
             database_url = "postgresql://" + database_url[len("postgres://"):]
+        pool = get_database_pool(database_url)
         return DatabaseConnection(
-            psycopg.connect(database_url, row_factory=dict_row),
+            pool.getconn(timeout=DATABASE_POOL_TIMEOUT_SECONDS),
             postgres=True,
+            release=pool.putconn,
         )
 
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -405,8 +553,17 @@ def initialize_db():
 
 @asynccontextmanager
 async def lifespan(_app):
-    initialize_db()
-    yield
+    try:
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if database_url:
+            if database_url.startswith("postgres://"):
+                database_url = "postgresql://" + database_url[len("postgres://"):]
+            get_database_pool(database_url)
+        initialize_db()
+        yield
+    finally:
+        close_database_pool()
+        close_redis_client()
 
 
 app = FastAPI(title="LipaRahisi API", lifespan=lifespan)
@@ -2369,8 +2526,33 @@ def list_products(
     search = q.strip().lower()
     seller_search = seller.strip().lower()
     category_search = category.strip().lower()
+    min_amount = max(0, min_amount)
+    max_amount = max(0, max_amount)
+    app_url = public_app_url(str(request.base_url))
+    cache_key = None
+    if user is None:
+        key_data = json.dumps(
+            [
+                search,
+                seller_search,
+                min_amount,
+                max_amount,
+                category_search,
+                app_url,
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        cache_key = (
+            "liparahisi:public-products:v1:"
+            + hashlib.sha256(key_data.encode("utf-8")).hexdigest()
+        )
+        cached = cached_product_list(cache_key)
+        if cached is not None:
+            return cached
+
     terms = ["p.amount >= ?", "p.amount <= ?"]
-    params = [max(0, min_amount), max(0, max_amount)]
+    params = [min_amount, max_amount]
     if search:
         terms.append("(LOWER(p.name) LIKE ? OR LOWER(COALESCE(u.shop_name, '')) LIKE ?)")
         params.extend([f"%{search}%", f"%{search}%"])
@@ -2420,8 +2602,7 @@ def list_products(
                 """,
                 tuple(params),
             ).fetchall()
-    app_url = public_app_url(str(request.base_url))
-    return [
+    products = [
         {
             **dict(row),
             "qr_url": f"{app_url}/p/{row['id']}",
@@ -2429,6 +2610,9 @@ def list_products(
         }
         for row in rows
     ]
+    if cache_key is not None:
+        cache_product_list(cache_key, products)
+    return products
 
 
 def record_inventory_movement(
@@ -3874,7 +4058,11 @@ def export_sales(request: Request):
 
 
 if FRONTEND_DIST.is_dir():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+    app.mount(
+        "/assets",
+        CachedStaticFiles(directory=FRONTEND_DIST / "assets"),
+        name="assets",
+    )
 
     @app.get("/p/{product_id}")
     def short_product_link(product_id: str):

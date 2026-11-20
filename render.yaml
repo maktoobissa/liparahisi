@@ -53,6 +53,16 @@ services:
         fromDatabase:
           name: liparahisi-db
           property: connectionString
+      - key: REDIS_HOST
+        fromService:
+          type: keyvalue
+          name: liparahisi-cache
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          type: keyvalue
+          name: liparahisi-cache
+          property: port
       - key: ADMIN_SETUP_TOKEN
         generateValue: true
       - key: ADMIN_SERVICE_TOKEN
@@ -73,9 +83,16 @@ services:
         value: ""
       - key: NOTIFICATION_SERVICE_URL
         value: ""
+  - type: keyvalue
+    name: liparahisi-cache
+    region: oregon
+    plan: 256mb
+    maxmemoryPolicy: allkeys-lru
+    persistenceMode: off
 
 databases:
   - name: liparahisi-db
     databaseName: liparahisi
     user: liparahisi
-    plan: free
+    plan: 0.1c-256mb
+    diskSizeGB: 40

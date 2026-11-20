@@ -6,9 +6,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend import main
@@ -85,6 +86,8 @@ class MarketplaceFlowTests(unittest.TestCase):
                 "ORDERS_SERVICE_TOKEN": "test-orders-service-token",
                 "ORDERS_SERVICE_URL": "http://orders",
                 "DATABASE_URL": "",
+                "REDIS_HOST": "",
+                "REDIS_PORT": "",
                 "DEMO_MODE": "true",
                 "EMAIL_PROVIDER": "resend",
                 "RESEND_API_KEY": "",
@@ -140,6 +143,95 @@ class MarketplaceFlowTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.content, expected)
+
+    def test_static_assets_get_long_lived_cache_headers(self):
+        with tempfile.TemporaryDirectory() as asset_dir:
+            Path(asset_dir, "app-123abc.js").write_text("app")
+            asset_app = FastAPI()
+            asset_app.mount(
+                "/assets",
+                main.CachedStaticFiles(directory=asset_dir),
+                name="assets",
+            )
+            with TestClient(asset_app) as asset_client:
+                response = asset_client.get("/assets/app-123abc.js")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["cache-control"],
+            "public, max-age=31536000, immutable",
+        )
+
+    def test_postgres_connections_are_returned_to_pool(self):
+        raw_connection = MagicMock()
+        pool = MagicMock()
+        pool.getconn.return_value = raw_connection
+
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://db"}):
+            with patch.object(main, "get_database_pool", return_value=pool) as get_pool:
+                connection = main.connect_db()
+
+        self.assertTrue(connection.postgres)
+        get_pool.assert_called_once_with("postgresql://db")
+        pool.getconn.assert_called_once_with(
+            timeout=main.DATABASE_POOL_TIMEOUT_SECONDS
+        )
+        with self.assertRaises(RuntimeError):
+            with connection:
+                raise RuntimeError("test transaction failure")
+
+        raw_connection.rollback.assert_called_once_with()
+        pool.putconn.assert_called_once_with(raw_connection)
+
+    def test_public_product_lists_are_cached_in_redis(self):
+        class FakeRedis:
+            def __init__(self):
+                self.values = {}
+                self.get_calls = 0
+                self.set_calls = 0
+
+            def get(self, key):
+                self.get_calls += 1
+                return self.values.get(key)
+
+            def setex(self, key, ttl, value):
+                self.set_calls += 1
+                self.values[key] = value
+
+        redis_client = FakeRedis()
+        with patch.object(main, "get_redis_client", return_value=redis_client):
+            first = self.client.get("/api/products")
+            second = self.client.get("/api/products")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(redis_client.get_calls, 2)
+        self.assertEqual(redis_client.set_calls, 1)
+
+    def test_redis_cache_failure_does_not_break_product_list(self):
+        class FailingRedis:
+            def get(self, _key):
+                raise main.RedisError("cache unavailable")
+
+            def setex(self, _key, _ttl, _value):
+                raise main.RedisError("cache unavailable")
+
+        with patch.object(main, "get_redis_client", return_value=FailingRedis()):
+            response = self.client.get("/api/products")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_partial_redis_configuration_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {"REDIS_HOST": "cache.internal", "REDIS_PORT": ""},
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "REDIS_HOST and REDIS_PORT must be set together",
+            ):
+                main.get_redis_client()
 
     def test_single_service_gateway_uses_in_process_apis(self):
         service_patches = (
