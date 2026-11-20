@@ -389,7 +389,7 @@ function Header({ label = "Demo", user, onLogout }) {
             className="logout-button"
             type="button"
             onClick={onLogout}
-            aria-label={`Toka kwenye akaunti ya ${user.full_name}`}
+            aria-label={`${translate("Toka kwenye akaunti ya", language)} ${user.full_name}`}
             key="logout"
           >
             Toka<span className="logout-name" key="logout-name"> ({user.full_name})</span>
@@ -577,6 +577,7 @@ function ProductTile({
   canArchive,
 }) {
   const localize = useLocalize();
+  const { language } = useLanguage();
   const [qr, setQr] = useState("");
   const barcodeRef = useRef(null);
   useEffect(() => {
@@ -631,7 +632,7 @@ function ProductTile({
         editable={canArchive}
         onDeleteImage={onDeleteGalleryImage}
       />
-      {qr ? <img className="product-qr" src={qr} alt={`QR ya ${product.name}`} /> : <div className="product-qr qr-placeholder" />}
+      {qr ? <img className="product-qr" src={qr} alt={`${translate("QR ya", language)} ${product.name}`} /> : <div className="product-qr qr-placeholder" />}
       <div className="product-tile-details">
         <strong>{product.name}</strong>
         {product.category && <small>{product.category}</small>}
@@ -649,7 +650,7 @@ function ProductTile({
               <input
                 type="file"
                 accept="image/jpeg,image/png,image/webp"
-                aria-label={`Pakia picha ya ${product.name}`}
+                aria-label={`${translate("Pakia picha ya", language)} ${product.name}`}
                 hidden
                 onChange={(event) => {
                   const [file] = event.target.files || [];
@@ -682,7 +683,7 @@ function ProductTile({
           {canArchive && product.is_active && <button type="button" onClick={() => onArchive(product.id)}>Ondoa</button>}
         </div>
       </div>
-      <svg ref={barcodeRef} className="product-barcode" aria-label={`Barcode ya ${product.name}`} />
+      <svg ref={barcodeRef} className="product-barcode" aria-label={`${translate("Barcode ya", language)} ${product.name}`} />
     </article>
   );
 }
@@ -700,6 +701,7 @@ function StatCard({ title, value, note }) {
 
 function MarketplaceDashboard({ user, onLogout }) {
   const localize = useLocalize();
+  const { language } = useLanguage();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
   const [stats, setStats] = useState(null);
@@ -714,6 +716,13 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [cancellations, setCancellations] = useState([]);
   const [reviews, setReviews] = useState([]);
   const [tickets, setTickets] = useState([]);
+  const [coupons, setCoupons] = useState([]);
+  const [couponForm, setCouponForm] = useState({
+    code: "",
+    discount_type: "PERCENT",
+    discount_value: "10",
+    max_redemptions: "",
+  });
   const [productForm, setProductForm] = useState({
     name: "", description: "", image_url: "", category: "", amount: "",
     cost_amount: "", stock_quantity: "", low_stock_threshold: "5",
@@ -761,16 +770,18 @@ function MarketplaceDashboard({ user, onLogout }) {
     setLowStock(await api("/inventory/low-stock"));
     if (isAdmin) setAuditRows(await api("/admin/audit"));
     if (isAdmin) {
-      const [sellerRows, cancellationRows, reviewRows, ticketRows] = await Promise.all([
+      const [sellerRows, cancellationRows, reviewRows, ticketRows, couponRows] = await Promise.all([
         api("/admin/sellers"),
         api("/admin/cancellations"),
         api("/admin/reviews"),
         api("/admin/support-tickets"),
+        api("/admin/coupons"),
       ]);
       setSellers(sellerRows);
       setCancellations(cancellationRows);
       setReviews(reviewRows);
       setTickets(ticketRows);
+      setCoupons(couponRows);
       if (!seenAdminEventsRef.current) {
         seenAdminEventsRef.current = new Set(adminEventKeys([
           ["seller", sellerRows],
@@ -1114,13 +1125,54 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function createCoupon(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    try {
+      await api("/admin/coupons", {
+        method: "POST",
+        body: JSON.stringify({
+          ...couponForm,
+          discount_value: Number(couponForm.discount_value),
+          max_redemptions: couponForm.max_redemptions
+            ? Number(couponForm.max_redemptions)
+            : null,
+        }),
+      });
+      setCouponForm({
+        code: "",
+        discount_type: "PERCENT",
+        discount_value: "10",
+        max_redemptions: "",
+      });
+      setMessage("Kuponi imeundwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function changeCouponStatus(coupon, isActive) {
+    try {
+      await api(`/admin/coupons/${coupon.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_active: isActive }),
+      });
+      await refresh();
+      setMessage("Hali ya kuponi imehifadhiwa.");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   const nav = [
     ["overview", "Muhtasari"],
     ["products", "Bidhaa"],
     ["sales", "Mauzo"],
     ...(!isAdmin ? [["storefront", "Duka lako"], ["stock", "Stock"]] : []),
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
-    ...(isAdmin ? [["categories", "Makundi"], ["cancellations", "Kughairi"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
+    ...(isAdmin ? [["categories", "Makundi"], ["coupons", "Kuponi"], ["cancellations", "Kughairi"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
     ...(isAdmin ? [["audit", "Audit"]] : []),
     ["settings", "Akaunti"],
   ];
@@ -1301,6 +1353,42 @@ function MarketplaceDashboard({ user, onLogout }) {
             <button className="generate-button" type="submit">Ongeza kundi</button>
           </form>
           <div className="feature-list">{categories.map((item) => <article className="seller-card" key={item.id}><strong>{item.name}</strong></article>)}</div>
+        </section>
+      )}
+
+      {tab === "coupons" && isAdmin && (
+        <section className="dashboard-content">
+          <form className="form-card inline-feature-form" onSubmit={createCoupon}>
+            <h2>Tengeneza kuponi ya majaribio</h2>
+            <p className="field-hint">Kuponi zinatumika kwenye checkout ya demo pekee; hazipunguzi malipo halisi.</p>
+            <label className="field-label" htmlFor="coupon-code">Msimbo wa kuponi</label>
+            <input id="coupon-code" className="text-input" minLength={3} maxLength={32} required value={couponForm.code} onChange={(event) => setCouponForm({ ...couponForm, code: event.target.value.toUpperCase() })} />
+            <label className="field-label" htmlFor="coupon-type">Aina ya punguzo</label>
+            <select id="coupon-type" className="text-input" value={couponForm.discount_type} onChange={(event) => setCouponForm({ ...couponForm, discount_type: event.target.value })}>
+              <option value="PERCENT">Asilimia (%)</option>
+              <option value="FIXED">Kiasi maalum (TZS)</option>
+            </select>
+            <label className="field-label" htmlFor="coupon-value">Kiasi cha punguzo</label>
+            <input id="coupon-value" className="text-input" type="number" min="1" max={couponForm.discount_type === "PERCENT" ? "100" : "999999999"} required value={couponForm.discount_value} onChange={(event) => setCouponForm({ ...couponForm, discount_value: event.target.value })} />
+            <label className="field-label" htmlFor="coupon-limit">Idadi ya matumizi (hiari)</label>
+            <input id="coupon-limit" className="text-input" type="number" min="1" value={couponForm.max_redemptions} onChange={(event) => setCouponForm({ ...couponForm, max_redemptions: event.target.value })} />
+            <button className="generate-button" type="submit" disabled={busy}>Hifadhi kuponi</button>
+          </form>
+          <div className="feature-list">
+            {coupons.map((coupon) => (
+              <article className="seller-card" key={coupon.id}>
+                <div>
+                  <strong>{coupon.code}</strong>
+                  <span>{coupon.discount_type === "PERCENT" ? `${coupon.discount_value}%` : `TZS ${formatMoney(coupon.discount_value)}`} · {translate("Matumizi ya kuponi", language)} {coupon.redemption_count}{coupon.max_redemptions ? ` / ${coupon.max_redemptions}` : ""}</span>
+                  <small>{coupon.is_active ? "INAENDELEA" : "IMEZIMWA"} · Demo pekee</small>
+                </div>
+                <button className="table-action" type="button" onClick={() => changeCouponStatus(coupon, !coupon.is_active)}>
+                  {coupon.is_active ? "Zima kuponi" : "Washa kuponi"}
+                </button>
+              </article>
+            ))}
+            {!coupons.length && <p className="empty-state">Hakuna kuponi zilizoundwa.</p>}
+          </div>
         </section>
       )}
 
@@ -1957,6 +2045,7 @@ function CheckoutPage({ productId }) {
   const [product, setProduct] = useState(null);
   const [paymentConfig, setPaymentConfig] = useState(null);
   const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
+  const [couponCode, setCouponCode] = useState("");
   const [orderId, setOrderId] = useState(new URLSearchParams(window.location.search).get("order_id") || "");
   const [order, setOrder] = useState(null);
   const previousOrderStatus = useRef(null);
@@ -2045,6 +2134,7 @@ function CheckoutPage({ productId }) {
           buyer_phone: form.buyer_phone,
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
+          coupon_code: couponCode,
           request_key: newRequestKey(),
         }),
       });
@@ -2138,6 +2228,8 @@ function CheckoutPage({ productId }) {
               <input id="buyer-phone" className="text-input" type="tel" inputMode="tel" autoComplete="tel" placeholder="Mf. 0712 345 678" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
               <label className="field-label" htmlFor="buyer-address">Anuani ya delivery (hiari)</label>
               <input id="buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
+              <label className="field-label" htmlFor="checkout-coupon">Msimbo wa kuponi (demo pekee)</label>
+              <input id="checkout-coupon" className="text-input" maxLength={32} autoComplete="off" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} />
               {isAblinerSelected && (
                 <p className="field-hint">Abliner itatuma ombi la malipo kwenye simu yako. Thibitisha kwenye simu; usiweke PIN au OTP kwenye tovuti hii.</p>
               )}
@@ -2170,6 +2262,7 @@ function CheckoutPage({ productId }) {
             <div className="eyebrow"><span /> {order.demo ? "MALIPO YA MAJARIBIO" : order.payment_method === ABLINER_PAYMENT_METHOD ? "MALIPO YA ABLINER" : "MALIPO YA CLICKPESA"}</div>
             <h1>{order.demo ? "Thibitisha oda yako" : "Subiri ombi la malipo"}</h1>
             <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
+            {order.coupon_discount > 0 && <p className="field-hint">{translate("Punguzo la kuponi", language)} ({order.coupon_code}): TZS {formatMoney(order.coupon_discount)}</p>}
             <div className="payment-result pending">
               <strong>Haijalipwa bado</strong>
               {order.demo ? (
@@ -2206,6 +2299,7 @@ function CheckoutPage({ productId }) {
               <div><dt>Njia ya malipo</dt><dd>{paymentMethodLabel(order.payment_method)}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
               <div><dt>Hali</dt><dd>{order.demo ? "Imekamilika (demo)" : "Malipo yamepokelewa"}</dd></div>
               <div><dt>Jumla ya malipo</dt><dd>TZS {formatMoney(order.amount)}</dd></div>
+              {order.coupon_discount > 0 && <div><dt>Punguzo la kuponi ({order.coupon_code})</dt><dd>- TZS {formatMoney(order.coupon_discount)}</dd></div>}
               <div><dt>Kamisheni ya jukwaa ({order.commission_percent}%)</dt><dd>TZS {formatMoney(order.platform_fee)}</dd></div>
               <div><dt>Mgao wa muuzaji baada ya kamisheni</dt><dd>TZS {formatMoney(order.seller_payout)}</dd></div>
               <div><dt>Tarehe</dt><dd>{order.completed_at || "—"}</dd></div>
@@ -2233,6 +2327,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   const [checkout, setCheckout] = useState(null);
   const previousCheckoutStatus = useRef(null);
   const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
+  const [couponCode, setCouponCode] = useState("");
   const [error, setError] = useFeedbackState("error");
   const [busy, setBusy] = useState(false);
 
@@ -2322,6 +2417,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           buyer_phone: form.buyer_phone,
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
+          coupon_code: couponCode,
           items: items.map((item) => ({
             product_id: item.product_id,
             quantity: item.quantity,
@@ -2417,6 +2513,8 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <input id="cart-buyer-phone" className="text-input" type="tel" inputMode="tel" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
                   <label className="field-label" htmlFor="cart-buyer-address">Anuani ya delivery (hiari)</label>
                   <input id="cart-buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
+                  <label className="field-label" htmlFor="cart-coupon">Msimbo wa kuponi (demo pekee)</label>
+                  <input id="cart-coupon" className="text-input" maxLength={32} autoComplete="off" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} />
                   {isAblinerSelected && (
                     <p className="field-hint">Abliner itatuma ombi moja la malipo kwa jumla ya kikapu. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
                   )}
@@ -2457,6 +2555,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <small>Mgao wa muuzaji baada ya kamisheni: TZS {formatMoney(split.seller_payout)}</small>
                 </div>
               ))}
+              {checkout.coupon_discount > 0 && <p className="field-hint">{translate("Punguzo la kuponi", language)} ({checkout.coupon_code}): - TZS {formatMoney(checkout.coupon_discount)}</p>}
               <div className="checkout-amount">Jumla ya mteja: TZS {formatMoney(checkout.total_amount)}</div>
               <p className="field-hint">Kamisheni inakatwa kwenye mgao wa kila muuzaji; haiongezwi kwenye bili ya mnunuzi.</p>
               {checkout.payment_status === "PENDING" && !checkout.demo && (

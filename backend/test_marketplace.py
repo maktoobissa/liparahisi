@@ -612,6 +612,20 @@ class MarketplaceFlowTests(unittest.TestCase):
             public_product = seller_client.get(f"/api/products/{product_id}").json()
             self.assertEqual(public_product["name"], "Kikombe cha kahawa")
             self.assertEqual(public_product["amount"], 5000)
+            self.assertEqual(
+                seller_client.get("/api/admin/coupons").status_code,
+                403,
+            )
+            coupon = self.client.post(
+                "/api/admin/coupons",
+                json={
+                    "code": "WELCOME10",
+                    "discount_type": "PERCENT",
+                    "discount_value": 10,
+                    "max_redemptions": 1,
+                },
+            )
+            self.assertEqual(coupon.status_code, 201, coupon.text)
 
             other_seller_id = self.client.post(
                 "/api/auth/register",
@@ -654,16 +668,21 @@ class MarketplaceFlowTests(unittest.TestCase):
                         "buyer_email": "buyer-cart@example.com",
                         "buyer_phone": "0712345678",
                         "payment_method": "M-Pesa",
+                        "coupon_code": "WELCOME10",
                         "items": [{"product_id": product_id, "quantity": 2}],
                     },
                 )
                 self.assertEqual(cart_checkout.status_code, 200)
                 cart = cart_checkout.json()
+                self.assertEqual(cart["coupon_discount"], 1000)
+                self.assertEqual(cart["total_amount"], 9000)
                 self.assertEqual(len(cart["order_ids"]), 1)
                 cart_status = buyer_client.get(
                     f"/api/checkouts/{cart['checkout_id']}"
                 ).json()
-                self.assertEqual(cart_status["total_amount"], 10000)
+                self.assertEqual(cart_status["total_amount"], 9000)
+                self.assertEqual(cart_status["coupon_code"], "WELCOME10")
+                self.assertEqual(cart_status["coupon_discount"], 1000)
                 self.assertEqual(len(cart_status["splits"]), 1)
                 self.email_sender.reset_mock()
                 cart_completed = buyer_client.post(
@@ -678,6 +697,64 @@ class MarketplaceFlowTests(unittest.TestCase):
                 )
                 self.assertEqual(repeated_cart_completion.status_code, 200)
                 self.assertEqual(self.email_sender.call_count, 2)
+                coupon_reuse = buyer_client.post(
+                    "/api/cart/checkout",
+                    json={
+                        "request_key": "e" * 32,
+                        "buyer_name": "Buyer Cart",
+                        "buyer_email": "buyer-cart@example.com",
+                        "buyer_phone": "0712345678",
+                        "payment_method": "M-Pesa",
+                        "coupon_code": "WELCOME10",
+                        "items": [{"product_id": product_id, "quantity": 1}],
+                    },
+                )
+                self.assertEqual(coupon_reuse.status_code, 409)
+
+                fixed_coupon = self.client.post(
+                    "/api/admin/coupons",
+                    json={
+                        "code": "SAVE500",
+                        "discount_type": "FIXED",
+                        "discount_value": 500,
+                    },
+                )
+                self.assertEqual(fixed_coupon.status_code, 201, fixed_coupon.text)
+                with patch.dict(os.environ, {"DEMO_MODE": "false"}):
+                    with main.db_connection() as connection:
+                        with self.assertRaises(main.HTTPException) as live_coupon_error:
+                            main.coupon_discount_for_checkout(
+                                connection,
+                                "SAVE500",
+                                5000,
+                                None,
+                                "buyer-fixed@example.com",
+                            )
+                self.assertEqual(live_coupon_error.exception.status_code, 422)
+                single_checkout = buyer_client.post(
+                    f"/api/products/{product_id}/checkout",
+                    json={
+                        "request_key": "f" * 32,
+                        "buyer_name": "Buyer Fixed",
+                        "buyer_email": "buyer-fixed@example.com",
+                        "buyer_phone": "0712345678",
+                        "payment_method": "M-Pesa",
+                        "coupon_code": "SAVE500",
+                    },
+                )
+                self.assertEqual(single_checkout.status_code, 200)
+                single_order_id = single_checkout.json()["order_id"]
+                single_order = buyer_client.get(
+                    f"/api/orders/{single_order_id}"
+                ).json()
+                self.assertEqual(single_order["amount"], 4500)
+                self.assertEqual(single_order["coupon_discount"], 500)
+                self.assertEqual(
+                    buyer_client.post(
+                        f"/api/orders/{single_order_id}/demo-complete"
+                    ).status_code,
+                    200,
+                )
                 checkout_payload = {
                     "request_key": "a" * 32,
                     "buyer_name": "Buyer One",
@@ -876,9 +953,9 @@ class MarketplaceFlowTests(unittest.TestCase):
                     )
                 self.assertEqual(invalid_callback.status_code, 422)
             dashboard = seller_client.get("/api/dashboard").json()
-            self.assertEqual(dashboard["gross_sales"], 20000)
-            self.assertEqual(dashboard["platform_fees"], 1000)
-            self.assertEqual(dashboard["net_profit"], 9000)
+            self.assertEqual(dashboard["gross_sales"], 23500)
+            self.assertEqual(dashboard["platform_fees"], 1175)
+            self.assertEqual(dashboard["net_profit"], 9825)
 
             archived = seller_client.post(f"/api/sales/{order_id}/archive")
             self.assertEqual(archived.status_code, 200)
@@ -886,6 +963,10 @@ class MarketplaceFlowTests(unittest.TestCase):
                 f"/api/sales/{cart_split_order_id}/archive"
             )
             self.assertEqual(cart_archived.status_code, 200)
+            single_archived = seller_client.post(
+                f"/api/sales/{single_order_id}/archive"
+            )
+            self.assertEqual(single_archived.status_code, 200)
             live_archived = seller_client.post(
                 f"/api/sales/{live_order_id}/archive"
             )
@@ -1486,6 +1567,15 @@ class MarketplaceFlowTests(unittest.TestCase):
             },
         )
         self.assertEqual(setup.status_code, 200)
+        coupon = self.client.post(
+            "/api/admin/coupons",
+            json={
+                "code": "ABLINER10",
+                "discount_type": "PERCENT",
+                "discount_value": 10,
+            },
+        )
+        self.assertEqual(coupon.status_code, 201, coupon.text)
 
         seller_client = TestClient(main.app)
         with seller_client:
@@ -1546,12 +1636,26 @@ class MarketplaceFlowTests(unittest.TestCase):
         with buyer_client, patch.dict(
             os.environ,
             {
+                "DEMO_MODE": "true",
                 "ABLINER_LIVE_ENABLED": "true",
                 "ABLINER_API_KEY": "test-api-key",
                 "ABLINER_WEBHOOK_SECRET": "test-webhook-secret",
                 "PUBLIC_APP_URL": "https://liparahisi.onrender.com",
             },
         ), patch("backend.main.get_abliner_client", return_value=fake_client):
+            live_coupon_checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    "request_key": "f" * 32,
+                    "buyer_name": "Buyer Abliner",
+                    "buyer_email": "buyer-abliner@example.com",
+                    "buyer_phone": "0712345678",
+                    "payment_method": "Abliner Mobile Money",
+                    "coupon_code": "ABLINER10",
+                },
+            )
+            self.assertEqual(live_coupon_checkout.status_code, 422)
+            self.assertIsNone(fake_client.request)
             checkout = buyer_client.post(
                 f"/api/products/{product_id}/checkout",
                 json={

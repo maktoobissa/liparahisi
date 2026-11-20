@@ -492,6 +492,25 @@ def initialize_db():
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS coupons (
+                id TEXT PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                discount_type TEXT NOT NULL CHECK (discount_type IN ('PERCENT', 'FIXED')),
+                discount_value INTEGER NOT NULL CHECK (discount_value > 0),
+                max_redemptions INTEGER,
+                redemption_count INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS coupon_redemptions (
+                coupon_id TEXT NOT NULL REFERENCES coupons(id) ON DELETE CASCADE,
+                redemption_key TEXT NOT NULL,
+                buyer_key TEXT NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (coupon_id, redemption_key),
+                UNIQUE (coupon_id, buyer_key)
+            );
             """
         )
 
@@ -539,6 +558,8 @@ def initialize_db():
             "expires_at": "DOUBLE PRECISION",
             "completed_at": timestamp_type,
             "archived_at": timestamp_type,
+            "coupon_code": "TEXT NOT NULL DEFAULT ''",
+            "coupon_discount": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, declaration in product_columns.items():
             ensure_column(connection, "products", column, declaration)
@@ -768,6 +789,31 @@ class SupportTicketUpdateInput(BaseModel):
     status: Literal["OPEN", "IN_PROGRESS", "RESOLVED"]
     admin_response: str = Field(default="", max_length=4000)
 
+
+class CouponInput(BaseModel):
+    code: str = Field(min_length=3, max_length=32)
+    discount_type: Literal["PERCENT", "FIXED"]
+    discount_value: int = Field(gt=0, le=999999999)
+    max_redemptions: int | None = Field(default=None, ge=1, le=999999999)
+
+    @validator("code")
+    def normalize_coupon_code(cls, value):
+        code = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{2,31}", code):
+            raise ValueError("Msimbo wa kuponi utumie herufi, namba, - au _ pekee.")
+        return code
+
+    @validator("discount_value")
+    def validate_coupon_discount(cls, value, values):
+        if values.get("discount_type") == "PERCENT" and value > 100:
+            raise ValueError("Punguzo la asilimia haliwezi kuzidi 100.")
+        return value
+
+
+class CouponStatusInput(BaseModel):
+    is_active: bool
+
+
 class CheckoutInput(BaseModel):
     request_key: str = Field(min_length=32, max_length=64)
     buyer_name: str = Field(min_length=2, max_length=100)
@@ -776,6 +822,7 @@ class CheckoutInput(BaseModel):
     payment_method: str
     bank_branch: str | None = Field(default=None, max_length=100)
     delivery_address: str = Field(default="", max_length=500)
+    coupon_code: str = Field(default="", max_length=32)
 
     @validator("buyer_name")
     def strip_buyer_name(cls, value):
@@ -805,6 +852,10 @@ class CheckoutInput(BaseModel):
         if value not in PAYMENT_METHODS:
             raise ValueError("Chagua mtandao au huduma ya benki iliyopo.")
         return value
+
+    @validator("coupon_code")
+    def normalize_checkout_coupon_code(cls, value):
+        return value.strip().upper()
 
 
 class CartItemInput(BaseModel):
@@ -1401,6 +1452,7 @@ def complete_order_group(order_ids, provider_verified=False, background_tasks=No
                     )
             orders.append(order)
 
+        record_coupon_redemption(connection, orders)
         for order in orders:
             if order["payment_status"] == "COMPLETED":
                 continue
@@ -1999,7 +2051,7 @@ async def proxy_internal_api(
 
 @app.api_route(
     "/api/admin/{admin_path:path}",
-    methods=["GET", "PATCH"],
+    methods=["GET", "POST", "PATCH"],
 )
 async def admin_api_gateway(admin_path: str, request: Request):
     return await proxy_internal_api(
@@ -3043,6 +3095,246 @@ def create_category(payload: CategoryInput, request: Request):
     return {"id": category_id, "name": name}
 
 
+def list_coupons(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, code, discount_type, discount_value, max_redemptions,
+                   redemption_count, is_active, created_at
+            FROM coupons ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [{**dict(row), "is_active": bool(row["is_active"])} for row in rows]
+
+
+def create_coupon(payload: CouponInput, request: Request):
+    actor = require_admin(request)
+    if payload.discount_type == "PERCENT" and payload.discount_value > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Punguzo la asilimia haliwezi kuzidi 100.",
+        )
+    coupon_id = secrets.token_hex(16)
+    try:
+        with db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO coupons
+                    (id, code, discount_type, discount_value, max_redemptions, created_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    coupon_id,
+                    payload.code,
+                    payload.discount_type,
+                    payload.discount_value,
+                    payload.max_redemptions,
+                    actor["id"],
+                ),
+            )
+    except Exception as error:
+        if is_integrity_error(error):
+            raise HTTPException(
+                status_code=409,
+                detail="Msimbo huu wa kuponi tayari upo.",
+            ) from error
+        raise
+    record_audit(
+        "COUPON_CREATED",
+        "coupon",
+        coupon_id,
+        payload.code,
+        actor=actor,
+        request=request,
+    )
+    with db_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, code, discount_type, discount_value, max_redemptions,
+                   redemption_count, is_active, created_at
+            FROM coupons WHERE id = ?
+            """,
+            (coupon_id,),
+        ).fetchone()
+    return {**dict(row), "is_active": bool(row["is_active"])}
+
+
+def set_coupon_status(coupon_id: str, payload: CouponStatusInput, request: Request):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            "UPDATE coupons SET is_active = ? WHERE id = ?",
+            (int(payload.is_active), coupon_id),
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kuponi haikupatikana.")
+    record_audit(
+        "COUPON_STATUS_UPDATED",
+        "coupon",
+        coupon_id,
+        "ACTIVE" if payload.is_active else "INACTIVE",
+        actor=actor,
+        request=request,
+    )
+    return {"id": coupon_id, "is_active": payload.is_active}
+
+
+def coupon_buyer_key(buyer_id, buyer_email):
+    if buyer_id:
+        return f"account:{buyer_id}"
+    return f"email:{buyer_email.strip().lower()}"
+
+
+def coupon_discount_for_checkout(
+    connection,
+    coupon_code,
+    subtotal,
+    buyer_id,
+    buyer_email,
+    minimum_total=1,
+    demo_checkout=False,
+):
+    code = (coupon_code or "").strip().upper()
+    if not code:
+        return "", 0
+    if not demo_checkout or not is_demo_mode():
+        raise HTTPException(
+            status_code=422,
+            detail="Kuponi zinapatikana kwenye majaribio pekee.",
+        )
+    coupon = connection.execute(
+        "SELECT * FROM coupons WHERE code = ?",
+        (code,),
+    ).fetchone()
+    if coupon is None or not coupon["is_active"]:
+        raise HTTPException(status_code=404, detail="Kuponi haipo au haijawashwa.")
+    if (
+        coupon["max_redemptions"] is not None
+        and coupon["redemption_count"] >= coupon["max_redemptions"]
+    ):
+        raise HTTPException(status_code=409, detail="Matumizi ya kuponi yamefika kikomo.")
+    buyer_key = coupon_buyer_key(buyer_id, buyer_email)
+    redeemed = connection.execute(
+        """
+        SELECT 1 FROM coupon_redemptions
+        WHERE coupon_id = ? AND buyer_key = ?
+        """,
+        (coupon["id"], buyer_key),
+    ).fetchone()
+    if redeemed is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Tayari umetumia kuponi hii.",
+        )
+    discount = (
+        subtotal * coupon["discount_value"] // 100
+        if coupon["discount_type"] == "PERCENT"
+        else coupon["discount_value"]
+    )
+    discount = min(discount, max(0, subtotal - minimum_total))
+    if discount <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Kuponi hii haiwezi kupunguza kiasi cha oda hii.",
+        )
+    return code, discount
+
+
+def allocate_coupon_discount(discount, seller_subtotals):
+    total_subtotal = sum(amount for _seller_id, amount in seller_subtotals)
+    remaining = discount
+    allocations = {}
+    for seller_id, subtotal in seller_subtotals:
+        share = min(discount * subtotal // total_subtotal, subtotal - 1, remaining)
+        allocations[seller_id] = share
+        remaining -= share
+    for seller_id, subtotal in seller_subtotals:
+        if remaining <= 0:
+            break
+        extra = min(subtotal - 1 - allocations[seller_id], remaining)
+        allocations[seller_id] += extra
+        remaining -= extra
+    if remaining:
+        raise HTTPException(
+            status_code=422,
+            detail="Kuponi hii haiwezi kupunguza kiasi cha oda hii.",
+        )
+    return allocations
+
+
+def record_coupon_redemption(connection, orders):
+    coupon_codes = {order.get("coupon_code") or "" for order in orders}
+    coupon_codes.discard("")
+    if not coupon_codes:
+        return
+    if (
+        len(coupon_codes) != 1
+        or not is_demo_mode()
+        or any(
+            order.get("provider_reference")
+            or order.get("payment_method") == ABLINER_PAYMENT_METHOD
+            for order in orders
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Kuponi hii haiwezi kutumika kwenye malipo halisi.",
+        )
+    coupon_code = next(iter(coupon_codes))
+    first_order = orders[0]
+    redemption_key = first_order.get("checkout_id") or first_order["order_id"]
+    coupon = connection.execute(
+        "SELECT id, max_redemptions, redemption_count FROM coupons WHERE code = ?",
+        (coupon_code,),
+    ).fetchone()
+    if coupon is None:
+        raise HTTPException(status_code=409, detail="Kuponi haipo tena.")
+    existing = connection.execute(
+        """
+        SELECT 1 FROM coupon_redemptions
+        WHERE coupon_id = ? AND redemption_key = ?
+        """,
+        (coupon["id"], redemption_key),
+    ).fetchone()
+    if existing is not None:
+        return
+    buyer_key = coupon_buyer_key(
+        first_order.get("buyer_id"),
+        first_order.get("buyer_email") or "",
+    )
+    updated = connection.execute(
+        """
+        UPDATE coupons
+        SET redemption_count = redemption_count + 1
+        WHERE id = ?
+          AND (? IS NULL OR redemption_count < ?)
+        """,
+        (
+            coupon["id"],
+            coupon["max_redemptions"],
+            coupon["max_redemptions"],
+        ),
+    )
+    if updated.rowcount == 0:
+        raise HTTPException(status_code=409, detail="Matumizi ya kuponi yamefika kikomo.")
+    try:
+        connection.execute(
+            """
+            INSERT INTO coupon_redemptions (coupon_id, redemption_key, buyer_key)
+            VALUES (?, ?, ?)
+            """,
+            (coupon["id"], redemption_key, buyer_key),
+        )
+    except Exception as error:
+        if is_integrity_error(error):
+            raise HTTPException(
+                status_code=409,
+                detail="Tayari umetumia kuponi hii.",
+            ) from error
+        raise
+
+
 def low_stock_products(request: Request):
     user = get_current_user(request)
     seller_filter = "" if user["role"] == "ADMIN" else "AND p.seller_id = ?"
@@ -3670,6 +3962,16 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     buyer_email = checkout_buyer_email(payload, buyer)
+    with db_connection() as connection:
+        coupon_code, coupon_discount = coupon_discount_for_checkout(
+            connection,
+            payload.coupon_code,
+            product["amount"],
+            buyer_id,
+            buyer_email,
+            demo_checkout=demo_order,
+        )
+    amount = product["amount"] - coupon_discount
     try:
         with db_connection() as connection:
             connection.execute(
@@ -3678,15 +3980,15 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     (order_id, request_key, product_id, seller_id, amount,
                      buyer_name, buyer_email, buyer_phone, buyer_id,
                      payment_method, bank_branch, delivery_address, provider_reference,
-                     product_cost, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     product_cost, expires_at, coupon_code, coupon_discount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
                     payload.request_key,
                     product_id,
                     product["seller_id"],
-                    product["amount"],
+                    amount,
                     payload.buyer_name.strip(),
                     buyer_email,
                     payload.buyer_phone,
@@ -3699,6 +4001,8 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     provider_reference,
                     product["cost_amount"],
                     time.time() + ORDER_TTL_SECONDS,
+                    coupon_code,
+                    coupon_discount,
                 ),
             )
             connection.execute(
@@ -3740,20 +4044,23 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
         payment_status = await begin_abliner_payment(
             provider_reference,
             payload.buyer_phone,
-            product["amount"],
+            amount,
             f"{app_url}/api/webhooks/abliner",
         )
     elif not demo_mode:
         payment_status = await begin_clickpesa_payment(
             provider_reference,
             payload.buyer_phone,
-            product["amount"],
+            amount,
         )
     return {
         "order_id": order_id,
         "checkout_url": checkout_url,
         "payment_status": payment_status,
         "demo": demo_order,
+        "amount": amount,
+        "coupon_code": coupon_code,
+        "coupon_discount": coupon_discount,
     }
 
 
@@ -3813,6 +4120,27 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         if existing:
             return get_cart_checkout(existing["checkout_id"], request)
 
+        seller_subtotals = [
+            (
+                seller_id,
+                sum(product["amount"] * quantity for product, quantity in seller_items),
+            )
+            for seller_id, seller_items in merged.items()
+        ]
+        subtotal = sum(amount for _seller_id, amount in seller_subtotals)
+        coupon_code, total_coupon_discount = coupon_discount_for_checkout(
+            connection,
+            payload.coupon_code,
+            subtotal,
+            buyer_id,
+            buyer_email,
+            minimum_total=len(seller_subtotals),
+            demo_checkout=demo_mode and not abliner_mode,
+        )
+        coupon_allocations = allocate_coupon_discount(
+            total_coupon_discount,
+            seller_subtotals,
+        ) if total_coupon_discount else {}
         checkout_id = "CART" + secrets.token_hex(16).upper()
         demo_order = demo_mode and not abliner_mode
         provider_reference = "" if demo_order else "LR" + secrets.token_hex(9).upper()
@@ -3820,7 +4148,11 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         order_ids = []
         for seller_index, (seller_id, seller_items) in enumerate(merged.items()):
             order_id = ("DEMO" if demo_order else "ORD") + secrets.token_hex(10).upper()
-            amount = sum(product["amount"] * quantity for product, quantity in seller_items)
+            seller_subtotal = sum(
+                product["amount"] * quantity for product, quantity in seller_items
+            )
+            coupon_discount = coupon_allocations.get(seller_id, 0)
+            amount = seller_subtotal - coupon_discount
             product_cost = sum(product["cost_amount"] * quantity for product, quantity in seller_items)
             fee = commission_amount(amount)
             payout = amount - fee
@@ -3833,8 +4165,9 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                      buyer_name, buyer_email, buyer_phone, buyer_id,
                      payment_method, bank_branch, delivery_address, provider_reference,
                      product_cost, platform_fee, seller_payout, net_profit,
-                     checkout_id, cart_request_key, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     checkout_id, cart_request_key, expires_at,
+                     coupon_code, coupon_discount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -3859,6 +4192,8 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     checkout_id,
                     payload.request_key,
                     expires_at,
+                    coupon_code,
+                    coupon_discount,
                 ),
             )
             for product, quantity in seller_items:
@@ -3886,10 +4221,7 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             (checkout_url, checkout_id),
         )
     payment_status = "PENDING"
-    total_amount = sum(
-        sum(product["amount"] * quantity for product, quantity in seller_items)
-        for seller_items in merged.values()
-    )
+    total_amount = subtotal - total_coupon_discount
     if abliner_mode:
         payment_status = await begin_abliner_payment(
             provider_reference,
@@ -3909,6 +4241,9 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         "order_ids": order_ids,
         "payment_status": payment_status,
         "demo": demo_order,
+        "total_amount": total_amount,
+        "coupon_code": coupon_code,
+        "coupon_discount": total_coupon_discount,
     }
 
 
@@ -3960,6 +4295,8 @@ def get_cart_checkout(checkout_id: str, request: Request):
         "demo": not any(order["provider_reference"] for order in orders),
         "commission_percent": COMMISSION_PERCENT,
         "total_amount": sum(split["amount"] for split in splits),
+        "coupon_code": orders[0]["coupon_code"] or "",
+        "coupon_discount": sum(order["coupon_discount"] for order in orders),
         "platform_fee": sum(split["platform_fee"] for split in splits),
         "completed_at": next((row["completed_at"] for row in orders if row["completed_at"]), None),
         "splits": splits,
@@ -4018,6 +4355,8 @@ def order_status(order_id: str, request: Request):
         "seller_payout": order["seller_payout"],
         "commission_percent": COMMISSION_PERCENT,
         "demo": not bool(order["provider_reference"]),
+        "coupon_code": order["coupon_code"] or "",
+        "coupon_discount": order["coupon_discount"],
     }
     buyer = optional_current_user(request)
     if buyer and buyer["role"] == "BUYER" and buyer["id"] == order["buyer_id"]:

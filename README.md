@@ -19,6 +19,8 @@ sales.
 - Order delivery status and tracking codes, buyer cancellation requests, and
   verified-order reviews subject to administrator moderation.
 - Buyer support tickets with administrator responses.
+- Admin-managed marketplace-wide percentage or fixed-value coupons, limited to
+  demo checkout and one completed redemption per buyer.
 - Downloadable receipt PDFs with item subtotals, total charged, commission per
   seller, and seller payouts.
 - Swahili, English, and French interface language selection, plus in-app
@@ -29,6 +31,10 @@ sales.
 
 Uploaded product images are stored with marketplace data and served through the
 public catalog image endpoint; storefront images still use HTTP/HTTPS URLs.
+The interface supports all three languages; text without a translation entry
+falls back to its source language. Seller-entered product/store names and
+descriptions remain in the language provided by the seller and are not
+automatically translated.
 Seller sales/dashboard data refreshes automatically while the page is visible,
 and pending order/checkout status is rechecked periodically. Browser
 notifications require the visitor's permission; sound can be muted in the app.
@@ -36,8 +42,8 @@ The in-app notification list and unread counter are available while the page is
 open. Push delivery while the app is closed is not configured. Approved
 cancellation of a completed order restores stock only in demo mode; it does not
 issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
-checkout, but neither is connected to a live payment provider. Coupons are not
-included in this feature set.
+checkout, but neither is connected to a live payment provider. Coupons are
+rejected when live payments are enabled.
 
 ## Payments
 

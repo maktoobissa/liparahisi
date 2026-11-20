@@ -5,21 +5,26 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
 from backend.main import (
     CancellationResolutionInput,
+    CouponInput,
+    CouponStatusInput,
     ReviewModerationInput,
     SellerStatusInput,
     SupportTicketUpdateInput,
     SupportTicketInput,
     connect_db,
+    create_coupon,
     create_support_ticket,
     export_sales,
     list_cancellations,
     list_audit,
+    list_coupons,
     list_reviews,
     list_sellers,
     list_support_tickets,
     moderate_review,
     resolve_cancellation,
     update_seller_status,
+    set_coupon_status,
     update_support_ticket,
 )
 
@@ -48,6 +53,28 @@ def health():
     with connect_db() as connection:
         connection.execute("SELECT 1").fetchone()
     return {"status": "ok"}
+
+
+@app.get("/coupons", dependencies=[Depends(verify_gateway_token)])
+def coupons(request: Request):
+    return list_coupons(request)
+
+
+@app.post("/coupons", status_code=201, dependencies=[Depends(verify_gateway_token)])
+def coupons_create(payload: CouponInput, request: Request):
+    return create_coupon(payload, request)
+
+
+@app.patch(
+    "/coupons/{coupon_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def coupons_status(
+    coupon_id: str,
+    payload: CouponStatusInput,
+    request: Request,
+):
+    return set_coupon_status(coupon_id, payload, request)
 
 
 @app.get("/sellers", dependencies=[Depends(verify_gateway_token)])
