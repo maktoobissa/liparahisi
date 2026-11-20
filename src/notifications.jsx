@@ -105,7 +105,7 @@ export function NotificationProvider({ children }) {
       try {
         const systemNotification = new Notification(title, {
           body,
-          icon: "/icons/icon.svg",
+          icon: "/images/liparahisi-app-icon.svg",
           tag: dedupeKey,
         });
         systemNotification.onclick = () => window.focus();

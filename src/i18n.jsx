@@ -290,8 +290,6 @@ const translations = Object.fromEntries([
   ["Kiasi", "Amount", "Montant"],
   ["Delivery", "Delivery", "Livraison"],
   ["Usafirishaji", "Shipping", "Expédition"],
-  ["Andika jina la tawi", "Enter branch name", "Saisissez le nom de l'agence"],
-  ["Tawi la benki", "Bank branch", "Agence bancaire"],
   ["Maoni (hiari)", "Review (optional)", "Avis (facultatif)"],
   ["Sababu ya kughairi", "Cancellation reason", "Motif de l'annulation"],
   ["Hali ya delivery", "Delivery status", "Statut de livraison"],

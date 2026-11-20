@@ -16,14 +16,12 @@ const ablinerNetwork = {
 };
 const networks = [
   { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa" },
-  { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo" },
-  { value: "Tigo Pesa", label: "Tigo Pesa", short: "TP", color: "tigo" },
-  { value: "Airtel Money", label: "Airtel Money", short: "AM", color: "airtel" },
-  { value: "NMB", label: "NMB", short: "NB", color: "bank" },
-  { value: "CRDB", label: "CRDB", short: "CR", color: "bank" },
-  { value: "NBC", label: "NBC", short: "NC", color: "bank" },
-  { value: "NMB Branch", label: "Tawi la NMB", short: "NT", color: "bank" },
-  { value: "CRDB Branch", label: "Tawi la CRDB", short: "CT", color: "bank" },
+  { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo", logo: "/images/payment-networks/halo-pesa.png" },
+  { value: "Tigo Pesa", label: "Mixx by Yas", short: "TP", color: "tigo", logo: "/images/payment-networks/mixx-by-yas.jpg" },
+  { value: "Airtel Money", label: "Airtel Money", short: "AM", color: "airtel", logo: "/images/payment-networks/airtel-money.png" },
+  { value: "NMB", label: "NMB", short: "NB", color: "bank", logo: "/images/payment-networks/nmb.png" },
+  { value: "CRDB", label: "CRDB", short: "CR", color: "bank", logo: "/images/payment-networks/crdb.png" },
+  { value: "NBC", label: "NBC", short: "NC", color: "bank", logo: "/images/payment-networks/nbc.jpg" },
 ];
 const clickpesaNetworkValues = new Set(["M-Pesa", "Halo Pesa", "Tigo Pesa", "Airtel Money"]);
 
@@ -37,15 +35,9 @@ function paymentOptionsFor(config) {
   return [...methods, ablinerNetwork];
 }
 
-const bankBranches = [
-  "Dar es Salaam - Kariakoo",
-  "Dar es Salaam - Posta",
-  "Dar es Salaam - Ubungo",
-  "Mwanza",
-  "Arusha",
-  "Dodoma",
-  "Tawi lingine",
-];
+function paymentMethodLabel(method) {
+  return method === "Tigo Pesa" ? "Mixx by Yas" : method;
+}
 
 function formatMoney(amount) {
   let language = "sw";
@@ -1194,7 +1186,7 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
     <tr className={sale.archived_at ? "archived-row" : ""}>
       <td><strong>{sale.product_name}</strong><small>{sale.order_id}</small></td>
       {isAdmin && <td>{sale.shop_name || "—"}</td>}
-      <td>{sale.buyer_name || "—"}<small>{sale.payment_method || ""}</small>{sale.delivery_address && <small>{sale.delivery_address}</small>}</td>
+      <td>{sale.buyer_name || "—"}<small>{paymentMethodLabel(sale.payment_method || "")}</small>{sale.delivery_address && <small>{sale.delivery_address}</small>}</td>
       <td><span className={`order-status ${sale.payment_status.toLowerCase()}`}>{sale.payment_status === "COMPLETED" ? "Imekamilika (demo)" : sale.payment_status}</span>{sale.archived_at && <small>Imefichwa na muuzaji</small>}</td>
       <td>
         {sale.payment_status === "COMPLETED" && onUpdateDelivery ? (
@@ -1711,7 +1703,7 @@ function CheckoutPage({ productId }) {
   const { notify } = useNotification();
   const [product, setProduct] = useState(null);
   const [paymentConfig, setPaymentConfig] = useState(null);
-  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
   const [orderId, setOrderId] = useState(new URLSearchParams(window.location.search).get("order_id") || "");
   const [order, setOrder] = useState(null);
   const previousOrderStatus = useRef(null);
@@ -1792,10 +1784,6 @@ function CheckoutPage({ productId }) {
     setError("");
     setBusy(true);
     try {
-      const bankBranch = form.bank_branch === "Tawi lingine" ? form.bank_branch_name.trim() : form.bank_branch;
-      if (form.payment_method.endsWith("Branch") && !bankBranch) {
-        throw new Error("Weka jina la tawi la benki.");
-      }
       const result = await api(`/products/${productId}/checkout`, {
         method: "POST",
         body: JSON.stringify({
@@ -1804,7 +1792,6 @@ function CheckoutPage({ productId }) {
           buyer_phone: form.buyer_phone,
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
-          bank_branch: bankBranch,
           request_key: newRequestKey(),
         }),
       });
@@ -1852,7 +1839,7 @@ function CheckoutPage({ productId }) {
     await downloadReceiptPdf({
       checkoutId: order.order_id,
       buyerName: order.buyer_name || form.buyer_name || "Mgeni",
-      paymentMethod: order.payment_method,
+      paymentMethod: paymentMethodLabel(order.payment_method),
       bankBranch: order.bank_branch,
       deliveryAddress: order.delivery_address,
       totalAmount: amount,
@@ -1908,27 +1895,13 @@ function CheckoutPage({ productId }) {
                   <legend>Chagua mtandao wa malipo</legend>
                   <div className="method-grid">
                     {paymentMethods.map((method) => (
-                      <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value, bank_branch: method.value.endsWith("Branch") ? form.bank_branch : "", bank_branch_name: method.value.endsWith("Branch") ? form.bank_branch_name : "" })}>
-                        <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                      <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
+                        {method.logo ? <img className="method-logo" src={method.logo} alt="" /> : <span className={`method-icon ${method.color}`}>{method.short}</span>}
+                        <span className="method-label">{method.label}</span><span className="radio-indicator" />
                       </button>
                     ))}
                   </div>
                 </fieldset>
-              )}
-              {!isLivePayment && form.payment_method.endsWith("Branch") && (
-                <>
-                  <label className="field-label" htmlFor="bank-branch">Tawi la benki</label>
-                  <select id="bank-branch" className="text-input" required value={form.bank_branch} onChange={(event) => setForm({ ...form, bank_branch: event.target.value })}>
-                    <option value="">Chagua tawi</option>
-                    {bankBranches.map((branch) => <option key={branch} value={branch}>{branch}</option>)}
-                  </select>
-                  {form.bank_branch === "Tawi lingine" && (
-                    <>
-                      <label className="field-label" htmlFor="other-bank-branch">Andika jina la tawi</label>
-                      <input id="other-bank-branch" className="text-input" required value={form.bank_branch_name} onChange={(event) => setForm({ ...form, bank_branch_name: event.target.value })} />
-                    </>
-                  )}
-                </>
               )}
               {error && <p className="form-error" role="alert">{error}</p>}
               <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
@@ -1952,7 +1925,7 @@ function CheckoutPage({ productId }) {
               ) : (
                 <span>Ombi la malipo limetumwa kwa namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
               )}
-              <span>Njia ya malipo: {order.payment_method || (isAblinerSelected ? ABLINER_PAYMENT_METHOD : selectedMethod?.label)}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
+              <span>Njia ya malipo: {paymentMethodLabel(order.payment_method || (isAblinerSelected ? ABLINER_PAYMENT_METHOD : selectedMethod?.label))}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
             </div>
             {error && <p className="form-error" role="alert">{error}</p>}
             {order.demo && <button className="generate-button" type="button" disabled={busy} onClick={completeDemo}>{busy ? "Inathibitisha..." : "Thibitisha malipo ya majaribio"}</button>}
@@ -1976,7 +1949,7 @@ function CheckoutPage({ productId }) {
             <dl className="receipt-details">
               <div><dt>Namba ya oda</dt><dd>{order.order_id}</dd></div>
               <div><dt>Mnunuzi</dt><dd>{order.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
-              <div><dt>Njia ya malipo</dt><dd>{order.payment_method}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
+              <div><dt>Njia ya malipo</dt><dd>{paymentMethodLabel(order.payment_method)}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
               <div><dt>Hali</dt><dd>{order.demo ? "Imekamilika (demo)" : "Malipo yamepokelewa"}</dd></div>
               <div><dt>Jumla ya malipo</dt><dd>TZS {formatMoney(order.amount)}</dd></div>
               <div><dt>Kamisheni ya jukwaa ({order.commission_percent}%)</dt><dd>TZS {formatMoney(order.platform_fee)}</dd></div>
@@ -2005,7 +1978,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   const [checkoutId, setCheckoutId] = useState(initialCheckoutId);
   const [checkout, setCheckout] = useState(null);
   const previousCheckoutStatus = useRef(null);
-  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
   const [error, setError] = useFeedbackState("error");
   const [busy, setBusy] = useState(false);
 
@@ -2095,7 +2068,6 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           buyer_phone: form.buyer_phone,
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
-          bank_branch: form.bank_branch,
           items: items.map((item) => ({
             product_id: item.product_id,
             quantity: item.quantity,
@@ -2141,7 +2113,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
       buyerName: checkout.buyer_name || form.buyer_name || "Mgeni",
       buyerEmail: checkout.buyer_email || form.buyer_email,
       buyerPhone: checkout.buyer_phone || form.buyer_phone,
-      paymentMethod: checkout.payment_method,
+      paymentMethod: paymentMethodLabel(checkout.payment_method),
       bankBranch: checkout.bank_branch,
       totalAmount: checkout.total_amount,
       platformFee: checkout.platform_fee,
@@ -2203,7 +2175,8 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                       <div className="method-grid">
                         {paymentMethods.map((method) => (
                           <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
-                            <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                            {method.logo ? <img className="method-logo" src={method.logo} alt="" /> : <span className={`method-icon ${method.color}`}>{method.short}</span>}
+                            <span className="method-label">{method.label}</span><span className="radio-indicator" />
                           </button>
                         ))}
                       </div>
@@ -2256,7 +2229,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                 <>
                   <dl className="receipt-details">
                     <div><dt>Mnunuzi</dt><dd>{checkout.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
-                    <div><dt>Njia ya malipo</dt><dd>{checkout.payment_method}{checkout.bank_branch ? ` — ${checkout.bank_branch}` : ""}</dd></div>
+                    <div><dt>Njia ya malipo</dt><dd>{paymentMethodLabel(checkout.payment_method)}{checkout.bank_branch ? ` — ${checkout.bank_branch}` : ""}</dd></div>
                     <div><dt>Kamisheni jumla ({checkout.commission_percent}%)</dt><dd>TZS {formatMoney(checkout.platform_fee)}</dd></div>
                     <div><dt>Mgao wa wauzaji baada ya kamisheni</dt><dd>TZS {formatMoney(checkout.splits.reduce((sum, split) => sum + Number(split.seller_payout || 0), 0))}</dd></div>
                     <div><dt>Tarehe</dt><dd>{checkout.completed_at || "—"}</dd></div>
