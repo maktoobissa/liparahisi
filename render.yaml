@@ -87,6 +87,7 @@ services:
     name: liparahisi-cache
     region: oregon
     plan: 256mb
+    ipAllowList: []
     maxmemoryPolicy: allkeys-lru
     persistenceMode: off
 
