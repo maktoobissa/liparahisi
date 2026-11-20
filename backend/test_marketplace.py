@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -1000,6 +1001,116 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.assertEqual(public_products.status_code, 200)
         self.assertIn(product_id, {item["id"] for item in public_products.json()})
 
+        gallery_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/rMcAAAAASUVORK5CYII="
+        )
+        gallery_files = [
+            ("images", ("front.png", gallery_bytes, "image/png")),
+            ("images", ("side.png", gallery_bytes, "image/png")),
+        ]
+        product_list_cache = MagicMock()
+        product_list_cache.scan_iter.return_value = iter(
+            ["liparahisi:public-products:v2:cached-list"]
+        )
+        with patch.object(main, "get_redis_client", return_value=product_list_cache):
+            with seller_client:
+                uploaded_gallery = seller_client.post(
+                    f"/api/products/{product_id}/gallery",
+                    files=gallery_files,
+                )
+                self.assertEqual(
+                    uploaded_gallery.status_code,
+                    200,
+                    uploaded_gallery.text,
+                )
+        product_list_cache.delete.assert_called_once_with(
+            "liparahisi:public-products:v2:cached-list"
+        )
+        public_product = guest_client.get(f"/api/products/{product_id}").json()
+        self.assertEqual(len(public_product["gallery_images"]), 3)
+        listed_product = next(
+            item
+            for item in guest_client.get("/api/products?category=Vifaa").json()
+            if item["id"] == product_id
+        )
+        self.assertEqual(len(listed_product["gallery_images"]), 3)
+        storefront_products = guest_client.get(
+            f"/api/storefronts/{store.json()['store_slug']}"
+        ).json()["products"]
+        storefront_product = next(
+            item for item in storefront_products if item["id"] == product_id
+        )
+        self.assertEqual(len(storefront_product["gallery_images"]), 3)
+        first_gallery_image = public_product["gallery_images"][1]
+        self.assertEqual(
+            guest_client.get(first_gallery_image["url"]).content,
+            gallery_bytes,
+        )
+        self.assertEqual(
+            guest_client.delete(
+                f"/api/products/{product_id}/gallery/{first_gallery_image['id']}"
+            ).status_code,
+            401,
+        )
+        with seller_client:
+            deleted_gallery_image = seller_client.delete(
+                f"/api/products/{product_id}/gallery/{first_gallery_image['id']}"
+            )
+            self.assertEqual(deleted_gallery_image.status_code, 200)
+        self.assertEqual(
+            len(guest_client.get(f"/api/products/{product_id}").json()["gallery_images"]),
+            2,
+        )
+        with seller_client:
+            removed_cover = seller_client.delete(f"/api/products/{product_id}/image")
+            self.assertEqual(removed_cover.status_code, 200)
+        remaining_gallery = guest_client.get(f"/api/products/{product_id}").json()
+        self.assertEqual(remaining_gallery["image_url"], "")
+        self.assertEqual(len(remaining_gallery["gallery_images"]), 1)
+
+        with seller_client:
+            coverless_product = seller_client.post(
+                "/api/products",
+                json={
+                    "name": "Bidhaa yenye pembe nyingi",
+                    "amount": 1000,
+                    "stock_quantity": 2,
+                },
+            )
+            self.assertEqual(coverless_product.status_code, 201)
+            coverless_id = coverless_product.json()["id"]
+            uploaded_cover = seller_client.post(
+                f"/api/products/{coverless_id}/gallery",
+                files=gallery_files,
+            )
+            self.assertEqual(uploaded_cover.status_code, 200, uploaded_cover.text)
+            gallery_product = seller_client.get(
+                f"/api/products/{coverless_id}"
+            ).json()
+            first_cover_image = gallery_product["gallery_images"][0]
+            second_cover_image = gallery_product["gallery_images"][1]
+            self.assertEqual(gallery_product["image_url"], first_cover_image["url"])
+            self.assertEqual(
+                seller_client.delete(
+                    f"/api/products/{coverless_id}/gallery/{first_cover_image['id']}"
+                ).status_code,
+                200,
+            )
+            refreshed_product = seller_client.get(
+                f"/api/products/{coverless_id}"
+            ).json()
+            self.assertEqual(refreshed_product["image_url"], second_cover_image["url"])
+            self.assertEqual(
+                seller_client.delete(
+                    f"/api/products/{coverless_id}/gallery/{second_cover_image['id']}"
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                seller_client.get(f"/api/products/{coverless_id}").json()["image_url"],
+                "",
+            )
+
         buyer_registration = guest_client.post(
             "/api/auth/customer/register",
             json={
@@ -1023,7 +1134,7 @@ class MarketplaceFlowTests(unittest.TestCase):
                 json={
                     "request_key": "d" * 32,
                     "buyer_name": "Buyer One",
-                    "buyer_email": "buyer@example.com",
+                    "buyer_email": "different-recipient@example.com",
                     "buyer_phone": "0712345678",
                     "payment_method": "M-Pesa",
                     "delivery_address": "Dar es Salaam",
@@ -1031,13 +1142,25 @@ class MarketplaceFlowTests(unittest.TestCase):
             )
             self.assertEqual(checkout.status_code, 200)
             order_id = checkout.json()["order_id"]
+            self.email_sender.reset_mock()
             self.assertEqual(
                 buyer_client.post(f"/api/orders/{order_id}/demo-complete").status_code,
                 200,
             )
+            self.assertEqual(self.email_sender.call_count, 2)
+            self.assertIn(
+                "buyer@example.com",
+                [call.args[0] for call in self.email_sender.call_args_list],
+            )
             buyer_order_status = buyer_client.get(f"/api/orders/{order_id}").json()
             self.assertEqual(buyer_order_status["buyer_name"], "Buyer One")
             self.assertEqual(buyer_order_status["delivery_address"], "Dar es Salaam")
+            with main.db_connection() as connection:
+                stored_order = connection.execute(
+                    "SELECT buyer_email FROM orders WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()
+            self.assertEqual(stored_order["buyer_email"], "buyer@example.com")
             guest_order_status = guest_client.get(f"/api/orders/{order_id}").json()
             for field in ("buyer_name", "delivery_address", "tracking_code"):
                 self.assertNotIn(field, guest_order_status)
@@ -1093,7 +1216,7 @@ class MarketplaceFlowTests(unittest.TestCase):
             json={
                 "request_key": "e" * 32,
                 "buyer_name": "Buyer One",
-                "buyer_email": "buyer@example.com",
+                "buyer_email": "different-recipient@example.com",
                 "buyer_phone": "0712345678",
                 "payment_method": "Halo Pesa",
                 "items": [{"product_id": product_id, "quantity": 3}],

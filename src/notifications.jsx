@@ -3,6 +3,26 @@ import { translate, useLanguage } from "./i18n.jsx";
 
 const notificationContext = createContext(null);
 const soundStorageKey = "liparahisi_notification_sound";
+const inboxLimit = 30;
+
+async function showDeviceNotification(title, body, tag) {
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  const options = {
+    body,
+    icon: "/images/liparahisi-app-icon.svg",
+    tag,
+    data: { url: "/" },
+  };
+  const registration = "serviceWorker" in navigator
+    ? await navigator.serviceWorker.getRegistration()
+    : null;
+  if (registration) {
+    await registration.showNotification(title, options);
+    return;
+  }
+  const systemNotification = new Notification(title, options);
+  systemNotification.onclick = () => window.focus();
+}
 
 export function useNotification() {
   const context = useContext(notificationContext);
@@ -29,6 +49,8 @@ export function useFeedbackState(kind, initialValue = "") {
 export function NotificationProvider({ children }) {
   const { language } = useLanguage();
   const [toasts, setToasts] = useState([]);
+  const [inbox, setInbox] = useState([]);
+  const [inboxOpen, setInboxOpen] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(() => {
     try {
       return window.localStorage.getItem(soundStorageKey) !== "false";
@@ -79,6 +101,12 @@ export function NotificationProvider({ children }) {
     setToasts((current) => current.filter((toast) => toast.id !== id));
   }, []);
 
+  const markAllRead = useCallback(() => {
+    setInbox((current) => current.map((notification) => (
+      notification.read ? notification : { ...notification, read: true }
+    )));
+  }, []);
+
   const notify = useCallback((message, type = "info", options = {}) => {
     const body = translate(message, language);
     const dedupeKey = `${type}:${body}`;
@@ -98,20 +126,14 @@ export function NotificationProvider({ children }) {
       type,
       titleKey,
       message,
+      createdAt: now,
     };
+    setInbox((current) => [...current.slice(-(inboxLimit - 1)), { ...toast, read: false }]);
     setToasts((current) => [...current.slice(-3), toast]);
     void playSound();
     if (permission === "granted" && typeof Notification !== "undefined") {
-      try {
-        const systemNotification = new Notification(title, {
-          body,
-          icon: "/images/liparahisi-app-icon.svg",
-          tag: dedupeKey,
-        });
-        systemNotification.onclick = () => window.focus();
-      } catch (error) {
-        console.error("Could not show a system notification.", error);
-      }
+      showDeviceNotification(title, body, dedupeKey)
+        .catch((error) => console.error("Could not show a system notification.", error));
     }
     const timer = window.setTimeout(() => dismiss(toast.id), 6500);
     timers.current.set(toast.id, timer);
@@ -205,10 +227,39 @@ export function NotificationProvider({ children }) {
     }
   }
 
+  useEffect(() => {
+    if (!inboxOpen) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setInboxOpen(false);
+    }
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [inboxOpen]);
+
+  const unreadCount = inbox.reduce((count, notification) => count + Number(!notification.read), 0);
+  const dateLocale = language === "sw" ? "sw-TZ" : language === "fr" ? "fr-FR" : "en-TZ";
   const labels = {
-    sw: { soundOn: "Sauti imewashwa", soundOff: "Washa sauti", system: "Washa arifa za kifaa", granted: "Arifa za kifaa zimewashwa", denied: "Arifa zimezuiwa kwenye kivinjari", install: "Sakinisha app", close: "Funga arifa" },
-    en: { soundOn: "Sound on", soundOff: "Turn sound on", system: "Enable device notifications", granted: "Device notifications enabled", denied: "Notifications are blocked in browser", install: "Install app", close: "Dismiss notification" },
-    fr: { soundOn: "Son activé", soundOff: "Activer le son", system: "Activer les notifications", granted: "Notifications activées", denied: "Notifications bloquées par le navigateur", install: "Installer l'application", close: "Fermer la notification" },
+    sw: {
+      soundOn: "Sauti imewashwa", soundOff: "Washa sauti", system: "Washa arifa za kifaa",
+      granted: "Arifa za kifaa zimewashwa", denied: "Arifa zimezuiwa kwenye kivinjari",
+      install: "Sakinisha app", close: "Funga arifa", open: "Fungua arifa",
+      inbox: "Arifa", unread: (count) => `${count} hazijasomwa`,
+      markRead: "Soma zote", empty: "Hakuna arifa bado.",
+    },
+    en: {
+      soundOn: "Sound on", soundOff: "Turn sound on", system: "Enable device notifications",
+      granted: "Device notifications enabled", denied: "Notifications are blocked in browser",
+      install: "Install app", close: "Dismiss notification", open: "Open notifications",
+      inbox: "Notifications", unread: (count) => `${count} unread`,
+      markRead: "Mark all as read", empty: "No notifications yet.",
+    },
+    fr: {
+      soundOn: "Son activé", soundOff: "Activer le son", system: "Activer les notifications",
+      granted: "Notifications activées", denied: "Notifications bloquées par le navigateur",
+      install: "Installer l'application", close: "Fermer la notification", open: "Ouvrir les notifications",
+      inbox: "Notifications", unread: (count) => `${count} non lues`,
+      markRead: "Tout marquer comme lu", empty: "Aucune notification pour le moment.",
+    },
   }[language];
 
   return (
@@ -216,8 +267,50 @@ export function NotificationProvider({ children }) {
       {children}
       <aside
         className="notification-tools"
-        aria-label={language === "sw" ? "Mipangilio ya arifa" : language === "fr" ? "Paramètres de notification" : "Notification settings"}
+        aria-label={language === "sw" ? "Arifa na mipangilio" : language === "fr" ? "Notifications et paramètres" : "Notifications and settings"}
       >
+        <button
+          className="notification-center-trigger"
+          type="button"
+          aria-label={`${labels.open}${unreadCount ? `, ${labels.unread(unreadCount)}` : ""}`}
+          aria-expanded={inboxOpen}
+          aria-controls="notification-center"
+          onClick={() => setInboxOpen((open) => !open)}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />
+          </svg>
+          {unreadCount > 0 && <span className="notification-count">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+        </button>
+        {inboxOpen && (
+          <section className="notification-center" id="notification-center" aria-label={labels.inbox}>
+            <header className="notification-center-header">
+              <div>
+                <strong>{labels.inbox}</strong>
+                <span>{labels.unread(unreadCount)}</span>
+              </div>
+              {unreadCount > 0 && (
+                <button type="button" onClick={markAllRead}>{labels.markRead}</button>
+              )}
+            </header>
+            {inbox.length ? (
+              <ul className="notification-center-list">
+                {inbox.slice().reverse().map((notification) => (
+                  <li className={notification.read ? "" : "unread"} key={notification.id}>
+                    <span className="notification-center-dot" aria-hidden="true" />
+                    <div>
+                      <strong>{translate(notification.titleKey, language)}</strong>
+                      <p>{translate(notification.message, language)}</p>
+                      <time dateTime={new Date(notification.createdAt).toISOString()}>
+                        {new Intl.DateTimeFormat(dateLocale, { dateStyle: "short", timeStyle: "short" }).format(notification.createdAt)}
+                      </time>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : <p className="notification-center-empty">{labels.empty}</p>}
+          </section>
+        )}
         <button type="button" onClick={toggleSound} aria-pressed={soundEnabled}>
           {soundEnabled ? labels.soundOn : labels.soundOff}
         </button>

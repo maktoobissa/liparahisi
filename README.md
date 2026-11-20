@@ -21,17 +21,19 @@ sales.
 - Buyer support tickets with administrator responses.
 - Downloadable receipt PDFs with item subtotals, total charged, commission per
   seller, and seller payouts.
-  - Swahili, English, and French interface language selection, plus in-app
-    pop-up notifications with optional sound and browser notifications.
-  - Installable PWA with an offline-cached application shell. Marketplace data
-    and checkout still require the API to be online.
+- Swahili, English, and French interface language selection, plus in-app
+  pop-up notifications with an unread counter, optional sound, and browser
+  notifications.
+- Installable PWA with a branded loading screen and offline-cached application
+  shell. Marketplace data and checkout still require the API to be online.
 
 Uploaded product images are stored with marketplace data and served through the
 public catalog image endpoint; storefront images still use HTTP/HTTPS URLs.
 Seller sales/dashboard data refreshes automatically while the page is visible,
 and pending order/checkout status is rechecked periodically. Browser
 notifications require the visitor's permission; sound can be muted in the app.
-Push delivery while the app is closed is not configured. Approved
+The in-app notification list and unread counter are available while the page is
+open. Push delivery while the app is closed is not configured. Approved
 cancellation of a completed order restores stock only in demo mode; it does not
 issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
 checkout, but neither is connected to a live payment provider. Coupons are not
@@ -258,6 +260,14 @@ Configure each Render web service in **Environment**:
    a future split deployment; email links use `FRONTEND_URL`.
 4. Save the environment and redeploy. Check
    `GET /api/config/integrations`; `email_configured` should be `true`.
+
+`email_configured` confirms only that the required settings are present; it
+does not verify the sender domain or prove that a recipient will accept mail.
+`EMAIL_FROM` is the sender address. Account verification/reset messages go to
+that account's registered address, buyer receipts go to the buyer's registered
+address when signed in (or the checkout address for guests), and sale notices
+go to the seller's registered address. Verify the sender domain in Resend to
+deliver to other recipients; do not send private order details to every account.
 
 The second Render service, if used, must use its own public origin for both
 URL variables. `PUBLIC_APP_URL` remains as a backward-compatible fallback for

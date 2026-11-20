@@ -60,11 +60,13 @@ DATABASE_POOL_MIN_SIZE = 1
 DATABASE_POOL_MAX_SIZE = 5
 DATABASE_POOL_TIMEOUT_SECONDS = 10
 PRODUCT_LIST_CACHE_TTL_SECONDS = 15
+PUBLIC_PRODUCT_CACHE_PREFIX = "liparahisi:public-products:v2:"
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
 RESET_TOKEN_TTL_SECONDS = 60 * 60
 PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_PRODUCT_GALLERY_IMAGES = 8
 ABLINER_PAYMENT_METHOD = "Abliner Mobile Money"
 PAYMENT_METHODS = {
     "M-Pesa",
@@ -245,6 +247,26 @@ def cache_product_list(cache_key, products):
         logger.warning("Redis cache write failed (%s)", type(error).__name__)
 
 
+def invalidate_public_product_lists():
+    client = get_redis_client()
+    if client is None:
+        return
+    try:
+        keys = []
+        for key in client.scan_iter(
+            match=f"{PUBLIC_PRODUCT_CACHE_PREFIX}*",
+            count=100,
+        ):
+            keys.append(key)
+            if len(keys) == 100:
+                client.delete(*keys)
+                keys.clear()
+        if keys:
+            client.delete(*keys)
+    except RedisError as error:
+        logger.warning("Redis product cache invalidation failed (%s)", type(error).__name__)
+
+
 def connect_db():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if database_url:
@@ -346,6 +368,16 @@ def initialize_db():
                 image_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
                 updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS product_gallery_images (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                sort_order INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                image_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS product_gallery_by_product
+                ON product_gallery_images(product_id, sort_order, id);
             CREATE TABLE IF NOT EXISTS categories (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -971,6 +1003,12 @@ def optional_current_user(request):
         raise
 
 
+def checkout_buyer_email(payload, buyer):
+    if buyer and buyer["role"] == "BUYER":
+        return buyer["email"].strip().lower()
+    return payload.buyer_email.strip().lower()
+
+
 def require_admin(request):
     user = get_current_user(request)
     if user["role"] != "ADMIN":
@@ -1062,6 +1100,47 @@ def get_product(product_id):
     if product is None:
         raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
     return dict(product)
+
+
+def attach_product_gallery(products):
+    results = [dict(product) for product in products]
+    product_ids = list(dict.fromkeys(product["id"] for product in results))
+    gallery_by_product = {}
+    with db_connection() as connection:
+        for offset in range(0, len(product_ids), 400):
+            batch = product_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, product_id FROM product_gallery_images
+                WHERE product_id IN ({placeholders})
+                ORDER BY product_id, sort_order, id
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                gallery_by_product.setdefault(row["product_id"], []).append(row["id"])
+
+    for product in results:
+        product_id = product["id"]
+        primary_url = product.get("image_url") or ""
+        images = []
+        if primary_url:
+            primary_id = next(
+                (
+                    image_id
+                    for image_id in gallery_by_product.get(product_id, [])
+                    if primary_url == f"/api/products/{product_id}/gallery/{image_id}"
+                ),
+                None,
+            )
+            images.append({"id": primary_id, "url": primary_url, "primary": True})
+        for image_id in gallery_by_product.get(product_id, []):
+            image_url = f"/api/products/{product_id}/gallery/{image_id}"
+            if image_url != primary_url:
+                images.append({"id": image_id, "url": image_url, "primary": False})
+        product["gallery_images"] = images
+    return results
 
 
 def get_order(order_id):
@@ -2099,6 +2178,39 @@ async def catalog_product_image_gateway(product_id: str, request: Request):
     )
 
 
+@app.api_route("/api/products/{product_id}/gallery", methods=["POST"])
+async def catalog_product_gallery_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/gallery",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/gallery/{image_id}",
+    methods=["GET", "DELETE"],
+)
+async def catalog_product_gallery_image_gateway(
+    product_id: str,
+    image_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/gallery/{image_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
 @app.api_route(
     "/api/products/{product_id}",
     methods=["GET", "PUT", "DELETE"],
@@ -2768,7 +2880,10 @@ def read_storefront(store_slug: str):
             """,
             (seller["id"],),
         ).fetchall()
-    return {"store": dict(seller), "products": [dict(row) for row in products]}
+    return {
+        "store": dict(seller),
+        "products": attach_product_gallery(products),
+    }
 
 
 def list_products(
@@ -2801,7 +2916,7 @@ def list_products(
             separators=(",", ":"),
         )
         cache_key = (
-            "liparahisi:public-products:v1:"
+            PUBLIC_PRODUCT_CACHE_PREFIX
             + hashlib.sha256(key_data.encode("utf-8")).hexdigest()
         )
         cached = cached_product_list(cache_key)
@@ -2867,6 +2982,7 @@ def list_products(
         }
         for row in rows
     ]
+    products = attach_product_gallery(products)
     if cache_key is not None:
         cache_product_list(cache_key, products)
     return products
@@ -3015,7 +3131,7 @@ def list_wishlist(request: Request):
             """,
             (user["id"],),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return attach_product_gallery(rows)
 
 
 def export_products(request: Request):
@@ -3253,7 +3369,7 @@ def archive_product(product_id: str, request: Request):
 
 def read_product(product_id: str):
     product = get_product(product_id)
-    return {
+    result = {
         "id": product["id"],
         "name": product["name"],
         "description": product["description"],
@@ -3265,18 +3381,10 @@ def read_product(product_id: str):
         "store_slug": product["store_slug"] or "",
         **list_product_reviews(product["id"]),
     }
+    return attach_product_gallery([result])[0]
 
 
-def upload_product_image(
-    product_id: str,
-    request: Request,
-    image: UploadFile = File(...),
-):
-    seller = require_seller(request)
-    declared_length = request.headers.get("content-length")
-    if declared_length and declared_length.isdigit() and int(declared_length) > MAX_PRODUCT_IMAGE_BYTES + 65536:
-        raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
-
+def read_uploaded_product_image(image):
     content_type = (image.content_type or "").lower()
     signatures = {
         "image/jpeg": lambda data: data.startswith(b"\xff\xd8\xff"),
@@ -3290,6 +3398,20 @@ def upload_product_image(
         raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
     if not image_data or not signatures[content_type](image_data):
         raise HTTPException(status_code=422, detail="Faili halilingani na aina ya picha iliyochaguliwa.")
+    return content_type, image_data
+
+
+def upload_product_image(
+    product_id: str,
+    request: Request,
+    image: UploadFile = File(...),
+):
+    seller = require_seller(request)
+    declared_length = request.headers.get("content-length")
+    if declared_length and declared_length.isdigit() and int(declared_length) > MAX_PRODUCT_IMAGE_BYTES + 65536:
+        raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
+
+    content_type, image_data = read_uploaded_product_image(image)
 
     with db_connection() as connection:
         product = connection.execute(
@@ -3314,7 +3436,135 @@ def upload_product_image(
             "UPDATE products SET image_url = ? WHERE id = ?",
             (image_url, product_id),
         )
+    invalidate_public_product_lists()
     return {"product_id": product_id, "image_url": image_url}
+
+
+def upload_product_gallery(
+    product_id: str,
+    request: Request,
+    images: list[UploadFile] = File(...),
+):
+    seller = require_seller(request)
+    if not images or len(images) > MAX_PRODUCT_GALLERY_IMAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Chagua picha 1 hadi {MAX_PRODUCT_GALLERY_IMAGES} za bidhaa.",
+        )
+    declared_length = request.headers.get("content-length")
+    max_request_bytes = len(images) * (MAX_PRODUCT_IMAGE_BYTES + 65536)
+    if declared_length and declared_length.isdigit() and int(declared_length) > max_request_bytes:
+        raise HTTPException(status_code=413, detail="Picha za bidhaa zimezidi ukubwa unaoruhusiwa.")
+    prepared_images = [read_uploaded_product_image(image) for image in images]
+
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id, image_url FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        existing = connection.execute(
+            """
+            SELECT id, sort_order FROM product_gallery_images
+            WHERE product_id = ?
+            ORDER BY sort_order, id
+            """,
+            (product_id,),
+        ).fetchall()
+        primary_is_gallery = any(
+            product["image_url"] == f"/api/products/{product_id}/gallery/{row['id']}"
+            for row in existing
+        )
+        current_count = len(existing) + int(bool(product["image_url"]) and not primary_is_gallery)
+        if current_count + len(prepared_images) > MAX_PRODUCT_GALLERY_IMAGES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Bidhaa inaweza kuwa na picha {MAX_PRODUCT_GALLERY_IMAGES} tu kwa jumla.",
+            )
+        next_order = max((row["sort_order"] for row in existing), default=-1) + 1
+        new_ids = []
+        for index, (content_type, image_data) in enumerate(prepared_images):
+            image_id = secrets.token_hex(16)
+            connection.execute(
+                """
+                INSERT INTO product_gallery_images
+                    (id, product_id, sort_order, content_type, image_data)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (image_id, product_id, next_order + index, content_type, image_data),
+            )
+            new_ids.append(image_id)
+        if not product["image_url"]:
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                (f"/api/products/{product_id}/gallery/{new_ids[0]}", product_id),
+            )
+    invalidate_public_product_lists()
+    return {
+        "product_id": product_id,
+        "image_ids": new_ids,
+    }
+
+
+def read_product_gallery_image(product_id: str, image_id: str):
+    with db_connection() as connection:
+        image = connection.execute(
+            """
+            SELECT content_type, image_data FROM product_gallery_images
+            WHERE product_id = ? AND id = ?
+            """,
+            (product_id, image_id),
+        ).fetchone()
+    if image is None:
+        raise HTTPException(status_code=404, detail="Picha ya pembe ya bidhaa haikupatikana.")
+    return Response(
+        content=image["image_data"],
+        media_type=image["content_type"],
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def delete_product_gallery_image(product_id: str, image_id: str, request: Request):
+    seller = require_seller(request)
+    image_url = f"/api/products/{product_id}/gallery/{image_id}"
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id, image_url FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        deleted = connection.execute(
+            "DELETE FROM product_gallery_images WHERE product_id = ? AND id = ?",
+            (product_id, image_id),
+        )
+        if deleted.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Picha ya pembe ya bidhaa haikupatikana.")
+        if product["image_url"] == image_url:
+            replacement = connection.execute(
+                """
+                SELECT id FROM product_gallery_images
+                WHERE product_id = ?
+                ORDER BY sort_order, id
+                LIMIT 1
+                """,
+                (product_id,),
+            ).fetchone()
+            replacement_url = (
+                f"/api/products/{product_id}/gallery/{replacement['id']}"
+                if replacement
+                else ""
+            )
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                (replacement_url, product_id),
+            )
+    invalidate_public_product_lists()
+    return {"product_id": product_id, "image_id": image_id}
 
 
 def read_product_image(product_id: str):
@@ -3340,7 +3590,7 @@ def delete_product_image(product_id: str, request: Request):
     image_url = f"/api/products/{product_id}/image"
     with db_connection() as connection:
         product = connection.execute(
-            "SELECT seller_id FROM products WHERE id = ?",
+            "SELECT seller_id, image_url FROM products WHERE id = ?",
             (product_id,),
         ).fetchone()
         if product is None or product["seller_id"] != seller["id"]:
@@ -3353,6 +3603,14 @@ def delete_product_image(product_id: str, request: Request):
             "UPDATE products SET image_url = '' WHERE id = ? AND image_url = ?",
             (product_id, image_url),
         )
+        if product["image_url"] and not product["image_url"].startswith(
+            f"/api/products/{product_id}/gallery/"
+        ):
+            connection.execute(
+                "UPDATE products SET image_url = '' WHERE id = ?",
+                (product_id,),
+            )
+    invalidate_public_product_lists()
     return {"product_id": product_id, "image_url": ""}
 
 
@@ -3411,6 +3669,7 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
     provider_reference = "" if demo_order else "LR" + secrets.token_hex(9).upper()
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
+    buyer_email = checkout_buyer_email(payload, buyer)
     try:
         with db_connection() as connection:
             connection.execute(
@@ -3429,7 +3688,7 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     product["seller_id"],
                     product["amount"],
                     payload.buyer_name.strip(),
-                    payload.buyer_email,
+                    buyer_email,
                     payload.buyer_phone,
                     buyer_id,
                     ABLINER_PAYMENT_METHOD
@@ -3524,6 +3783,7 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     merged = {}
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
+    buyer_email = checkout_buyer_email(payload, buyer)
     with db_connection() as connection:
         for item in payload.items:
             product = connection.execute(
@@ -3583,7 +3843,7 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     seller_id,
                     amount,
                     payload.buyer_name.strip(),
-                    payload.buyer_email,
+                    buyer_email,
                     payload.buyer_phone,
                     buyer_id,
                     ABLINER_PAYMENT_METHOD

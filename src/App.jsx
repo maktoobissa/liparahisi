@@ -8,6 +8,7 @@ const API = "/api";
 const ABLINER_PAYMENT_METHOD = "Abliner Mobile Money";
 const productImageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
 const maxProductImageBytes = 5 * 1024 * 1024;
+const maxProductGalleryImages = 8;
 const ablinerNetwork = {
   value: ABLINER_PAYMENT_METHOD,
   label: "Abliner Mobile Money",
@@ -15,7 +16,7 @@ const ablinerNetwork = {
   color: "bank",
 };
 const networks = [
-  { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa" },
+  { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa", logo: "/images/payment-networks/mpesa.svg" },
   { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo", logo: "/images/payment-networks/halo-pesa.png" },
   { value: "Tigo Pesa", label: "Mixx by Yas", short: "TP", color: "tigo", logo: "/images/payment-networks/mixx-by-yas.jpg" },
   { value: "Airtel Money", label: "Airtel Money", short: "AM", color: "airtel", logo: "/images/payment-networks/airtel-money.png" },
@@ -169,6 +170,196 @@ async function uploadProductImage(productId, file) {
     method: "POST",
     body: formData,
   });
+}
+
+async function uploadProductGallery(productId, files) {
+  const formData = new FormData();
+  files.forEach((file) => {
+    validateProductImage(file);
+    formData.append("images", file);
+  });
+  return api(`/products/${encodeURIComponent(productId)}/gallery`, {
+    method: "POST",
+    body: formData,
+  });
+}
+
+function ProductGallery({ product, className = "", editable = false, onDeleteImage }) {
+  const { language } = useLanguage();
+  const images = product.gallery_images?.length
+    ? product.gallery_images
+    : product.image_url
+      ? [{ id: null, url: product.image_url, primary: true }]
+      : [];
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [expanded, setExpanded] = useState(false);
+  const dragStart = useRef(null);
+  const imageSignature = images.map((image) => `${image.id || ""}:${image.url}`).join("|");
+  const t = (text) => translate(text, language);
+  const multipleImages = images.length > 1;
+  const activeImage = images[activeIndex] || images[0];
+
+  useEffect(() => {
+    setActiveIndex(0);
+    setExpanded(false);
+  }, [product.id, imageSignature]);
+
+  useEffect(() => {
+    if (!expanded) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setExpanded(false);
+    }
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [expanded]);
+
+  if (!activeImage) return null;
+
+  function move(delta) {
+    if (multipleImages) {
+      setActiveIndex((index) => (index + delta + images.length) % images.length);
+    }
+  }
+
+  function startDrag(event) {
+    if (!multipleImages || event.target.closest("button")) return;
+    dragStart.current = event.clientX;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function finishDrag(event) {
+    if (dragStart.current === null) return;
+    const distance = event.clientX - dragStart.current;
+    dragStart.current = null;
+    if (Math.abs(distance) > 30) move(distance > 0 ? -1 : 1);
+  }
+
+  function handleKeyDown(event) {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      move(-1);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      move(1);
+    }
+  }
+
+  function renderFrame(isExpanded = false) {
+    return (
+      <div
+        className={`product-gallery-frame ${multipleImages ? "is-rotatable" : ""} ${isExpanded ? "is-expanded" : ""}`}
+        role="group"
+        aria-label={t("Mionekano ya bidhaa")}
+        tabIndex={multipleImages ? 0 : undefined}
+        onKeyDown={handleKeyDown}
+        onPointerDown={startDrag}
+        onPointerUp={finishDrag}
+        onPointerCancel={() => { dragStart.current = null; }}
+      >
+        <img
+          src={activeImage.url}
+          alt={`${product.name} (${activeIndex + 1}/${images.length})`}
+          draggable="false"
+        />
+        {editable && activeImage.id && onDeleteImage && (
+          <button
+            className="product-gallery-delete"
+            type="button"
+            aria-label={`${t("Ondoa picha hii")} ${activeIndex + 1}`}
+            onClick={() => onDeleteImage(product.id, activeImage.id)}
+          >
+            ×
+          </button>
+        )}
+        {multipleImages && (
+          <>
+            <button
+              className="product-gallery-arrow previous"
+              type="button"
+              aria-label={t("Picha iliyotangulia")}
+              onClick={() => move(-1)}
+            >
+              ‹
+            </button>
+            <span className="product-gallery-count" aria-live="polite">
+              {activeIndex + 1}/{images.length}
+            </span>
+            <button
+              className="product-gallery-arrow next"
+              type="button"
+              aria-label={t("Picha inayofuata")}
+              onClick={() => move(1)}
+            >
+              ›
+            </button>
+          </>
+        )}
+        {isExpanded ? (
+          <button
+            className="product-gallery-close"
+            type="button"
+            aria-label={t("Funga picha kubwa")}
+            onClick={() => setExpanded(false)}
+          >
+            ×
+          </button>
+        ) : (
+          <button
+            className="product-gallery-expand"
+            type="button"
+            aria-label={t("Fungua picha kubwa")}
+            onClick={() => setExpanded(true)}
+          >
+            ⤢
+          </button>
+        )}
+        {multipleImages && (
+          <div className="product-gallery-dots" aria-label={t("Chagua pembe ya bidhaa")}>
+            {images.map((image, index) => (
+              <button
+                key={image.id || image.url}
+                type="button"
+                className={index === activeIndex ? "active" : ""}
+                aria-label={`${t("Pembe")} ${index + 1}`}
+                aria-current={index === activeIndex ? "true" : undefined}
+                onClick={() => setActiveIndex(index)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`product-gallery ${className}`}>
+      {renderFrame()}
+      {multipleImages && (
+        <p className="product-gallery-hint">{t("Buruta picha kushoto au kulia ili kuzungusha bidhaa.")}</p>
+      )}
+      {expanded && (
+        <div className="product-gallery-backdrop" onClick={() => setExpanded(false)}>
+          <div
+            className="product-gallery-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${product.name} — ${t("Mionekano ya bidhaa")}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {renderFrame(true)}
+            {multipleImages && (
+              <p className="product-gallery-hint">{t("Buruta picha kushoto au kulia ili kuzungusha bidhaa.")}</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function Header({ label = "Demo", user, onLogout }) {
@@ -376,7 +567,15 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
   );
 }
 
-function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArchive }) {
+function ProductTile({
+  product,
+  onArchive,
+  onUploadImage,
+  onUploadGallery,
+  onDeleteImage,
+  onDeleteGalleryImage,
+  canArchive,
+}) {
   const localize = useLocalize();
   const [qr, setQr] = useState("");
   const barcodeRef = useRef(null);
@@ -426,7 +625,12 @@ function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArch
 
   return localize(
     <article className={`product-tile ${product.is_active ? "" : "product-inactive"}`}>
-      {product.image_url && <img className="product-card-image" src={product.image_url} alt="" loading="lazy" />}
+      <ProductGallery
+        product={product}
+        className="product-card-gallery"
+        editable={canArchive}
+        onDeleteImage={onDeleteGalleryImage}
+      />
       {qr ? <img className="product-qr" src={qr} alt={`QR ya ${product.name}`} /> : <div className="product-qr qr-placeholder" />}
       <div className="product-tile-details">
         <strong>{product.name}</strong>
@@ -455,7 +659,26 @@ function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArch
               />
             </label>
           )}
-          {canArchive && product.image_url && <button type="button" onClick={() => onDeleteImage(product.id)}>Ondoa picha</button>}
+          {canArchive && (
+            <label className="table-action">
+              Ongeza pembe za picha
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                aria-label="Ongeza pembe za picha"
+                multiple
+                hidden
+                onChange={(event) => {
+                  const files = Array.from(event.target.files || []);
+                  if (files.length) onUploadGallery(product.id, files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          )}
+          {canArchive && product.image_url && !product.image_url.includes("/gallery/") && (
+            <button type="button" onClick={() => onDeleteImage(product.id)}>Ondoa picha kuu</button>
+          )}
           {canArchive && product.is_active && <button type="button" onClick={() => onArchive(product.id)}>Ondoa</button>}
         </div>
       </div>
@@ -495,7 +718,7 @@ function MarketplaceDashboard({ user, onLogout }) {
     name: "", description: "", image_url: "", category: "", amount: "",
     cost_amount: "", stock_quantity: "", low_stock_threshold: "5",
   });
-  const [productImage, setProductImage] = useState(null);
+  const [productImages, setProductImages] = useState([]);
   const productImageInputRef = useRef(null);
   const [productQuery, setProductQuery] = useState("");
   const [salesFilters, setSalesFilters] = useState({ start_date: "", end_date: "", status: "" });
@@ -642,10 +865,11 @@ function MarketplaceDashboard({ user, onLogout }) {
     setError("");
     setBusy(true);
     try {
-      if (productImage && productForm.image_url.trim()) {
-        throw new Error("Chagua kutumia URL au kupakia picha; si vyote kwa pamoja.");
+      const totalImages = productImages.length + Number(Boolean(productForm.image_url.trim()));
+      if (totalImages > maxProductGalleryImages) {
+        throw new Error(`Chagua picha zisizozidi ${maxProductGalleryImages} kwa bidhaa.`);
       }
-      if (productImage) validateProductImage(productImage);
+      productImages.forEach(validateProductImage);
       const createdProduct = await api("/products", {
         method: "POST",
         body: JSON.stringify({
@@ -660,19 +884,19 @@ function MarketplaceDashboard({ user, onLogout }) {
         }),
       });
       setProductForm({ name: "", description: "", image_url: "", category: "", amount: "", cost_amount: "", stock_quantity: "", low_stock_threshold: "5" });
-      setProductImage(null);
+      setProductImages([]);
       if (productImageInputRef.current) productImageInputRef.current.value = "";
-      if (productImage) {
+      if (productImages.length) {
         try {
-          await uploadProductImage(createdProduct.id, productImage);
+          await uploadProductGallery(createdProduct.id, productImages);
         } catch (uploadError) {
-          setError(`Bidhaa imehifadhiwa, lakini picha haikupakiwa: ${uploadError.message}`);
+          setError(`Bidhaa imehifadhiwa, lakini picha hazikupakiwa: ${uploadError.message}`);
           await refresh();
           return;
         }
       }
-      setMessage(productImage
-        ? "Bidhaa na picha yake zimehifadhiwa."
+      setMessage(productImages.length
+        ? "Bidhaa na picha zake zimehifadhiwa."
         : "Bidhaa imehifadhiwa. QR na barcode yake vipo kwenye orodha hapa chini.");
       await refresh();
     } catch (requestError) {
@@ -694,12 +918,38 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function uploadExistingProductGallery(productId, files) {
+    setError("");
+    setMessage("");
+    try {
+      await uploadProductGallery(productId, files);
+      setMessage("Picha za pembe za bidhaa zimehifadhiwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function deleteProductImage(productId) {
     setError("");
     setMessage("");
     try {
       await api(`/products/${encodeURIComponent(productId)}/image`, { method: "DELETE" });
       setMessage("Picha ya bidhaa imeondolewa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function deleteProductGalleryImage(productId, imageId) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/products/${encodeURIComponent(productId)}/gallery/${encodeURIComponent(imageId)}`, {
+        method: "DELETE",
+      });
+      setMessage("Picha ya pembe ya bidhaa imeondolewa.");
       await refresh();
     } catch (requestError) {
       setError(requestError.message);
@@ -925,16 +1175,17 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <textarea id="product-description" className="text-input feature-textarea" maxLength={2000} value={productForm.description} onChange={(event) => setProductForm({ ...productForm, description: event.target.value })} />
                 <label className="field-label" htmlFor="product-image">URL ya picha (HTTP/HTTPS)</label>
                 <input id="product-image" className="text-input" type="url" maxLength={2048} value={productForm.image_url} onChange={(event) => setProductForm({ ...productForm, image_url: event.target.value })} />
-                <label className="field-label" htmlFor="product-image-file">Au pakia picha (hiari)</label>
+                <label className="field-label" htmlFor="product-image-file">Pakia picha za bidhaa (picha kuu na pembe tofauti)</label>
                 <input
                   id="product-image-file"
                   ref={productImageInputRef}
                   className="text-input"
                   type="file"
                   accept="image/jpeg,image/png,image/webp"
-                  onChange={(event) => setProductImage(event.target.files?.[0] || null)}
+                  multiple
+                  onChange={(event) => setProductImages(Array.from(event.target.files || []))}
                 />
-                <p className="field-hint">JPEG, PNG au WebP; kiwango cha juu MB 5. Picha itahifadhiwa pamoja na bidhaa.</p>
+                <p className="field-hint">Chagua hadi picha 8 za pembe tofauti. JPEG, PNG au WebP; kila picha hadi MB 5. Mnunuzi anaweza kuzizungusha.</p>
                 <label className="field-label" htmlFor="product-category">Kundi</label>
                 <input id="product-category" className="text-input" list="product-categories" maxLength={60} value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} />
                 <datalist id="product-categories">{categories.map((item) => <option key={item.id} value={item.name} />)}</datalist>
@@ -982,7 +1233,9 @@ function MarketplaceDashboard({ user, onLogout }) {
                   canArchive={!isAdmin}
                   onArchive={archiveProduct}
                   onUploadImage={uploadExistingProductImage}
+                  onUploadGallery={uploadExistingProductGallery}
                   onDeleteImage={deleteProductImage}
+                  onDeleteGalleryImage={deleteProductGalleryImage}
                 />
               ))}
             </div>
@@ -1292,7 +1545,7 @@ function PublicMarketplace({ onLogin }) {
         <div className="product-grid marketplace-grid">
           {products.map((product) => (
             <article className="market-product" key={product.id}>
-              {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+              <ProductGallery product={product} className="market-product-gallery" />
               <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description || "Bidhaa ya muuzaji wetu."}</p><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name || "Duka"}</span></div>
               <div className="market-product-actions">
                 {product.store_slug && <a className="table-action" href={`/store/${encodeURIComponent(product.store_slug)}`}>Tembelea duka</a>}
@@ -1331,7 +1584,7 @@ function StorefrontPage({ storeSlug }) {
           <div className="product-grid marketplace-grid">
             {storefront.products.map((product) => (
               <article className="market-product" key={product.id}>
-                {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+                <ProductGallery product={product} className="market-product-gallery" />
                 <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description}</p><strong>TZS {formatMoney(product.amount)}</strong></div>
                 <a className="generate-button" href={`/pay/${product.id}`}>Nunua sasa</a>
               </article>
@@ -1491,7 +1744,7 @@ function BuyerDashboard({ user, onLogout }) {
           <div className="product-grid marketplace-grid">
             {filteredProducts.map((product) => (
               <article className="market-product" key={product.id}>
-                {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+                <ProductGallery product={product} className="market-product-gallery" />
                 <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description}</p><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name || "Duka"}</span></div>
                 <div className="market-product-actions">
                   <button type="button" className="table-action" onClick={() => runAction(() => api(`/wishlist/${product.id}`, { method: "POST" }), "Bidhaa imehifadhiwa kwenye vipendwa.")}>Hifadhi</button>
@@ -1509,7 +1762,7 @@ function BuyerDashboard({ user, onLogout }) {
           <div className="product-grid marketplace-grid">
             {wishlist.map((product) => (
               <article className="market-product" key={product.id}>
-                {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+                <ProductGallery product={product} className="market-product-gallery" />
                 <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name}</span></div>
                 <div className="market-product-actions"><button type="button" className="table-action" onClick={() => runAction(() => api(`/wishlist/${product.id}`, { method: "DELETE" }), "Bidhaa imeondolewa kwenye vipendwa.")}>Ondoa</button><a className="generate-button" href={`/pay/${product.id}`}>Nunua</a></div>
               </article>
@@ -1873,6 +2126,7 @@ function CheckoutPage({ productId }) {
           <section className="checkout-card">
             <div className="eyebrow"><span /> BIDHAA IMETAMBULIKA</div>
             <h1>{product.name}</h1>
+            <ProductGallery product={product} className="checkout-product-gallery" />
             <div className="checkout-amount">TZS {formatMoney(product.amount)}</div>
             <p className="buyer-intro">Jaza taarifa za oda na uchague njia ya malipo. PIN au OTP haiingizwe kwenye ukurasa huu.</p>
             <form className="buyer-form" onSubmit={submitCheckout}>
