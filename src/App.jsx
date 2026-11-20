@@ -46,7 +46,7 @@ async function downloadReceiptPdf(receipt, language) {
   const margin = 16;
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
-  let y = 19;
+  let y = 28;
 
   function writeLine(text, { size = 10, bold = false, indent = 0, gap = 1 } = {}) {
     pdf.setFont("helvetica", bold ? "bold" : "normal");
@@ -64,9 +64,10 @@ async function downloadReceiptPdf(receipt, language) {
     y += height + gap;
   }
 
-  pdf.setTextColor(22, 131, 93);
-  writeLine("LipaRahisi", { size: 19, bold: true, gap: 0 });
-  pdf.setTextColor(23, 37, 31);
+  const logoResponse = await fetch("/images/liparahisi-logo.svg");
+  if (!logoResponse.ok) throw new Error("Imeshindikana kupakia logo ya LipaRahisi.");
+  await pdf.addSvgAsImage(await logoResponse.text(), margin, 8, 58, 17.4);
+  pdf.setTextColor(7, 27, 82);
   writeLine(t("RISITI YA MALIPO - DEMO"), { size: 11, bold: true, gap: 4 });
   writeLine(`${t("Oda:")} ${receipt.checkoutId}`, { bold: true });
   writeLine(`${t("Mnunuzi:")} ${receipt.buyerName}`);
@@ -98,7 +99,7 @@ async function downloadReceiptPdf(receipt, language) {
     pdf.addPage();
     y = 19;
   }
-  pdf.setDrawColor(210, 218, 211);
+  pdf.setDrawColor(227, 234, 245);
   pdf.line(margin, y, pageWidth - margin, y);
   y += 7;
   writeLine(`${t("JUMLA YA MNUNUZI:")} TZS ${formatMoney(receipt.totalAmount)}`, { size: 12, bold: true });
@@ -164,29 +165,51 @@ function Header({ label = "Demo", user, onLogout }) {
   const localize = useLocalize();
   return localize(
     <header className="topbar">
-      <a className="brand" href="/" aria-label="LipaRahisi mwanzo">
-        <span className="brand-mark" aria-hidden="true"><span /><span /><span /><span /></span>
-        <span data-no-translate>Lipa<span className="brand-light">Rahisi</span></span>
+      <a className="brand" href="/" aria-label="LipaRahisi mwanzo" key="brand">
+        <picture className="brand-image" key="brand-image">
+          <source key="mobile-icon" media="(max-width: 440px)" srcSet="/images/liparahisi-app-icon.svg" />
+          <img key="logo" className="brand-logo" src="/images/liparahisi-logo.svg" alt="" aria-hidden="true" />
+        </picture>
+        <span className="brand-mobile-name" key="brand-name">LipaRahisi</span>
       </a>
-      <div className="header-right">
-        <label className="language-control">
-          <span className="sr-only">Lugha</span>
-          <select aria-label="Lugha" value={language} onChange={(event) => setLanguage(event.target.value)}>
-            <option value="sw">🇹🇿 Kiswahili</option>
-            <option value="en">🇬🇧 English</option>
-            <option value="fr">🇫🇷 Français</option>
+      <div className="header-right" key="controls">
+        <label className="language-control" key="language">
+          <span className="sr-only" key="language-label">Lugha</span>
+          <select key="language-select" aria-label="Lugha" value={language} onChange={(event) => setLanguage(event.target.value)}>
+            <option key="sw" value="sw">🇹🇿 Kiswahili</option>
+            <option key="en" value="en">🇬🇧 English</option>
+            <option key="fr" value="fr">🇫🇷 Français</option>
           </select>
         </label>
-        <span className="prototype-label"><span className="status-dot" />{label}</span>
+        <span className="prototype-label" key="label"><span className="status-dot" key="status-dot" />{label}</span>
         {user && (
-          <button className="logout-button" type="button" onClick={onLogout}>
-            Toka ({user.full_name})
+          <button
+            className="logout-button"
+            type="button"
+            onClick={onLogout}
+            aria-label={`Toka kwenye akaunti ya ${user.full_name}`}
+            key="logout"
+          >
+            Toka<span className="logout-name" key="logout-name"> ({user.full_name})</span>
           </button>
         )}
       </div>
     </header>
   );
 }
+function BrandFooter({ children }) {
+  return (
+    <footer className="site-footer">
+      <a className="footer-brand" href="/" aria-label="LipaRahisi mwanzo">
+        <img src="/images/liparahisi-app-icon.svg" alt="" aria-hidden="true" />
+        <span>LipaRahisi</span>
+      </a>
+      <span className="footer-motto">Lipa <i>•</i> Tuma <i>•</i> Pokea</span>
+      <div className="footer-content">{children}</div>
+    </footer>
+  );
+}
+
 
 function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
   const localize = useLocalize();
@@ -337,7 +360,7 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
         )}
         {!setupRequired && <div className="auth-switch"><button type="button" onClick={onBrowse}>Rudi kuangalia bidhaa</button></div>}
       </section>
-      <footer><span>© 2026 LipaRahisi</span><span>PIN au OTP haiombwi hapa</span></footer>
+      <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="privacy">PIN au OTP haiombwi hapa</span></BrandFooter>
     </main>
   );
 }
@@ -352,14 +375,14 @@ function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArch
       width: 320,
       margin: 1,
       errorCorrectionLevel: "M",
-      color: { dark: "#17251f", light: "#ffffff" },
+      color: { dark: "#071B52", light: "#FFFFFF" },
     }).then((image) => {
       if (active) setQr(image);
     }).catch(() => {});
     if (barcodeRef.current) {
       JsBarcode(barcodeRef.current, product.id, {
         format: "CODE128",
-        lineColor: "#17251f",
+        lineColor: "#071B52",
         width: 1.5,
         height: 48,
         displayValue: true,
@@ -1111,7 +1134,7 @@ function MarketplaceDashboard({ user, onLogout }) {
         </section>
       )}
 
-      <footer><span>© 2026 LipaRahisi</span><span>Data ya akaunti na mauzo hutenganishwa kwa muuzaji</span></footer>
+      <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="privacy">Data ya akaunti na mauzo hutenganishwa kwa muuzaji</span></BrandFooter>
     </main>
   );
 }
@@ -1268,7 +1291,7 @@ function PublicMarketplace({ onLogin }) {
           ))}
         </div>
       ) : <p className="empty-state">Hakuna bidhaa za kuonyesha kwa sasa.</p>}
-      <footer><span>© 2026 LipaRahisi</span><span>Malipo halisi hayajaunganishwa</span></footer>
+      <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="payments">Malipo halisi hayajaunganishwa</span></BrandFooter>
     </main>
   );
 }
@@ -1306,7 +1329,7 @@ function StorefrontPage({ storeSlug }) {
           </div>
         </>
       )}
-      <footer><a className="retry-link" href="/">Rudi marketplace</a><span>Malipo ya majaribio</span></footer>
+      <BrandFooter><a className="retry-link" href="/" key="back">Rudi marketplace</a><span key="payments">Malipo ya majaribio</span></BrandFooter>
     </main>
   );
 }
@@ -1505,7 +1528,7 @@ function BuyerDashboard({ user, onLogout }) {
           <div className="feature-list"><h2>Ombi zako</h2>{tickets.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.subject}</strong><span>{item.status} · {item.created_at}</span><small>{item.admin_response || item.message}</small></div></article>)}{!tickets.length && <p className="empty-state">Hakuna ombi la msaada bado.</p>}</div>
         </section>
       )}
-      <footer><span>© 2026 LipaRahisi</span><span>Malipo ya majaribio pekee</span></footer>
+      <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="payments">Malipo ya majaribio pekee</span></BrandFooter>
     </main>
   );
 }
@@ -1905,6 +1928,7 @@ function CheckoutPage({ productId }) {
           </section>
         )}
         {orderId && isCompleted && (
+            <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />
           <section className="checkout-card receipt-card">
             <div className="receipt-success" aria-hidden="true">✓</div>
             <p className="receipt-kicker">{order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
@@ -1927,7 +1951,7 @@ function CheckoutPage({ productId }) {
           </section>
         )}
       </div>
-      <footer><span>© 2026 LipaRahisi</span><span>{product?.shop_name || "Malipo ya bidhaa"}</span></footer>
+      <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="merchant">{product?.shop_name || "Malipo ya bidhaa"}</span></BrandFooter>
     </main>
   );
 }
@@ -2138,6 +2162,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           {checkoutId && checkout && (
             <>
               <div className="eyebrow"><span /> {checkout.demo ? "ODA YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+              {checkout.payment_status === "COMPLETED" && <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />}
               <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : checkout.demo ? "Gawanya kwa wauzaji" : "Subiri ombi la malipo"}</h1>
               {checkout.splits.map((split) => (
                 <div className="cart-split" key={split.order_id}>
@@ -2183,7 +2208,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           )}
         </section>
       </div>
-      <footer><span>© 2026 LipaRahisi</span><span>QR ya bidhaa ni reusable; oda ya malipo ina muda wa saa 24</span></footer>
+      <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="qr-info">QR ya bidhaa ni reusable; oda ya malipo ina muda wa saa 24</span></BrandFooter>
     </main>
   );
 }

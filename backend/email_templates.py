@@ -22,7 +22,7 @@ def _render_email(
     name = full_name.strip() or "mteja"
     safe_name = escape(name)
     safe_frontend_url = escape(frontend_url.rstrip("/"), quote=True)
-    logo_url = escape(f"{frontend_url.rstrip('/')}/icons/icon.svg", quote=True)
+    logo_url = escape(f"{frontend_url.rstrip('/')}/images/liparahisi-logo.svg", quote=True)
     text_parts = [f"Habari {name},", heading, *paragraphs]
     if details:
         text_parts.extend(f"{label}: {value}" for label, value in details)
@@ -53,37 +53,35 @@ def _render_email(
         safe_button_url = escape(button_url, quote=True)
         button_html = (
             '<p style="margin:24px 0">'
-            f'<a href="{safe_button_url}" style="display:inline-block;background:#16835d;'
+            f'<a href="{safe_button_url}" style="display:inline-block;background:#174DAA;'
             'border-radius:8px;color:#ffffff;font-weight:700;padding:13px 20px;'
             f'text-decoration:none">{escape(button_label)}</a></p>'
             f'<p style="margin:0 0 16px;color:#64748b;font-size:13px;line-height:1.5">'
             f'Kama kitufe hakifanyi kazi, tumia kiungo hiki: '
-            f'<a href="{safe_button_url}" style="color:#126a4c;word-break:break-all">{safe_button_url}</a></p>'
+            f'<a href="{safe_button_url}" style="color:#174DAA;word-break:break-all">{safe_button_url}</a></p>'
         )
     html = (
         '<!doctype html><html lang="sw"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f'<title>{escape(subject)}</title></head>'
-        '<body style="margin:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif">'
+        '<body style="margin:0;background:#f5f8ff;font-family:Arial,Helvetica,sans-serif">'
         '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
-        'style="background:#f1f5f9;padding:28px 12px"><tr><td align="center">'
+        'style="background:#f5f8ff;padding:28px 12px"><tr><td align="center">'
         '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
         'style="max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden">'
-        '<tr><td style="padding:24px 28px;background:#f0fdf4;border-bottom:1px solid #dcfce7">'
-        f'<img src="{logo_url}" width="40" height="40" alt="LipaRahisi" '
-        'style="display:inline-block;vertical-align:middle;margin-right:10px">'
-        '<span style="display:inline-block;vertical-align:middle;color:#126a4c;'
-        'font-size:20px;font-weight:700">LipaRahisi</span></td></tr>'
+        '<tr><td style="padding:24px 28px;background:#f3f7ff;border-bottom:1px solid #e3eaf5">'
+        f'<img src="{logo_url}" width="180" height="54" alt="LipaRahisi" '
+        'style="display:block;width:180px;max-width:100%;height:auto"></td></tr>'
         '<tr><td style="padding:30px 28px">'
         f'<p style="margin:0 0 10px;color:#334155">Habari {safe_name},</p>'
-        f'<h1 style="margin:0 0 18px;color:#0f172a;font-size:23px;line-height:1.3">{escape(heading)}</h1>'
+        f'<h1 style="margin:0 0 18px;color:#071B52;font-size:23px;line-height:1.3">{escape(heading)}</h1>'
         f'{paragraph_html}{details_html}{button_html}'
         '<p style="margin:24px 0 0;color:#64748b;font-size:13px;line-height:1.5">'
         'Hujatambua ombi hili? Unaweza kupuuza ujumbe huu au kuwasiliana na timu ya LipaRahisi.</p>'
         '</td></tr>'
         '<tr><td style="padding:18px 28px;background:#f8fafc;color:#64748b;'
         'font-size:12px;line-height:1.5;text-align:center">'
-        f'<a href="{safe_frontend_url}" style="color:#126a4c;text-decoration:none">LipaRahisi</a>'
+        f'<a href="{safe_frontend_url}" style="color:#174DAA;text-decoration:none">LipaRahisi</a>'
         ' · Malipo na biashara kwa urahisi.</td></tr>'
         '</table></td></tr></table></body></html>'
     )

@@ -2,8 +2,8 @@
 
 :root {
   font-family: "DM Sans", sans-serif;
-  color: #17251f;
-  background: #f6f7f4;
+  color: #071b52;
+  background: #f5f8ff;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -11,10 +11,14 @@
   font-optical-sizing: auto;
   font-weight: 400;
 
-  --green: #16835d;
-  --deep-green: #126a4c;
-  --muted: #78827b;
-  --line: #e7eae5;
+  --brand-navy: #071b52;
+  --brand-blue: #174daa;
+  --brand-orange: #ff8a00;
+  --brand-white: #ffffff;
+  --green: var(--brand-blue);
+  --deep-green: var(--brand-navy);
+  --muted: #66738b;
+  --line: #e3eaf5;
 }
 
 * {
@@ -26,8 +30,9 @@ body {
   min-height: 100vh;
   margin: 0;
   background:
-    radial-gradient(ellipse at 87% 1%, rgba(201, 230, 215, 0.26), transparent 31rem),
-    #f6f7f4;
+    radial-gradient(ellipse at 88% 2%, rgba(23, 77, 170, 0.09), transparent 32rem),
+    radial-gradient(ellipse at 5% 52%, rgba(255, 138, 0, 0.045), transparent 24rem),
+    #f5f8ff;
 }
 
 button,
@@ -989,6 +994,13 @@ button {
   text-align: center;
 }
 
+.receipt-logo {
+  display: block;
+  width: min(220px, 72%);
+  height: auto;
+  margin: 0 auto 14px;
+}
+
 .receipt-success {
   width: 54px;
   height: 54px;
@@ -1169,6 +1181,212 @@ footer span span {
   gap: 8px;
   align-items: center;
   margin: 12px 0 18px;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  color: var(--brand-navy);
+}
+
+.topbar {
+  height: 88px;
+  border-bottom-color: rgba(7, 27, 82, 0.1);
+}
+
+.brand {
+  gap: 10px;
+  color: var(--brand-navy);
+}
+
+.brand-image,
+.brand-logo {
+  display: block;
+}
+
+.brand-logo {
+  width: 210px;
+  height: auto;
+}
+
+.brand-mobile-name {
+  display: none;
+}
+
+.prototype-label {
+  color: #34446b;
+  background: #eef3fc;
+}
+
+.status-dot,
+.eyebrow span {
+  background: var(--brand-orange);
+}
+
+.intro h1,
+.dashboard-welcome h1,
+.auth-card h1 {
+  color: var(--brand-navy);
+}
+
+.auth-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.auth-card::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 4px;
+  background: linear-gradient(90deg, var(--brand-blue), var(--brand-orange));
+  content: "";
+}
+
+.dashboard-welcome {
+  padding: 27px 30px;
+}
+
+.dashboard-welcome h1 span,
+.intro h1 span {
+  color: var(--brand-blue);
+}
+
+.logout-button,
+.auth-switch button,
+.dashboard-section-heading button,
+.cart-link {
+  color: var(--brand-blue);
+}
+
+.logout-button:focus-visible,
+.auth-switch button:focus-visible,
+.dashboard-section-heading button:focus-visible,
+.cart-link:focus-visible,
+.brand:focus-visible,
+.footer-brand:focus-visible {
+  outline: 3px solid rgba(255, 138, 0, 0.65);
+  outline-offset: 3px;
+  border-radius: 5px;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 3px solid rgba(23, 77, 170, 0.34);
+  outline-offset: 2px;
+}
+
+.site-footer {
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 30px 0 22px;
+  padding-top: 16px;
+  border-top: 1px solid #e3eaf5;
+  color: #6b7891;
+  font-size: 10px;
+}
+
+.footer-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--brand-navy);
+  font-family: "Manrope", sans-serif;
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.footer-brand img {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+
+.footer-motto {
+  color: var(--brand-blue);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.footer-motto i {
+  padding: 0 4px;
+  color: var(--brand-orange);
+  font-style: normal;
+}
+
+.footer-content {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 18px;
+  margin-left: auto;
+  text-align: right;
+}
+
+.site-footer .retry-link {
+  color: var(--brand-blue);
+}
+
+@media (max-width: 760px) {
+  .dashboard-welcome {
+    padding: 22px;
+  }
+}
+
+@media (max-width: 440px) {
+  .brand {
+    min-width: 0;
+    gap: 7px;
+  }
+
+  .brand-logo {
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+  }
+
+  .brand-mobile-name {
+    display: inline;
+    color: var(--brand-navy);
+    font-family: "Manrope", sans-serif;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: -0.4px;
+    white-space: nowrap;
+  }
+
+  .prototype-label {
+    display: none;
+  }
+
+  .site-footer {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 9px;
+    margin-top: 24px;
+  }
+
+  .footer-content {
+    justify-content: flex-start;
+    gap: 6px;
+    margin-left: 0;
+    text-align: left;
+  }
+
+  .dashboard-welcome {
+    padding: 18px;
+  }
+}
+
+@media print {
+  .site-footer {
+    display: none;
+  }
 }
 
 @media (max-width: 760px) {
@@ -1831,7 +2049,7 @@ select {
   width: 100%;
   height: 170px;
   border-radius: 7px;
-  background: #f6f7f4;
+  background: #f0f4fb;
   object-fit: cover;
 }
 
@@ -2037,9 +2255,9 @@ select {
   border: 1px solid #d5e8dc;
   border-left: 4px solid #16835d;
   border-radius: 10px;
-  color: #17251f;
+  color: var(--brand-navy);
   background: #fff;
-  box-shadow: 0 10px 32px rgba(23, 37, 31, 0.17);
+  box-shadow: 0 10px 32px rgba(7, 27, 82, 0.17);
   animation: toast-enter 180ms ease-out;
   pointer-events: auto;
 }
@@ -2133,5 +2351,65 @@ select {
   .stat-card {
     min-height: 100px;
     padding: 12px;
+  }
+}
+
+.auth-card {
+  border-color: #e1e8f4;
+  border-radius: 18px;
+  box-shadow: 0 18px 48px rgba(7, 27, 82, 0.08);
+}
+
+.dashboard-welcome {
+  border: 1px solid #e1e8f4;
+  border-radius: 18px;
+  background:
+    radial-gradient(ellipse at 100% 0, rgba(255, 138, 0, 0.1), transparent 17rem),
+    linear-gradient(135deg, #ffffff, #f3f7ff);
+}
+
+.dashboard-tabs {
+  border-bottom-color: #dce5f2;
+}
+
+.dashboard-tabs button.active {
+  color: var(--brand-navy);
+  background: #eaf1ff;
+  box-shadow: inset 0 -2px 0 var(--brand-orange);
+}
+
+@media (max-width: 440px) {
+  .topbar {
+    height: auto;
+    min-height: 68px;
+    gap: 8px;
+    padding: 8px 0;
+  }
+
+  .topbar .header-right {
+    align-items: center;
+    flex-direction: row;
+    gap: 7px;
+  }
+
+  .topbar .language-control select {
+    max-width: 86px;
+    padding: 6px 3px;
+    font-size: 10px;
+  }
+
+  .topbar .logout-button {
+    max-width: 45px;
+    padding: 0;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
+  .topbar .logout-name {
+    display: none;
+  }
+
+  .dashboard-welcome {
+    border-radius: 15px;
   }
 }

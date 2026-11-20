@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">LipaRahisi</title>
+  <desc id="desc">LipaRahisi digital payments logo in navy blue and orange, with wallet symbol and the tagline Lipa, Tuma, Pokea.</desc>
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#174DAA"/><stop offset="1" stop-color="#071B52"/>
+    </linearGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFB12B"/><stop offset="1" stop-color="#F36A12"/>
+    </linearGradient>
+  </defs>
+  <!-- Wallet mark -->
+  <g transform="translate(36 38)">
+    <path d="M72 65 190 12q15-7 26 7l30 36" fill="none" stroke="url(#navy)" stroke-width="17" stroke-linecap="round"/>
+    <path d="M100 53 222 4q15-6 22 10l17 39" fill="none" stroke="url(#orange)" stroke-width="17" stroke-linecap="round"/>
+    <path d="M38 112q0-27 28-35L275 24q29-7 38 22l20 177q4 31-26 39L88 317q-31 8-39-24z" fill="url(#navy)"/>
+    <path d="M61 113q0-17 18-22l206-54q17-4 22 14l4 24-226 58q-24 6-24 30z" fill="#0D347E" opacity=".8"/>
+    <path d="M59 126q0-18 18-23l218-56q18-5 23 13l3 13-230 59q-32 8-32 37z" fill="none" stroke="#FFFFFF" stroke-width="5" stroke-dasharray="12 11" stroke-linecap="round" opacity=".95"/>
+    <path d="M38 244q8 59 69 45l202-52q-83 81-208 91-76 6-96-48-9-24 1-49z" fill="url(#orange)"/>
+    <path d="M112 155h49M105 183h42M98 211h35" stroke="#FFFFFF" stroke-width="13" stroke-linecap="round"/>
+    <path d="m196 129-32 120h81l10-31h-46l24-89z" fill="#FFFFFF"/>
+    <path d="M286 133h57q18 0 18 18v48q0 18-18 18h-57q-18 0-18-18v-48q0-18 18-18z" fill="#0A2868" stroke="#3C83E8" stroke-width="5"/>
+    <circle cx="302" cy="175" r="13" fill="url(#orange)"/>
+    <path d="M17 145h29M9 169h37M22 193h24" stroke="url(#orange)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M18 264q-20-62 33-104-34 74 16 105 49 30 151-3-112 81-181 35-16-11-19-33z" fill="url(#orange)" opacity=".96"/>
+  </g>
+  <!-- Wordmark -->
+  <g font-family="Inter, Montserrat, Arial, sans-serif" font-weight="800" letter-spacing="-3">
+    <text x="420" y="205" font-size="104" fill="#0B245E">Lipa</text>
+    <text x="625" y="205" font-size="104" fill="#F47A16">Rahisi</text>
+  </g>
+  <!-- Contactless symbol -->
+  <g transform="translate(1055 91)" fill="none" stroke="#174DAA" stroke-width="9" stroke-linecap="round">
+    <path d="M0 30q25 18 0 36"/><path d="M17 14q47 34 0 68"/><path d="M35 0q67 50 0 98"/>
+  </g>
+  <g font-family="Inter, Montserrat, Arial, sans-serif" font-size="36" font-weight="700">
+    <text x="632" y="270" fill="#174DAA">Lipa</text>
+    <circle cx="725" cy="258" r="6" fill="#F47A16"/>
+    <text x="748" y="270" fill="#174DAA">Tuma</text>
+    <circle cx="864" cy="258" r="6" fill="#F47A16"/>
+    <text x="887" y="270" fill="#174DAA">Pokea</text>
+  </g>
+  <path d="M625 300q190-57 430-12" fill="none" stroke="url(#orange)" stroke-width="8" stroke-linecap="round"/>
+</svg>

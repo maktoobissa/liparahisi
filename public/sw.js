@@ -1,5 +1,10 @@
-const CACHE_NAME = "liparahisi-shell-v2";
-const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/icon.svg"];
+const CACHE_NAME = "liparahisi-shell-v3";
+const APP_SHELL = [
+  "/",
+  "/manifest.webmanifest",
+  "/images/liparahisi-logo.svg",
+  "/images/liparahisi-app-icon.svg",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

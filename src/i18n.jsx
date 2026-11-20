@@ -458,17 +458,17 @@ export function LanguageProvider({ children }) {
     const htmlLanguage = language === "sw" ? "sw-TZ" : language;
     document.documentElement.lang = htmlLanguage;
     document.title = language === "en"
-      ? "LipaRahisi — Marketplace"
+      ? "LipaRahisi — Pay, Send, Receive"
       : language === "fr"
-        ? "LipaRahisi — Marketplace"
-        : "LipaRahisi — QR ya malipo";
+        ? "LipaRahisi — Payer, Envoyer, Recevoir"
+        : "LipaRahisi — Lipa, Tuma, Pokea";
     const description = document.querySelector('meta[name="description"]');
     if (description) {
       description.content = language === "en"
-        ? "A marketplace for products, orders, and demo payments."
+        ? "LipaRahisi — pay, send, and receive payments with ease."
         : language === "fr"
-          ? "Une marketplace de produits, commandes et paiements démo."
-          : "Tengeneza QR code ya maelezo ya malipo ya bidhaa.";
+          ? "LipaRahisi — payez, envoyez et recevez des paiements facilement."
+          : "LipaRahisi — Lipa, Tuma, Pokea. Malipo na biashara kwa urahisi.";
     }
   }, [language]);
 

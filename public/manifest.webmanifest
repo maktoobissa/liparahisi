@@ -8,16 +8,16 @@
   "scope": "/",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],
-  "background_color": "#f6f7f4",
-  "theme_color": "#16835d",
+  "background_color": "#FFFFFF",
+  "theme_color": "#071B52",
   "orientation": "portrait-primary",
   "categories": ["shopping", "finance"],
   "icons": [
     {
-      "src": "/icons/icon.svg",
-      "sizes": "any",
+      "src": "/images/liparahisi-app-icon.svg",
+      "sizes": "512x512",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
     }
   ]
 }
