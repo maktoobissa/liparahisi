@@ -417,6 +417,15 @@ class MarketplaceFlowTests(unittest.TestCase):
         )
         self.assertNotIn("private data", failed_delivery.text)
 
+        self.email_sender.side_effect = None
+        self.email_sender.reset_mock()
+        retry_after_failure = self.client.post(
+            "/api/auth/password-reset/request",
+            json=request_payload,
+        )
+        self.assertEqual(retry_after_failure.status_code, 200)
+        self.assertEqual(self.email_sender.call_count, 1)
+
     def test_seller_approval_sales_commission_and_archive_isolation(self):
         status = self.client.get("/api/auth/status").json()
         self.assertTrue(status["setup_required"])

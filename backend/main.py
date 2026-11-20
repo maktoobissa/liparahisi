@@ -2248,7 +2248,7 @@ def request_password_reset(payload: PasswordResetRequestInput, request: Request)
             with db_connection() as connection:
                 connection.execute(
                     """
-                    UPDATE users SET reset_token_hash = ''
+                    UPDATE users SET reset_token_hash = '', reset_expires = 0
                     WHERE id = ? AND reset_token_hash = ?
                     """,
                     (user["id"], reset_hash),
