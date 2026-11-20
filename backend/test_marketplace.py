@@ -997,6 +997,205 @@ class MarketplaceFlowTests(unittest.TestCase):
                 "https://liparahisi.onrender.com",
             )
 
+    def test_product_variants_track_checkout_and_cancellation_stock(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Variant Seller",
+                "email": "variant-seller@example.com",
+                "password": "seller-password-long",
+                "shop_name": "Duka la Variant",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        seller = self.client.get("/api/admin/sellers").json()[0]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+
+        seller_client = TestClient(main.app)
+        with seller_client:
+            self.assertEqual(
+                seller_client.post(
+                    "/api/auth/login",
+                    json={
+                        "email": "variant-seller@example.com",
+                        "password": "seller-password-long",
+                    },
+                ).status_code,
+                200,
+            )
+            created = seller_client.post(
+                "/api/products",
+                json={
+                    "name": "Shati",
+                    "amount": 1000,
+                    "stock_quantity": 0,
+                    "variants": [
+                        {"label": "Nyekundu / M", "stock_quantity": 2},
+                        {"label": "Bluu / L", "stock_quantity": 2},
+                    ],
+                },
+            )
+            self.assertEqual(created.status_code, 201, created.text)
+            product_id = created.json()["id"]
+            variants_by_label = {
+                variant["label"]: variant
+                for variant in created.json()["variants"]
+            }
+            red_variant = variants_by_label["Nyekundu / M"]
+            blue_variant = variants_by_label["Bluu / L"]
+            self.assertEqual(created.json()["stock_quantity"], 4)
+
+            green_variant = seller_client.post(
+                f"/api/products/{product_id}/variants",
+                json={"label": "Kijani / M", "stock_quantity": 1},
+            )
+            self.assertEqual(green_variant.status_code, 201, green_variant.text)
+            duplicate_variant = seller_client.post(
+                f"/api/products/{product_id}/variants",
+                json={"label": "kijani / m", "stock_quantity": 1},
+            )
+            self.assertEqual(duplicate_variant.status_code, 409)
+            updated_variant = seller_client.patch(
+                f"/api/products/{product_id}/variants/{green_variant.json()['id']}",
+                json={"stock_quantity": 3},
+            )
+            self.assertEqual(updated_variant.status_code, 200, updated_variant.text)
+            product = seller_client.get(f"/api/products/{product_id}").json()
+            self.assertEqual(product["stock_quantity"], 7)
+            self.assertEqual(
+                seller_client.put(
+                    f"/api/products/{product_id}",
+                    json={"stock_quantity": 5},
+                ).status_code,
+                422,
+            )
+
+        buyer_registration = self.client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Variant Buyer",
+                "email": "variant-buyer@example.com",
+                "password": "buyer-password-long",
+            },
+        )
+        self.assertEqual(buyer_registration.status_code, 201)
+        buyer_client = TestClient(main.app)
+        with buyer_client:
+            self.assertEqual(
+                buyer_client.post(
+                    "/api/auth/login",
+                    json={
+                        "email": "variant-buyer@example.com",
+                        "password": "buyer-password-long",
+                    },
+                ).status_code,
+                200,
+            )
+            checkout_payload = {
+                "buyer_name": "Variant Buyer",
+                "buyer_email": "variant-buyer@example.com",
+                "buyer_phone": "0712345678",
+                "payment_method": "M-Pesa",
+            }
+            missing_variant = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={**checkout_payload, "request_key": "u" * 32},
+            )
+            self.assertEqual(missing_variant.status_code, 422)
+            single_checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    **checkout_payload,
+                    "request_key": "v" * 32,
+                    "variant_id": red_variant["id"],
+                },
+            )
+            self.assertEqual(single_checkout.status_code, 200, single_checkout.text)
+            order_id = single_checkout.json()["order_id"]
+            completed = buyer_client.post(f"/api/orders/{order_id}/demo-complete")
+            self.assertEqual(completed.status_code, 200, completed.text)
+            order_status = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(order_status["variant_label"], "Nyekundu / M")
+            product = buyer_client.get(f"/api/products/{product_id}").json()
+            stock_by_label = {variant["label"]: variant["stock_quantity"] for variant in product["variants"]}
+            self.assertEqual(stock_by_label["Nyekundu / M"], 1)
+            self.assertEqual(product["stock_quantity"], 6)
+
+            out_of_stock_variant = buyer_client.post(
+                "/api/cart/checkout",
+                json={
+                    **checkout_payload,
+                    "request_key": "x" * 32,
+                    "items": [{
+                        "product_id": product_id,
+                        "quantity": 3,
+                        "variant_id": blue_variant["id"],
+                    }],
+                },
+            )
+            self.assertEqual(out_of_stock_variant.status_code, 409)
+
+            cart_checkout = buyer_client.post(
+                "/api/cart/checkout",
+                json={
+                    **checkout_payload,
+                    "request_key": "w" * 32,
+                    "items": [{
+                        "product_id": product_id,
+                        "quantity": 2,
+                        "variant_id": blue_variant["id"],
+                    }],
+                },
+            )
+            self.assertEqual(cart_checkout.status_code, 200, cart_checkout.text)
+            cart_id = cart_checkout.json()["checkout_id"]
+            cart_complete = buyer_client.post(
+                f"/api/checkouts/{cart_id}/demo-complete"
+            )
+            self.assertEqual(cart_complete.status_code, 200, cart_complete.text)
+            split = cart_complete.json()["splits"][0]
+            self.assertEqual(split["items"][0]["variant_label"], "Bluu / L")
+            self.assertEqual(split["items"][0]["quantity"], 2)
+
+            cancellation = buyer_client.post(
+                f"/api/orders/{split['order_id']}/cancellation",
+                json={"reason": "Nimebadilisha uamuzi kuhusu oda."},
+            )
+            self.assertEqual(cancellation.status_code, 200, cancellation.text)
+            admin_cancellation = next(
+                row
+                for row in self.client.get("/api/admin/cancellations").json()
+                if row["id"] == cancellation.json()["id"]
+            )
+            resolution = self.client.patch(
+                f"/api/admin/cancellations/{admin_cancellation['id']}",
+                json={"status": "APPROVED", "admin_note": "Imeidhinishwa demo."},
+            )
+            self.assertEqual(resolution.status_code, 200, resolution.text)
+            restored_product = buyer_client.get(f"/api/products/{product_id}").json()
+            restored_stock = {
+                variant["label"]: variant["stock_quantity"]
+                for variant in restored_product["variants"]
+            }
+            self.assertEqual(restored_stock["Bluu / L"], 2)
+            self.assertEqual(restored_product["stock_quantity"], 6)
+
     def test_buyer_catalog_storefront_orders_and_support_features(self):
         setup = self.client.post(
             "/api/auth/setup",

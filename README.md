@@ -16,6 +16,8 @@ sales.
   remain available by their order link but are not attached to an account.
 - Seller storefront profiles, stock thresholds and movement history, product
   CSV import/export, and date/status-filtered sales.
+- Product variants with separate stock counts; each variant uses its product's
+  base price and can be selected in single-item or cart checkout.
 - Order delivery status and tracking codes, buyer cancellation requests, and
   verified-order reviews subject to administrator moderation.
 - Buyer support tickets with administrator responses.

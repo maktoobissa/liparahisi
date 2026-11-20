@@ -378,6 +378,16 @@ def initialize_db():
             );
             CREATE INDEX IF NOT EXISTS product_gallery_by_product
                 ON product_gallery_images(product_id, sort_order, id);
+            CREATE TABLE IF NOT EXISTS product_variants (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                stock_quantity INTEGER NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (product_id, label)
+            );
+            CREATE INDEX IF NOT EXISTS product_variants_by_product
+                ON product_variants(product_id, label, id);
             CREATE TABLE IF NOT EXISTS categories (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -438,6 +448,8 @@ def initialize_db():
                 quantity INTEGER NOT NULL CHECK (quantity > 0),
                 unit_amount INTEGER NOT NULL CHECK (unit_amount > 0),
                 unit_cost INTEGER NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+                variant_id TEXT NOT NULL DEFAULT '',
+                variant_label TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (order_id, product_id)
             );
             CREATE TABLE IF NOT EXISTS merchant_settings (
@@ -578,6 +590,8 @@ def initialize_db():
             )
         for column, declaration in order_columns.items():
             ensure_column(connection, "orders", column, declaration)
+        ensure_column(connection, "order_items", "variant_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "order_items", "variant_label", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS products_seller_idx ON products(seller_id)"
         )
@@ -681,6 +695,18 @@ class CategoryInput(BaseModel):
     name: str = Field(min_length=2, max_length=60)
 
 
+class ProductVariantInput(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    stock_quantity: int = Field(ge=0, le=999999999)
+
+    @validator("label")
+    def strip_variant_label(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Jina la variant linahitajika.")
+        return value
+
+
 class ProductInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=2000)
@@ -690,6 +716,7 @@ class ProductInput(BaseModel):
     cost_amount: int = Field(default=0, ge=0, le=999999999)
     stock_quantity: int = Field(default=0, ge=0, le=999999999)
     low_stock_threshold: int = Field(default=5, ge=0, le=999999999)
+    variants: list[ProductVariantInput] = Field(default_factory=list, max_items=100)
 
     @validator("name")
     def strip_product_name(cls, value):
@@ -701,6 +728,15 @@ class ProductInput(BaseModel):
     @validator("category")
     def normalize_category(cls, value):
         return value.strip()
+
+    @validator("variants")
+    def validate_variants(cls, variants):
+        labels = [variant.label.casefold() for variant in variants]
+        if len(labels) != len(set(labels)):
+            raise ValueError("Majina ya variant yanapaswa kuwa tofauti.")
+        if sum(variant.stock_quantity for variant in variants) > 999999999:
+            raise ValueError("Jumla ya stock ya variant imezidi kikomo.")
+        return variants
 
     @validator("image_url")
     def validate_image_url(cls, value):
@@ -744,6 +780,10 @@ class ProductUpdateInput(BaseModel):
     @validator("category")
     def normalize_category(cls, value):
         return value.strip() if value is not None else None
+
+
+class ProductVariantStockInput(BaseModel):
+    stock_quantity: int = Field(ge=0, le=999999999)
 
 
 class ProductCsvInput(BaseModel):
@@ -823,6 +863,7 @@ class CheckoutInput(BaseModel):
     bank_branch: str | None = Field(default=None, max_length=100)
     delivery_address: str = Field(default="", max_length=500)
     coupon_code: str = Field(default="", max_length=32)
+    variant_id: str | None = Field(default=None, max_length=64)
 
     @validator("buyer_name")
     def strip_buyer_name(cls, value):
@@ -857,10 +898,15 @@ class CheckoutInput(BaseModel):
     def normalize_checkout_coupon_code(cls, value):
         return value.strip().upper()
 
+    @validator("variant_id")
+    def normalize_variant_id(cls, value):
+        return value.strip() if value else None
+
 
 class CartItemInput(BaseModel):
     product_id: str = Field(min_length=1, max_length=64)
     quantity: int = Field(gt=0, le=99)
+    variant_id: str | None = Field(default=None, max_length=64)
 
 
 class CartCheckoutInput(CheckoutInput):
@@ -1194,6 +1240,70 @@ def attach_product_gallery(products):
     return results
 
 
+def product_variants_for(connection, product_id):
+    rows = connection.execute(
+        """
+        SELECT id, label, stock_quantity
+        FROM product_variants
+        WHERE product_id = ?
+        ORDER BY LOWER(label), id
+        """,
+        (product_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def attach_product_variants(products):
+    results = [dict(product) for product in products]
+    product_ids = list(dict.fromkeys(product["id"] for product in results))
+    variants_by_product = {}
+    with db_connection() as connection:
+        for offset in range(0, len(product_ids), 400):
+            batch = product_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, product_id, label, stock_quantity
+                FROM product_variants
+                WHERE product_id IN ({placeholders})
+                ORDER BY product_id, LOWER(label), id
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                variants_by_product.setdefault(row["product_id"], []).append(
+                    {
+                        "id": row["id"],
+                        "label": row["label"],
+                        "stock_quantity": row["stock_quantity"],
+                    }
+                )
+    for product in results:
+        product["variants"] = variants_by_product.get(product["id"], [])
+    return results
+
+
+def validate_variant_selection(connection, product, variant_id, quantity):
+    variants = product_variants_for(connection, product["id"])
+    if not variants:
+        if variant_id:
+            raise HTTPException(status_code=404, detail="Aina ya bidhaa haikupatikana.")
+        if product["stock_quantity"] < quantity:
+            raise HTTPException(status_code=409, detail="Stock ya bidhaa haitoshi.")
+        return {"variant_id": "", "variant_label": ""}
+    if not variant_id:
+        raise HTTPException(status_code=422, detail="Chagua aina ya bidhaa.")
+    variant = next((row for row in variants if row["id"] == variant_id), None)
+    if variant is None:
+        raise HTTPException(status_code=404, detail="Aina ya bidhaa haikupatikana.")
+    if variant["stock_quantity"] < quantity:
+        raise HTTPException(status_code=409, detail="Stock ya aina hii ya bidhaa haitoshi.")
+    return {
+        "variant_id": variant["id"],
+        "variant_label": variant["label"],
+    }
+
+
 def get_order(order_id):
     expire_pending_orders()
     with db_connection() as connection:
@@ -1473,11 +1583,33 @@ def complete_order_group(order_ids, provider_verified=False, background_tasks=No
                 continue
             newly_completed_ids.append(order["order_id"])
             items = connection.execute(
-                "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                """
+                SELECT product_id, quantity, variant_id
+                FROM order_items WHERE order_id = ?
+                """,
                 (order["order_id"],),
             ).fetchall()
             if items:
                 for item in items:
+                    if item["variant_id"]:
+                        variant_update = connection.execute(
+                            """
+                            UPDATE product_variants
+                            SET stock_quantity = stock_quantity - ?
+                            WHERE id = ? AND product_id = ? AND stock_quantity >= ?
+                            """,
+                            (
+                                item["quantity"],
+                                item["variant_id"],
+                                item["product_id"],
+                                item["quantity"],
+                            ),
+                        )
+                        if variant_update.rowcount == 0:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Stock ya aina hii ya bidhaa imeisha.",
+                            )
                     result = connection.execute(
                         """
                         UPDATE products
@@ -2264,6 +2396,45 @@ async def catalog_product_gallery_image_gateway(
 
 
 @app.api_route(
+    "/api/products/{product_id}/variants",
+    methods=["POST"],
+)
+async def catalog_product_variants_gateway(
+    product_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/variants",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/variants/{variant_id}",
+    methods=["PATCH"],
+)
+async def catalog_product_variant_gateway(
+    product_id: str,
+    variant_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/variants/{variant_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
     "/api/products/{product_id}",
     methods=["GET", "PUT", "DELETE"],
 )
@@ -3035,6 +3206,8 @@ def list_products(
         for row in rows
     ]
     products = attach_product_gallery(products)
+    if user and user["role"] in {"ADMIN", "SELLER"}:
+        products = attach_product_variants(products)
     if cache_key is not None:
         cache_product_list(cache_key, products)
     return products
@@ -3534,6 +3707,11 @@ def create_product(payload: ProductInput, request: Request):
     if user["role"] != "SELLER":
         raise HTTPException(status_code=403, detail="Ni akaunti ya muuzaji pekee inayoweza kuunda bidhaa.")
     product_id = secrets.token_hex(16)
+    stock_quantity = (
+        sum(variant.stock_quantity for variant in payload.variants)
+        if payload.variants
+        else payload.stock_quantity
+    )
     with db_connection() as connection:
         connection.execute(
             """
@@ -3551,17 +3729,30 @@ def create_product(payload: ProductInput, request: Request):
                 payload.amount,
                 user["id"],
                 payload.cost_amount,
-                payload.stock_quantity,
+                stock_quantity,
                 payload.low_stock_threshold,
             ),
         )
-        if payload.stock_quantity:
+        for variant in payload.variants:
+            connection.execute(
+                """
+                INSERT INTO product_variants (id, product_id, label, stock_quantity)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    secrets.token_hex(16),
+                    product_id,
+                    variant.label,
+                    variant.stock_quantity,
+                ),
+            )
+        if stock_quantity:
             record_inventory_movement(
                 connection,
                 product_id,
                 user["id"],
                 user["id"],
-                payload.stock_quantity,
+                stock_quantity,
                 "INITIAL_STOCK",
             )
     record_audit("PRODUCT_CREATED", "product", product_id, payload.name, actor=user, request=request)
@@ -3574,9 +3765,135 @@ def create_product(payload: ProductInput, request: Request):
         "category": payload.category,
         "amount": payload.amount,
         "cost_amount": payload.cost_amount,
-        "stock_quantity": payload.stock_quantity,
+        "stock_quantity": stock_quantity,
         "low_stock_threshold": payload.low_stock_threshold,
+        "variants": attach_product_variants([{"id": product_id}])[0]["variants"],
         "qr_url": f"{app_url}/p/{product_id}",
+    }
+
+
+def update_product_variant_stock(
+    product_id: str,
+    variant_id: str,
+    payload: ProductVariantStockInput,
+    request: Request,
+):
+    seller = require_seller(request)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE products SET stock_quantity = stock_quantity WHERE id = ? AND seller_id = ?",
+            (product_id, seller["id"]),
+        )
+        variant = connection.execute(
+            """
+            SELECT v.label, v.stock_quantity, p.seller_id, p.stock_quantity AS product_stock
+            FROM product_variants v
+            JOIN products p ON p.id = v.product_id
+            WHERE v.id = ? AND v.product_id = ?
+            """,
+            (variant_id, product_id),
+        ).fetchone()
+        if variant is None or variant["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Aina ya bidhaa haikupatikana.")
+        connection.execute(
+            "UPDATE product_variants SET stock_quantity = ? WHERE id = ?",
+            (payload.stock_quantity, variant_id),
+        )
+        total_stock = connection.execute(
+            "SELECT COALESCE(SUM(stock_quantity), 0) AS total FROM product_variants WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()["total"]
+        stock_delta = total_stock - variant["product_stock"]
+        connection.execute(
+            "UPDATE products SET stock_quantity = ? WHERE id = ?",
+            (total_stock, product_id),
+        )
+        if stock_delta:
+            record_inventory_movement(
+                connection,
+                product_id,
+                seller["id"],
+                seller["id"],
+                stock_delta,
+                "VARIANT_STOCK_ADJUSTMENT",
+            )
+    invalidate_public_product_lists()
+    record_audit(
+        "PRODUCT_VARIANT_STOCK_UPDATED",
+        "product_variant",
+        variant_id,
+        f"{variant['label']} stock={payload.stock_quantity}",
+        actor=seller,
+        request=request,
+    )
+    return {
+        "id": variant_id,
+        "product_id": product_id,
+        "label": variant["label"],
+        "stock_quantity": payload.stock_quantity,
+    }
+
+
+def add_product_variant(
+    product_id: str,
+    payload: ProductVariantInput,
+    request: Request,
+):
+    seller = require_seller(request)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE products SET stock_quantity = stock_quantity WHERE id = ? AND seller_id = ?",
+            (product_id, seller["id"]),
+        )
+        product = connection.execute(
+            "SELECT seller_id, stock_quantity FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        variants = product_variants_for(connection, product_id)
+        if len(variants) >= 100:
+            raise HTTPException(status_code=409, detail="Bidhaa haiwezi kuwa na variants zaidi ya 100.")
+        if any(variant["label"].casefold() == payload.label.casefold() for variant in variants):
+            raise HTTPException(status_code=409, detail="Variant yenye jina hili tayari ipo.")
+        variant_id = secrets.token_hex(16)
+        connection.execute(
+            """
+            INSERT INTO product_variants (id, product_id, label, stock_quantity)
+            VALUES (?, ?, ?, ?)
+            """,
+            (variant_id, product_id, payload.label, payload.stock_quantity),
+        )
+        total_stock = sum(variant["stock_quantity"] for variant in variants)
+        total_stock += payload.stock_quantity
+        stock_delta = total_stock - product["stock_quantity"]
+        connection.execute(
+            "UPDATE products SET stock_quantity = ? WHERE id = ?",
+            (total_stock, product_id),
+        )
+        if stock_delta:
+            record_inventory_movement(
+                connection,
+                product_id,
+                seller["id"],
+                seller["id"],
+                stock_delta,
+                "VARIANT_ADDED",
+            )
+    invalidate_public_product_lists()
+    record_audit(
+        "PRODUCT_VARIANT_ADDED",
+        "product_variant",
+        variant_id,
+        f"{payload.label} stock={payload.stock_quantity}",
+        actor=seller,
+        request=request,
+    )
+    return {
+        "id": variant_id,
+        "product_id": product_id,
+        "label": payload.label,
+        "stock_quantity": payload.stock_quantity,
     }
 
 
@@ -3591,6 +3908,15 @@ def update_product(product_id: str, payload: ProductUpdateInput, request: Reques
             raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
         if user["role"] != "ADMIN" and product["seller_id"] != user["id"]:
             raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        has_variants = connection.execute(
+            "SELECT 1 FROM product_variants WHERE product_id = ? LIMIT 1",
+            (product_id,),
+        ).fetchone()
+        if has_variants and payload.stock_quantity is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Badilisha stock ya kila variant kivyake.",
+            )
         name = payload.name if payload.name is not None else product["name"]
         description = payload.description if payload.description is not None else product["description"]
         image_url = payload.image_url if payload.image_url is not None else product["image_url"]
@@ -3673,7 +3999,7 @@ def read_product(product_id: str):
         "store_slug": product["store_slug"] or "",
         **list_product_reviews(product["id"]),
     }
-    return attach_product_gallery([result])[0]
+    return attach_product_variants(attach_product_gallery([result]))[0]
 
 
 def read_uploaded_product_image(image):
@@ -3963,6 +4289,12 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     buyer_email = checkout_buyer_email(payload, buyer)
     with db_connection() as connection:
+        variant = validate_variant_selection(
+            connection,
+            product,
+            payload.variant_id,
+            1,
+        )
         coupon_code, coupon_discount = coupon_discount_for_checkout(
             connection,
             payload.coupon_code,
@@ -4008,10 +4340,18 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
             connection.execute(
                 """
                 INSERT INTO order_items
-                    (order_id, product_id, quantity, unit_amount, unit_cost)
-                VALUES (?, ?, 1, ?, ?)
+                    (order_id, product_id, quantity, unit_amount, unit_cost,
+                     variant_id, variant_label)
+                VALUES (?, ?, 1, ?, ?, ?, ?)
                 """,
-                (order_id, product_id, product["amount"], product["cost_amount"]),
+                (
+                    order_id,
+                    product_id,
+                    product["amount"],
+                    product["cost_amount"],
+                    variant["variant_id"],
+                    variant["variant_label"],
+                ),
             )
     except Exception as error:
         if is_integrity_error(error):
@@ -4092,7 +4432,14 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     buyer_email = checkout_buyer_email(payload, buyer)
     with db_connection() as connection:
+        seen_product_ids = set()
         for item in payload.items:
+            if item.product_id in seen_product_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Kila bidhaa iwe mara moja tu kwenye kikapu; chagua variant moja.",
+                )
+            seen_product_ids.add(item.product_id)
             product = connection.execute(
                 """
                 SELECT p.id, p.name, p.amount, p.cost_amount, p.stock_quantity, p.seller_id,
@@ -4109,6 +4456,16 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     status_code=409,
                     detail=f"Stock ya {product['name']} haitoshi; inabaki {product['stock_quantity']}.",
                 )
+            variant = validate_variant_selection(
+                connection,
+                product,
+                item.variant_id,
+                item.quantity,
+            )
+            product = {
+                **dict(product),
+                **variant,
+            }
             seller_id = product["seller_id"]
             merged.setdefault(seller_id, []).append(
                 (product, item.quantity)
@@ -4200,8 +4557,9 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                 connection.execute(
                     """
                     INSERT INTO order_items
-                        (order_id, product_id, quantity, unit_amount, unit_cost)
-                    VALUES (?, ?, ?, ?, ?)
+                        (order_id, product_id, quantity, unit_amount, unit_cost,
+                         variant_id, variant_label)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_id,
@@ -4209,6 +4567,8 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                         quantity,
                         product["amount"],
                         product["cost_amount"],
+                        product["variant_id"],
+                        product["variant_label"],
                     ),
                 )
             order_ids.append(order_id)
@@ -4267,7 +4627,7 @@ def get_cart_checkout(checkout_id: str, request: Request):
         with db_connection() as connection:
             items = connection.execute(
                 """
-                SELECT oi.product_id, oi.quantity, oi.unit_amount,
+                SELECT oi.product_id, oi.quantity, oi.unit_amount, oi.variant_label,
                        p.name AS product_name
                 FROM order_items oi JOIN products p ON p.id = oi.product_id
                 WHERE oi.order_id = ?
@@ -4341,14 +4701,21 @@ def order_status(order_id: str, request: Request):
     order = get_order(order_id)
     with db_connection() as connection:
         product = connection.execute(
-            "SELECT name FROM products WHERE id = ?",
-            (order["product_id"],),
+            """
+            SELECT p.name, oi.variant_label
+            FROM products p
+            LEFT JOIN order_items oi
+              ON oi.product_id = p.id AND oi.order_id = ?
+            WHERE p.id = ?
+            """,
+            (order_id, order["product_id"]),
         ).fetchone()
     result = {
         "order_id": order_id,
         "payment_status": order["payment_status"],
         "amount": order["amount"],
         "product_name": product["name"] if product else "Bidhaa",
+        "variant_label": product["variant_label"] if product else "",
         "payment_method": order["payment_method"],
         "completed_at": order["completed_at"],
         "platform_fee": order["platform_fee"],
@@ -4378,10 +4745,12 @@ def order_history(request: Request):
             SELECT o.order_id, o.product_id, o.amount, o.payment_status,
                    o.delivery_status, o.tracking_code, o.delivery_address,
                    o.created_at, o.completed_at, p.name AS product_name,
-                   p.image_url, u.shop_name
+                   p.image_url, u.shop_name, oi.variant_label
             FROM orders o
             JOIN products p ON p.id = o.product_id
             LEFT JOIN users u ON u.id = o.seller_id
+            LEFT JOIN order_items oi
+              ON oi.order_id = o.order_id AND oi.product_id = o.product_id
             WHERE o.buyer_id = ?
             ORDER BY o.created_at DESC
             LIMIT 200
@@ -4493,11 +4862,27 @@ def resolve_cancellation(
                 if not is_demo_mode():
                     raise HTTPException(status_code=409, detail="Refund ya malipo halisi haijaunganishwa.")
                 items = connection.execute(
-                    "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                    """
+                    SELECT product_id, quantity, variant_id
+                    FROM order_items WHERE order_id = ?
+                    """,
                     (cancellation["order_id"],),
                 ).fetchall()
                 if items:
                     for item in items:
+                        if item["variant_id"]:
+                            connection.execute(
+                                """
+                                UPDATE product_variants
+                                SET stock_quantity = stock_quantity + ?
+                                WHERE id = ? AND product_id = ?
+                                """,
+                                (
+                                    item["quantity"],
+                                    item["variant_id"],
+                                    item["product_id"],
+                                ),
+                            )
                         connection.execute(
                             "UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?",
                             (item["quantity"], item["product_id"]),
@@ -4801,10 +5186,12 @@ def list_sales(
                o.delivery_address, o.delivery_status, o.tracking_code,
                o.completed_at, o.archived_at,
                o.created_at, p.name AS product_name,
-               u.shop_name
+               u.shop_name, oi.variant_label
         FROM orders o
         JOIN products p ON p.id = o.product_id
         LEFT JOIN users u ON u.id = o.seller_id
+        LEFT JOIN order_items oi
+          ON oi.order_id = o.order_id AND oi.product_id = o.product_id
     """
     if user["role"] == "ADMIN":
         conditions = []

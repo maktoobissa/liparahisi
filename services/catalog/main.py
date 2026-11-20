@@ -8,10 +8,13 @@ from backend.main import (
     ProductInput,
     ProductCsvInput,
     ProductUpdateInput,
+    ProductVariantInput,
+    ProductVariantStockInput,
     StorefrontInput,
     add_to_wishlist,
     archive_product,
     connect_db,
+    add_product_variant,
     create_category,
     create_product,
     delete_product_image,
@@ -29,6 +32,7 @@ from backend.main import (
     read_storefront,
     remove_from_wishlist,
     update_product,
+    update_product_variant_stock,
     update_storefront,
     upload_product_image,
     upload_product_gallery,
@@ -109,6 +113,32 @@ def low_stock(request: Request):
 )
 def stock_movements(product_id: str, request: Request):
     return product_inventory_movements(product_id, request)
+
+
+@app.patch(
+    "/products/{product_id}/variants/{variant_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def variant_stock(
+    product_id: str,
+    variant_id: str,
+    payload: ProductVariantStockInput,
+    request: Request,
+):
+    return update_product_variant_stock(product_id, variant_id, payload, request)
+
+
+@app.post(
+    "/products/{product_id}/variants",
+    status_code=201,
+    dependencies=[Depends(verify_gateway_token)],
+)
+def create_variant(
+    product_id: str,
+    payload: ProductVariantInput,
+    request: Request,
+):
+    return add_product_variant(product_id, payload, request)
 
 
 app.add_api_route(

@@ -1745,6 +1745,34 @@ select {
   font-size: 9px;
 }
 
+.variant-editor,
+.variant-stock-list {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.variant-editor-row,
+.variant-stock-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.variant-editor-row .text-input {
+  min-width: 0;
+}
+
+.variant-stock-row {
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+
+.variant-stock-row .text-input {
+  width: 90px;
+  padding: 6px 8px;
+}
+
 .product-tile-details .muted-status {
   color: #ad5144;
 }

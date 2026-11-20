@@ -574,12 +574,25 @@ function ProductTile({
   onUploadGallery,
   onDeleteImage,
   onDeleteGalleryImage,
+  onAddVariant,
+  onUpdateVariantStock,
   canArchive,
 }) {
   const localize = useLocalize();
   const { language } = useLanguage();
   const [qr, setQr] = useState("");
+  const [variantStocks, setVariantStocks] = useState({});
+  const [newVariantLabel, setNewVariantLabel] = useState("");
+  const [newVariantStock, setNewVariantStock] = useState(String(product.stock_quantity ?? 0));
   const barcodeRef = useRef(null);
+  useEffect(() => {
+    setVariantStocks(Object.fromEntries(
+      (product.variants || []).map((variant) => [variant.id, String(variant.stock_quantity)]),
+    ));
+    setNewVariantStock(product.variants?.length ? "0" : String(product.stock_quantity ?? 0));
+    setNewVariantLabel("");
+  }, [product.id, product.variants]);
+
   useEffect(() => {
     let active = true;
     QRCode.toDataURL(product.qr_url, {
@@ -624,6 +637,15 @@ function ProductTile({
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
 
+  async function submitNewVariant(event) {
+    event.preventDefault();
+    const added = await onAddVariant(product.id, newVariantLabel, Number(newVariantStock));
+    if (added) {
+      setNewVariantLabel("");
+      setNewVariantStock("0");
+    }
+  }
+
   return localize(
     <article className={`product-tile ${product.is_active ? "" : "product-inactive"}`}>
       <ProductGallery
@@ -639,6 +661,71 @@ function ProductTile({
         {product.description && <small>{product.description}</small>}
         <span>TZS {formatMoney(product.amount)}</span>
         <small>Stock: {product.stock_quantity ?? 0}</small>
+        {(product.variants?.length > 0 || canArchive) && (
+          <div className="variant-stock-list">
+            <strong>Stock kwa variant</strong>
+            {!product.variants?.length && (
+              <small>Stock ya kawaida itakuwa stock ya variant mpya.</small>
+            )}
+            {(product.variants || []).map((variant) => (
+              <div className="variant-stock-row" key={variant.id}>
+                <span>{variant.label}: {variant.stock_quantity}</span>
+                {canArchive && (
+                  <>
+                    <input
+                      className="text-input"
+                      type="number"
+                      min="0"
+                      max="999999999"
+                      aria-label={`${translate("Stock kwa variant", language)} ${variant.label}`}
+                      value={variantStocks[variant.id] ?? String(variant.stock_quantity)}
+                      onChange={(event) => setVariantStocks((current) => ({
+                        ...current,
+                        [variant.id]: event.target.value,
+                      }))}
+                    />
+                    <button
+                      className="table-action"
+                      type="button"
+                      disabled={!Number.isInteger(Number(variantStocks[variant.id] ?? variant.stock_quantity))}
+                      onClick={() => onUpdateVariantStock(
+                        product.id,
+                        variant.id,
+                        Number(variantStocks[variant.id] ?? variant.stock_quantity),
+                      )}
+                    >
+                      Hifadhi stock
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+            {canArchive && (
+              <form className="variant-stock-row" onSubmit={submitNewVariant}>
+                <input
+                  className="text-input"
+                  aria-label={translate("Variant", language)}
+                  placeholder={translate("Mfano: Rangi nyeusi / Size M", language)}
+                  maxLength={80}
+                  required
+                  value={newVariantLabel}
+                  onChange={(event) => setNewVariantLabel(event.target.value)}
+                />
+                <input
+                  className="text-input"
+                  type="number"
+                  min="0"
+                  max="999999999"
+                  aria-label={translate("Stock kwa variant", language)}
+                  required
+                  value={newVariantStock}
+                  onChange={(event) => setNewVariantStock(event.target.value)}
+                />
+                <button className="table-action" type="submit">Ongeza variant</button>
+              </form>
+            )}
+          </div>
+        )}
         {product.shop_name && <small>{product.shop_name}</small>}
         {!product.is_active && <small className="muted-status">Imeondolewa</small>}
         <div className="product-tile-actions">
@@ -727,6 +814,7 @@ function MarketplaceDashboard({ user, onLogout }) {
     name: "", description: "", image_url: "", category: "", amount: "",
     cost_amount: "", stock_quantity: "", low_stock_threshold: "5",
   });
+  const [productVariants, setProductVariants] = useState([]);
   const [productImages, setProductImages] = useState([]);
   const productImageInputRef = useRef(null);
   const [productQuery, setProductQuery] = useState("");
@@ -870,6 +958,20 @@ function MarketplaceDashboard({ user, onLogout }) {
       .catch((requestError) => setError(requestError.message));
   }, []);
 
+  function addProductVariant() {
+    setProductVariants((current) => [...current, { label: "", stock_quantity: "0" }]);
+  }
+
+  function updateProductVariant(index, field, value) {
+    setProductVariants((current) => current.map((variant, variantIndex) => (
+      variantIndex === index ? { ...variant, [field]: value } : variant
+    )));
+  }
+
+  function removeProductVariant(index) {
+    setProductVariants((current) => current.filter((_, variantIndex) => variantIndex !== index));
+  }
+
   async function createProduct(event) {
     event.preventDefault();
     setMessage("");
@@ -892,9 +994,14 @@ function MarketplaceDashboard({ user, onLogout }) {
           cost_amount: Number(productForm.cost_amount) || 0,
           stock_quantity: Number(productForm.stock_quantity) || 0,
           low_stock_threshold: Number(productForm.low_stock_threshold) || 0,
+          variants: productVariants.map((variant) => ({
+            label: variant.label.trim(),
+            stock_quantity: Number(variant.stock_quantity) || 0,
+          })),
         }),
       });
       setProductForm({ name: "", description: "", image_url: "", category: "", amount: "", cost_amount: "", stock_quantity: "", low_stock_threshold: "5" });
+      setProductVariants([]);
       setProductImages([]);
       if (productImageInputRef.current) productImageInputRef.current.value = "";
       if (productImages.length) {
@@ -926,6 +1033,38 @@ function MarketplaceDashboard({ user, onLogout }) {
       await refresh();
     } catch (requestError) {
       setError(requestError.message);
+    }
+  }
+
+  async function updateProductVariantStock(productId, variantId, stockQuantity) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/products/${encodeURIComponent(productId)}/variants/${encodeURIComponent(variantId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ stock_quantity: stockQuantity }),
+      });
+      setMessage(translate("Stock ya variant imehifadhiwa.", language));
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function addExistingProductVariant(productId, label, stockQuantity) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/products/${encodeURIComponent(productId)}/variants`, {
+        method: "POST",
+        body: JSON.stringify({ label, stock_quantity: stockQuantity }),
+      });
+      setMessage(translate("Variant imeongezwa.", language));
+      await refresh();
+      return true;
+    } catch (requestError) {
+      setError(requestError.message);
+      return false;
     }
   }
 
@@ -1245,8 +1384,45 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <input id="product-amount" className="text-input" type="number" min="1" step="1" required value={productForm.amount} onChange={(event) => setProductForm({ ...productForm, amount: event.target.value })} />
                 <label className="field-label" htmlFor="product-cost">Gharama ya bidhaa (TZS)</label>
                 <input id="product-cost" className="text-input" type="number" min="0" step="1" value={productForm.cost_amount} onChange={(event) => setProductForm({ ...productForm, cost_amount: event.target.value })} />
-                <label className="field-label" htmlFor="product-stock">Stock inayopatikana</label>
-                <input id="product-stock" className="text-input" type="number" min="0" step="1" required value={productForm.stock_quantity} onChange={(event) => setProductForm({ ...productForm, stock_quantity: event.target.value })} />
+                {productVariants.length ? (
+                  <p className="field-hint">
+                    {translate("Stock ya jumla kutoka variants", language)}: {productVariants.reduce((sum, variant) => sum + (Number(variant.stock_quantity) || 0), 0)}
+                  </p>
+                ) : (
+                  <>
+                    <label className="field-label" htmlFor="product-stock">Stock inayopatikana</label>
+                    <input id="product-stock" className="text-input" type="number" min="0" step="1" required value={productForm.stock_quantity} onChange={(event) => setProductForm({ ...productForm, stock_quantity: event.target.value })} />
+                  </>
+                )}
+                <div className="variant-editor">
+                  <strong>Variants (hiari)</strong>
+                  <p className="field-hint">Kila variant hutumia bei ya bidhaa na ina stock yake.</p>
+                  {productVariants.map((variant, index) => (
+                    <div className="variant-editor-row" key={`variant-${index}`}>
+                      <input
+                        className="text-input"
+                        aria-label={`${translate("Variant", language)} ${index + 1}`}
+                        placeholder={translate("Mfano: Rangi nyeusi / Size M", language)}
+                        maxLength={80}
+                        required
+                        value={variant.label}
+                        onChange={(event) => updateProductVariant(index, "label", event.target.value)}
+                      />
+                      <input
+                        className="text-input"
+                        aria-label={`${translate("Stock kwa variant", language)} ${index + 1}`}
+                        type="number"
+                        min="0"
+                        max="999999999"
+                        required
+                        value={variant.stock_quantity}
+                        onChange={(event) => updateProductVariant(index, "stock_quantity", event.target.value)}
+                      />
+                      <button className="table-action" type="button" onClick={() => removeProductVariant(index)}>Ondoa variant</button>
+                    </div>
+                  ))}
+                  <button className="table-action" type="button" onClick={addProductVariant}>Ongeza variant</button>
+                </div>
                 <label className="field-label" htmlFor="product-low-stock">Tahadhari stock ikiwa chini ya</label>
                 <input id="product-low-stock" className="text-input" type="number" min="0" step="1" value={productForm.low_stock_threshold} onChange={(event) => setProductForm({ ...productForm, low_stock_threshold: event.target.value })} />
                 <p className="field-hint">Gharama hutumika kukadiria faida; inaweza kuachwa wazi.</p>
@@ -1288,6 +1464,8 @@ function MarketplaceDashboard({ user, onLogout }) {
                   onUploadGallery={uploadExistingProductGallery}
                   onDeleteImage={deleteProductImage}
                   onDeleteGalleryImage={deleteProductGalleryImage}
+                  onAddVariant={addExistingProductVariant}
+                  onUpdateVariantStock={updateProductVariantStock}
                 />
               ))}
             </div>
@@ -1525,7 +1703,7 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
   }
   return localize(
     <tr className={sale.archived_at ? "archived-row" : ""}>
-      <td><strong>{sale.product_name}</strong><small>{sale.order_id}</small></td>
+      <td><strong>{sale.product_name}</strong>{sale.variant_label && <small>{sale.variant_label}</small>}<small>{sale.order_id}</small></td>
       {isAdmin && <td>{sale.shop_name || "—"}</td>}
       <td>{sale.buyer_name || "—"}<small>{paymentMethodLabel(sale.payment_method || "")}</small>{sale.delivery_address && <small>{sale.delivery_address}</small>}</td>
       <td><span className={`order-status ${sale.payment_status.toLowerCase()}`}>{sale.payment_status === "COMPLETED" ? "Imekamilika (demo)" : sale.payment_status}</span>{sale.archived_at && <small>Imefichwa na muuzaji</small>}</td>
@@ -1894,7 +2072,7 @@ function BuyerOrderRow({ order, onAction }) {
   return localize(
     <tr>
       <td><strong>{order.order_id}</strong><small>{order.created_at}</small></td>
-      <td>{order.product_name}<small>{order.shop_name || "Muuzaji"}</small></td>
+      <td>{order.product_name}{order.variant_label && <small>{order.variant_label}</small>}<small>{order.shop_name || "Muuzaji"}</small></td>
       <td>{order.payment_status}</td>
       <td>{order.delivery_status}{order.tracking_code && <small>{order.tracking_code}</small>}{order.delivery_address && <small>{order.delivery_address}</small>}</td>
       <td>TZS {formatMoney(order.amount)}</td>
@@ -2046,6 +2224,7 @@ function CheckoutPage({ productId }) {
   const [paymentConfig, setPaymentConfig] = useState(null);
   const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa" });
   const [couponCode, setCouponCode] = useState("");
+  const [variantId, setVariantId] = useState("");
   const [orderId, setOrderId] = useState(new URLSearchParams(window.location.search).get("order_id") || "");
   const [order, setOrder] = useState(null);
   const previousOrderStatus = useRef(null);
@@ -2054,6 +2233,7 @@ function CheckoutPage({ productId }) {
   const [cartCount, setCartCount] = useState(() => loadCart().reduce((sum, item) => sum + item.quantity, 0));
 
   useEffect(() => {
+    setVariantId("");
     api(`/products/${productId}`).then(setProduct).catch((requestError) => setError(requestError.message));
   }, [productId]);
 
@@ -2113,10 +2293,22 @@ function CheckoutPage({ productId }) {
   }, [notify, orderId]);
 
   function addToCart() {
+    const hasVariants = (product?.variants || []).length > 0;
+    if (hasVariants && !variantId) {
+      setError(translate("Chagua aina ya bidhaa kabla ya kuongeza kwenye kikapu.", language));
+      return;
+    }
     const cart = loadCart();
     const existing = cart.find((item) => item.product_id === productId);
-    if (existing) existing.quantity += 1;
-    else cart.push({ product_id: productId, quantity: 1 });
+    if (existing) {
+      if ((existing.variant_id || "") !== (variantId || "")) {
+        setError(translate("Kikapu kina variant moja kwa kila bidhaa; badilisha variant kwenye kikapu.", language));
+        return;
+      }
+      existing.quantity += 1;
+    } else {
+      cart.push({ product_id: productId, quantity: 1, variant_id: variantId || "" });
+    }
     saveCart(cart);
     setCartCount(cart.reduce((sum, item) => sum + item.quantity, 0));
   }
@@ -2135,6 +2327,7 @@ function CheckoutPage({ productId }) {
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
           coupon_code: couponCode,
+          variant_id: variantId || null,
           request_key: newRequestKey(),
         }),
       });
@@ -2195,7 +2388,13 @@ function CheckoutPage({ productId }) {
         amount,
         platformFee,
         sellerPayout: Number(order.seller_payout) || 0,
-        items: [{ product_name: order.product_name, quantity: 1, unit_amount: amount }],
+        items: [{
+          product_name: order.variant_label
+            ? `${order.product_name} — ${order.variant_label}`
+            : order.product_name,
+          quantity: 1,
+          unit_amount: amount,
+        }],
       }],
     }, language);
   }
@@ -2206,6 +2405,8 @@ function CheckoutPage({ productId }) {
   const isAblinerSelected = form.payment_method === ABLINER_PAYMENT_METHOD;
   const paymentMethods = paymentOptionsFor(paymentConfig);
   const selectedMethod = networks.find((method) => method.value === form.payment_method);
+  const productVariants = product?.variants || [];
+  const selectedVariant = productVariants.find((variant) => variant.id === variantId);
   return localize(
     <main className="page-shell checkout-shell">
       <Header label="Malipo ya bidhaa" />
@@ -2220,6 +2421,25 @@ function CheckoutPage({ productId }) {
             <div className="checkout-amount">TZS {formatMoney(product.amount)}</div>
             <p className="buyer-intro">Jaza taarifa za oda na uchague njia ya malipo. PIN au OTP haiingizwe kwenye ukurasa huu.</p>
             <form className="buyer-form" onSubmit={submitCheckout}>
+              {productVariants.length > 0 && (
+                <>
+                  <label className="field-label" htmlFor="checkout-variant">Aina ya bidhaa</label>
+                  <select
+                    id="checkout-variant"
+                    className="text-input"
+                    required
+                    value={variantId}
+                    onChange={(event) => setVariantId(event.target.value)}
+                  >
+                    <option value="">Chagua aina ya bidhaa</option>
+                    {productVariants.map((variant) => (
+                      <option key={variant.id} value={variant.id} disabled={variant.stock_quantity <= 0}>
+                        {variant.label} · {translate("Stock inayopatikana", language)}: {variant.stock_quantity}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
               <label className="field-label" htmlFor="buyer-name">Jina la mnunuzi</label>
               <input id="buyer-name" className="text-input" autoComplete="name" required minLength={2} value={form.buyer_name} onChange={(event) => setForm({ ...form, buyer_name: event.target.value })} />
               <label className="field-label" htmlFor="buyer-email">Barua pepe ya risiti</label>
@@ -2250,9 +2470,9 @@ function CheckoutPage({ productId }) {
                 </fieldset>
               )}
               {error && <p className="form-error" role="alert">{error}</p>}
-              <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
+              <button className="generate-button" type="submit" disabled={busy || (productVariants.length > 0 && (!selectedVariant || selectedVariant.stock_quantity <= 0))}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
             </form>
-            <button className="cart-secondary-button" type="button" onClick={addToCart}>Ongeza bidhaa nyingine kwenye kikapu</button>
+            <button className="cart-secondary-button" type="button" onClick={addToCart} disabled={productVariants.length > 0 && (!selectedVariant || selectedVariant.stock_quantity <= 0)}>Ongeza bidhaa nyingine kwenye kikapu</button>
             {cartCount > 0 && <a className="cart-link" href="/cart">Nenda kikapu ({cartCount})</a>}
             <p className="checkout-footnote">{isAblinerSelected ? "Malipo yatakusanywa kupitia Abliner kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : "Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji."}</p>
           </section>
@@ -2261,7 +2481,12 @@ function CheckoutPage({ productId }) {
           <section className="checkout-card">
             <div className="eyebrow"><span /> {order.demo ? "MALIPO YA MAJARIBIO" : order.payment_method === ABLINER_PAYMENT_METHOD ? "MALIPO YA ABLINER" : "MALIPO YA CLICKPESA"}</div>
             <h1>{order.demo ? "Thibitisha oda yako" : "Subiri ombi la malipo"}</h1>
-            <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
+            <div className="receipt-product">
+              <span>{order.variant_label
+                ? `${order.product_name || product?.name} — ${order.variant_label}`
+                : order.product_name || product?.name}</span>
+              <strong>TZS {formatMoney(order.amount)}</strong>
+            </div>
             {order.coupon_discount > 0 && <p className="field-hint">{translate("Punguzo la kuponi", language)} ({order.coupon_code}): TZS {formatMoney(order.coupon_discount)}</p>}
             <div className="payment-result pending">
               <strong>Haijalipwa bado</strong>
@@ -2292,7 +2517,12 @@ function CheckoutPage({ productId }) {
             <div className="receipt-success" aria-hidden="true">✓</div>
             <p className="receipt-kicker">{order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
             <h1>Oda imekamilika</h1>
-            <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
+            <div className="receipt-product">
+              <span>{order.variant_label
+                ? `${order.product_name || product?.name} — ${order.variant_label}`
+                : order.product_name || product?.name}</span>
+              <strong>TZS {formatMoney(order.amount)}</strong>
+            </div>
             <dl className="receipt-details">
               <div><dt>Namba ya oda</dt><dd>{order.order_id}</dd></div>
               <div><dt>Mnunuzi</dt><dd>{order.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
@@ -2397,6 +2627,14 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
     saveCart(next);
   }
 
+  function updateVariant(productId, variantId) {
+    const next = items.map((item) => item.product_id === productId
+      ? { ...item, variant_id: variantId }
+      : item);
+    setItems(next);
+    saveCart(next);
+  }
+
   function removeItem(productId) {
     const next = items.filter((item) => item.product_id !== productId);
     setItems(next);
@@ -2406,6 +2644,24 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   async function submitCart(event) {
     event.preventDefault();
     setError("");
+    const missingVariant = products.some((product) => (
+      product.variants?.length
+      && !items.find((item) => item.product_id === product.id)?.variant_id
+    ));
+    if (missingVariant) {
+      setError(translate("Chagua aina ya bidhaa.", language));
+      return;
+    }
+    const unavailableVariant = products.some((product) => {
+      if (!product.variants?.length) return false;
+      const item = items.find((row) => row.product_id === product.id);
+      const variant = product.variants.find((row) => row.id === item?.variant_id);
+      return !variant || variant.stock_quantity < (item?.quantity || 0);
+    });
+    if (unavailableVariant) {
+      setError(translate("Stock ya aina hii ya bidhaa haitoshi.", language));
+      return;
+    }
     setBusy(true);
     try {
       const result = await api("/cart/checkout", {
@@ -2421,6 +2677,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           items: items.map((item) => ({
             product_id: item.product_id,
             quantity: item.quantity,
+            variant_id: item.variant_id || null,
           })),
         }),
       });
@@ -2498,7 +2755,24 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               {products.length === 0 && <p className="buyer-intro">Kikapu kiko tupu. Scan QR ya bidhaa ili uongeze bidhaa.</p>}
               {products.map((product) => (
                 <div className="cart-row" key={product.id}>
-                  <div><strong>{product.name}</strong><span>Wauzaji: {product.shop_name}</span><small>TZS {formatMoney(product.amount)}</small></div>
+                  <div>
+                    <strong>{product.name}</strong><span>Wauzaji: {product.shop_name}</span><small>TZS {formatMoney(product.amount)}</small>
+                    {product.variants?.length > 0 && (
+                      <select
+                        className="text-input"
+                        aria-label={`${translate("Aina ya bidhaa", language)} ${product.name}`}
+                        value={items.find((item) => item.product_id === product.id)?.variant_id || ""}
+                        onChange={(event) => updateVariant(product.id, event.target.value)}
+                      >
+                        <option value="">Chagua aina ya bidhaa</option>
+                        {product.variants.map((variant) => (
+                          <option key={variant.id} value={variant.id} disabled={variant.stock_quantity <= 0}>
+                            {variant.label} · {translate("Stock inayopatikana", language)}: {variant.stock_quantity}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
                   <input aria-label={`Idadi ya ${product.name}`} className="cart-quantity" type="number" min="1" max="99" value={items.find((item) => item.product_id === product.id)?.quantity || 1} onChange={(event) => updateQuantity(product.id, Number(event.target.value) || 1)} />
                   <button type="button" onClick={() => removeItem(product.id)}>Ondoa</button>
                 </div>
@@ -2549,7 +2823,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               {checkout.splits.map((split) => (
                 <div className="cart-split" key={split.order_id}>
                   <strong>{split.shop_name}</strong>
-                  <span>{split.items.map((item) => `${item.quantity} x ${item.product_name} @ TZS ${formatMoney(item.unit_amount)} = TZS ${formatMoney(item.quantity * item.unit_amount)}`).join(", ")}</span>
+                  <span>{split.items.map((item) => `${item.quantity} x ${item.product_name}${item.variant_label ? ` (${item.variant_label})` : ""} @ TZS ${formatMoney(item.unit_amount)} = TZS ${formatMoney(item.quantity * item.unit_amount)}`).join(", ")}</span>
                   <b>TZS {formatMoney(split.amount)}</b>
                   <small>Kamisheni ({checkout.commission_percent}%): TZS {formatMoney(split.platform_fee)}</small>
                   <small>Mgao wa muuzaji baada ya kamisheni: TZS {formatMoney(split.seller_payout)}</small>
