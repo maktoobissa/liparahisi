@@ -186,32 +186,27 @@ admin routes) and verify cookies and HTTPS before routing users through it.
 
 ## Render deployment
 
-The Blueprint provisions Render Postgres with 40 GB of storage and the
-`0.1c-256mb` compute plan, plus a paid 256 MB Key Value instance. At current
-published prices these resources are approximately $28/month combined, before
-taxes or additional usage. Postgres storage cannot be reduced after it is
-increased. The 256 MB compute plan is intentionally the lowest-cost option;
-40 GB describes storage, not query capacity. The web service remains on the
-Free plan and in demo-payment mode.
+The Blueprint keeps the web service and the existing Postgres database on the
+Free plan. It does not create a paid Key Value instance or request additional
+database storage. The existing database currently has 1 GB of storage. The web
+service remains in demo-payment mode.
 
-1. Push the project to GitHub and open Render's **New > Blueprint** flow.
-2. Select the repository and review the resources and their current prices.
-3. Apply the Blueprint only after accepting the displayed database charge.
-4. In the web service's Environment page, reveal `ADMIN_SETUP_TOKEN` and use
+1. Push the project to GitHub and open the existing Render Blueprint.
+2. Confirm that syncing does not add paid resources before applying it.
+3. In the web service's Environment page, reveal `ADMIN_SETUP_TOKEN` and use
    it once to create the main administrator. Do not share that token.
-5. Sellers register from the app; the administrator approves each seller.
+4. Sellers register from the app; the administrator approves each seller.
 
 The service's `DATABASE_URL` is connected to the managed Postgres resource.
 The API reuses PostgreSQL connections through a per-process pool capped at
 five connections, and serves Vite's fingerprinted `/assets` files with
-long-lived browser caching. Anonymous public product-list responses are
-cached in Render Key Value for 15 seconds; account, seller, and payment
-responses are not cached. The Blueprint provisions a 256 MB Redis-compatible
-Key Value instance in the same region, configured for cache eviction with
-persistence disabled. Pooling and caching reduce avoidable work but do not
-remove Free web-service cold starts or establish capacity for 10,000
-concurrent users; that requires a separately provisioned staging environment
-and load testing against production-like infrastructure.
+long-lived browser caching. Redis product caching is optional and only runs
+when `REDIS_HOST` and `REDIS_PORT` are configured; they are intentionally
+unset on the no-cost deployment. Without Redis, product requests continue to
+work directly against Postgres. Pooling and static-asset caching do not remove
+Free web-service cold starts or establish capacity for 10,000 concurrent
+users; that requires a separately provisioned staging environment and load
+testing against production-like infrastructure.
 The QR contains a public product URL at `PUBLIC_APP_URL`; scanning it opens
 the product name, price, and available checkout methods. It does not contain
 payment credentials.
