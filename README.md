@@ -208,7 +208,8 @@ payment credentials.
 Render Free blocks outbound SMTP ports, so the FastAPI backend sends mail
 through Resend's official HTTPS email API. It sends verification and welcome
 messages, password-reset links, password-change alerts, payment-failure
-notices, and payment receipts. Emails have HTML and plain-text versions.
+notices and receipts to buyers, and sale-completion notices to sellers.
+Emails have HTML and plain-text versions.
 
 Configure each Render web service in **Environment**:
 

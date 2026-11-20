@@ -30,6 +30,7 @@ from backend.email_templates import (
     password_changed_email,
     password_reset_email,
     payment_email,
+    seller_payment_email,
     verification_email,
     welcome_email,
 )
@@ -1026,9 +1027,12 @@ def send_payment_notification(order_ids, failed=False, demo=False):
         for order_id in order_ids:
             row = connection.execute(
                 """
-                SELECT orders.*, products.name AS product_name
+                SELECT orders.*, products.name AS product_name,
+                       sellers.email AS seller_email,
+                       sellers.full_name AS seller_name
                 FROM orders
                 LEFT JOIN products ON products.id = orders.product_id
+                LEFT JOIN users AS sellers ON sellers.id = orders.seller_id
                 WHERE orders.order_id = ?
                 """,
                 (order_id,),
@@ -1046,7 +1050,7 @@ def send_payment_notification(order_ids, failed=False, demo=False):
         return False
     recipient = next(iter(recipients))
     full_name = orders[0].get("buyer_name") or "Mteja"
-    return send_app_email(
+    buyer_email_sent = send_app_email(
         "payment_failed" if failed else "payment_receipt",
         recipient,
         lambda app_url: payment_email(
@@ -1057,6 +1061,33 @@ def send_payment_notification(order_ids, failed=False, demo=False):
             demo=demo,
         ),
     )
+    if failed:
+        return buyer_email_sent
+
+    seller_orders = {}
+    for order in orders:
+        seller_email = (order.get("seller_email") or "").strip()
+        seller_id = order.get("seller_id")
+        if not seller_id or not seller_email:
+            logger.warning("Seller payment email skipped: seller email is unavailable.")
+            continue
+        seller_orders.setdefault(
+            (seller_id, seller_email.lower()),
+            {"email": seller_email, "name": order.get("seller_name") or "Muuzaji", "orders": []},
+        )["orders"].append(order)
+
+    for seller in seller_orders.values():
+        send_app_email(
+            "seller_payment_receipt",
+            seller["email"],
+            lambda app_url, seller=seller: seller_payment_email(
+                seller["name"],
+                seller["orders"],
+                app_url,
+                demo=demo,
+            ),
+        )
+    return buyer_email_sent
 
 
 def complete_order_group(order_ids, provider_verified=False):

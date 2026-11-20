@@ -567,13 +567,13 @@ class MarketplaceFlowTests(unittest.TestCase):
                 )
                 self.assertEqual(cart_completed.status_code, 200)
                 self.assertEqual(cart_completed.json()["payment_status"], "COMPLETED")
-                self.assertEqual(self.email_sender.call_count, 1)
+                self.assertEqual(self.email_sender.call_count, 2)
                 cart_split_order_id = cart_completed.json()["splits"][0]["order_id"]
                 repeated_cart_completion = buyer_client.post(
                     f"/api/checkouts/{cart['checkout_id']}/demo-complete"
                 )
                 self.assertEqual(repeated_cart_completion.status_code, 200)
-                self.assertEqual(self.email_sender.call_count, 1)
+                self.assertEqual(self.email_sender.call_count, 2)
                 checkout_payload = {
                     "request_key": "a" * 32,
                     "buyer_name": "Buyer One",
@@ -601,7 +601,7 @@ class MarketplaceFlowTests(unittest.TestCase):
                 completed = buyer_client.post(f"/api/orders/{order_id}/demo-complete")
                 self.assertEqual(completed.status_code, 200)
                 self.assertEqual(completed.json()["platform_fee"], 250)
-                self.assertEqual(self.email_sender.call_count, 1)
+                self.assertEqual(self.email_sender.call_count, 2)
 
                 class FakeClickPesaClient:
                     async def initiate_ussd_push(self, phone_number, amount, order_reference):
@@ -685,12 +685,15 @@ class MarketplaceFlowTests(unittest.TestCase):
                         json=callback_payload,
                     )
                     self.assertEqual(repeated_callback.status_code, 200, repeated_callback.text)
-                self.assertEqual(self.email_sender.call_count, 1)
-                self.assertEqual(
-                    self.email_sender.call_args.args[0],
-                    "buyer@example.com",
-                )
-                self.assertIn("Risiti", self.email_sender.call_args.args[1])
+                self.assertEqual(self.email_sender.call_count, 2)
+                sent_emails = {
+                    call.args[0]: call.args[1]
+                    for call in self.email_sender.call_args_list
+                }
+                self.assertIn("buyer@example.com", sent_emails)
+                self.assertIn("seller@example.com", sent_emails)
+                self.assertIn("Risiti", sent_emails["buyer@example.com"])
+                self.assertIn("Malipo ya mteja", sent_emails["seller@example.com"])
                 live_receipt = buyer_client.get(
                     f"/api/orders/{live_order_id}"
                 ).json()

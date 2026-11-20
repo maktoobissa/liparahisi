@@ -187,3 +187,44 @@ def payment_email(full_name, orders, frontend_url, failed=False, demo=False):
         frontend_url.rstrip("/") + "/",
         details,
     )
+
+
+def seller_payment_email(full_name, orders, frontend_url, demo=False):
+    order_ids = ", ".join(order["order_id"] for order in orders)
+    product_names = ", ".join(
+        dict.fromkeys(order.get("product_name") or "Bidhaa" for order in orders)
+    )
+    total = sum(int(order["amount"]) for order in orders)
+    payment_method = ", ".join(
+        dict.fromkeys(order.get("payment_method") or "Haijaainishwa" for order in orders)
+    )
+    completed_at = next(
+        (
+            order.get("completed_at") or order.get("created_at")
+            for order in orders
+            if order.get("completed_at") or order.get("created_at")
+        ),
+        "Haijaainishwa",
+    )
+    paragraphs = [
+        "Malipo ya mteja kwa oda hizi yamekamilika. Hii ni taarifa ya mauzo, si uthibitisho wa kutumwa kwa fedha za mauzo kwako."
+    ]
+    if demo:
+        paragraphs.append("Hili lilikuwa jaribio la demo; hakuna fedha halisi zilizohamishwa.")
+    details = [
+        ("Namba ya oda", order_ids),
+        ("Bidhaa", product_names),
+        ("Jumla ya mauzo", f"TSh {total:,}"),
+        ("Njia ya malipo", payment_method),
+        ("Tarehe", completed_at),
+    ]
+    return _render_email(
+        "Malipo ya mteja yamekamilika — LipaRahisi",
+        full_name,
+        "Oda yako imelipiwa",
+        paragraphs,
+        frontend_url,
+        "Fungua LipaRahisi",
+        frontend_url.rstrip("/") + "/",
+        details,
+    )
