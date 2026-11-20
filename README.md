@@ -23,12 +23,15 @@ sales.
   add-to-cart, and direct checkout from the buyer feed.
 - Seller-managed delivery status, carrier, tracking code, and a separately
   collected delivery fee shown to buyers (not included in the product payment).
-- Buyer cancellation requests and return/refund requests for delivered orders,
-  with administrator resolution. Return approval records a decision only; no
-  payment is refunded or transferred by the system.
+- Buyer cancellation requests before shipment and return requests within seven
+  days after delivery, with administrator resolution. Return approval records
+  a decision only; no payment is refunded by the system.
 - Seller payout ledger that reconciles completed-order earnings against
   admin-recorded partial payments; entries document external transfers and
   never initiate one.
+- Admin-only system alerts for failed payment and email delivery attempts.
+- Admin-only, unpublished drafts for terms, privacy, and cancellation/return
+  policies; these require business details and legal review before publication.
 - Optional abandoned-checkout recovery: buyers can opt in to one reminder email
   after 24 hours, with an unsubscribe link. Only unpaid, expired checkouts are
   eligible; the email starts a new checkout because the old one has expired.
@@ -58,12 +61,15 @@ and pending order/checkout status is rechecked periodically. Browser
 notifications require the visitor's permission; sound can be muted in the app.
 The in-app notification list and unread counter are available while the page is
 open. Push delivery while the app is closed is not configured. Approved
-cancellation of a completed order restores stock only in demo mode; it does not
-issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
-checkout, but neither is connected to a live payment provider. Coupons are
-rejected when live payments are enabled. Abandoned-checkout reminders require
-buyer opt-in and an available email provider; Render Free service sleep or
-email-provider outages can delay delivery beyond 24 hours.
+cancellation is allowed only before shipment and restores stock only in demo
+mode; it does not issue a real payment refund. Return requests are accepted
+within seven days of delivery, but approval does not initiate a refund.
+M-Pesa and Halo Pesa can be selected in demo checkout, but neither is connected
+to a live payment provider. Coupons are rejected when live payments are
+enabled. Abandoned-checkout reminders require buyer opt-in and an available
+email provider; Render Free service sleep or email-provider outages can delay
+delivery beyond 24 hours. Payment/email failures are recorded in the admin
+alerts panel, and an email alert is attempted for active administrators.
 
 ## Payments
 
@@ -72,6 +78,10 @@ multi-seller cart. ClickPesa collects the total into the platform's merchant
 account. The app records the 5% platform commission and each seller's payout
 in its ledger, but does **not** transfer money to sellers; the platform must
 pay them manually and reconcile those payouts.
+
+Abliner is the selected provider for a future automatic seller-payout workflow,
+but automatic transfers are not implemented or enabled. The current ledger is
+manual; do not treat a recorded payout as proof of a provider transfer.
 
 Demo mode remains the default (`DEMO_MODE=true`), and the Render Blueprint
 keeps ClickPesa and Abliner live payments disabled. A successful demo checkout

@@ -14,7 +14,7 @@ import csv
 import io
 import unicodedata
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
@@ -33,7 +33,49 @@ from backend.email_delivery import (
     email_is_configured,
     email_provider,
 )
+
+
+def record_system_alert(alert_type, message):
+    alert_id = secrets.token_hex(16)
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO system_alerts (id, alert_type, message)
+            VALUES (?, ?, ?)
+            """,
+            (alert_id, alert_type, message),
+        )
+    return alert_id
+
+
+def send_system_alert_email(subject, message):
+    with db_connection() as connection:
+        admins = connection.execute(
+            """
+            SELECT email FROM users
+            WHERE role = 'ADMIN' AND status = 'ACTIVE' AND email <> ''
+            """
+        ).fetchall()
+    content = EmailContent(
+        subject=subject,
+        text=message,
+        html=f"<p>{message}</p>",
+    )
+    for admin in admins:
+        try:
+            send_smtp_email(
+                admin["email"],
+                content.subject,
+                content.text,
+                content.html,
+            )
+        except HTTPException as error:
+            logger.warning(
+                "Admin system-alert email failed (HTTP %s).",
+                error.status_code,
+            )
 from backend.email_templates import (
+    EmailContent,
     abandoned_checkout_email,
     password_changed_email,
     password_reset_email,
@@ -69,6 +111,7 @@ ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS = ORDER_TTL_SECONDS
 ABANDONED_CHECKOUT_REMINDER_POLL_SECONDS = 60
 ABANDONED_CHECKOUT_REMINDER_MAX_ATTEMPTS = 5
 ABANDONED_CHECKOUT_REMINDER_LEASE_SECONDS = 15 * 60
+RETURN_REQUEST_WINDOW_SECONDS = 7 * 24 * 60 * 60
 RESET_TOKEN_TTL_SECONDS = 60 * 60
 PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
@@ -421,6 +464,15 @@ def initialize_db():
                 ip_address TEXT NOT NULL DEFAULT '',
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS system_alerts (
+                id TEXT PRIMARY KEY,
+                alert_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                acknowledged_at {timestamp_type}
+            );
+            CREATE INDEX IF NOT EXISTS system_alerts_by_created
+                ON system_alerts(created_at DESC);
             CREATE TABLE IF NOT EXISTS login_attempts (
                 email TEXT PRIMARY KEY,
                 failed_count INTEGER NOT NULL DEFAULT 0,
@@ -1135,6 +1187,9 @@ def send_notification_email(event, to_email, content):
             event,
             error.status_code,
         )
+        message = "Barua pepe ya mfumo imeshindwa kutumwa."
+        record_system_alert("EMAIL_DELIVERY_FAILED", message)
+        send_system_alert_email("LipaRahisi: email imeshindwa", message)
         return False
     logger.info("Email notification sent: %s", event)
     return True
@@ -2074,6 +2129,10 @@ def send_payment_notification(order_ids, failed=False, demo=False):
                 orders.append(dict(row))
     if not orders:
         return False
+    if failed:
+        message = "Malipo ya checkout yameshindwa."
+        record_system_alert("PAYMENT_FAILED", message)
+        send_system_alert_email("LipaRahisi: malipo yameshindwa", message)
     recipients = {
         (order.get("buyer_email") or "").strip().lower()
         for order in orders
@@ -5638,6 +5697,19 @@ def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Reques
             and payload.delivery_status not in transitions.get(order["delivery_status"], set())
         ):
             raise HTTPException(status_code=409, detail="Hatua ya delivery haiwezi kurukwa au kurudishwa nyuma.")
+        if payload.delivery_status == "SHIPPED":
+            pending_cancellation = connection.execute(
+                """
+                SELECT 1 FROM cancellation_requests
+                WHERE order_id = ? AND status = 'PENDING'
+                """,
+                (order_id,),
+            ).fetchone()
+            if pending_cancellation:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Tatua ombi la kughairi kabla ya kusafirisha oda.",
+                )
         connection.execute(
             """
             UPDATE orders
@@ -5680,12 +5752,19 @@ def request_cancellation(order_id: str, payload: CancellationInput, request: Req
             (order_id, buyer["id"]),
         )
         order = connection.execute(
-            "SELECT buyer_id, payment_status, cancelled_at FROM orders WHERE order_id = ?",
+            """
+            SELECT buyer_id, payment_status, delivery_status, cancelled_at
+            FROM orders WHERE order_id = ?
+            """,
             (order_id,),
         ).fetchone()
         if order is None or order["buyer_id"] != buyer["id"]:
             raise HTTPException(status_code=404, detail="Oda haikupatikana.")
-        if order["cancelled_at"] or order["payment_status"] not in {"PENDING", "COMPLETED"}:
+        if (
+            order["cancelled_at"]
+            or order["payment_status"] not in {"PENDING", "COMPLETED"}
+            or order["delivery_status"] in {"SHIPPED", "DELIVERED"}
+        ):
             raise HTTPException(status_code=409, detail="Oda hii haiwezi kuombewa kughairiwa.")
         return_request = connection.execute(
             "SELECT status FROM return_requests WHERE order_id = ?",
@@ -5723,7 +5802,7 @@ def resolve_cancellation(
         cancellation = connection.execute(
             """
             SELECT c.order_id, c.status, o.payment_status, o.product_id,
-                   o.seller_id, o.checkout_id
+                   o.seller_id, o.checkout_id, o.delivery_status
             FROM cancellation_requests c
             JOIN orders o ON o.order_id = c.order_id
             WHERE c.id = ?
@@ -5735,6 +5814,11 @@ def resolve_cancellation(
         if cancellation["status"] != "PENDING":
             raise HTTPException(status_code=409, detail="Ombi hili limeshughulikiwa tayari.")
         if payload.status == "APPROVED":
+            if cancellation["delivery_status"] in {"SHIPPED", "DELIVERED"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Oda imeshasafirishwa; shughulikia ombi la marejesho badala ya kughairi.",
+                )
             if cancellation["payment_status"] == "COMPLETED":
                 if not is_demo_mode():
                     raise HTTPException(status_code=409, detail="Refund ya malipo halisi haijaunganishwa.")
@@ -5840,7 +5924,7 @@ def request_return(order_id: str, payload: ReturnRequestInput, request: Request)
         )
         order = connection.execute(
             """
-            SELECT payment_status, delivery_status, cancelled_at
+            SELECT payment_status, delivery_status, delivered_at, cancelled_at
             FROM orders
             WHERE order_id = ? AND buyer_id = ?
             """,
@@ -5856,6 +5940,25 @@ def request_return(order_id: str, payload: ReturnRequestInput, request: Request)
             raise HTTPException(
                 status_code=409,
                 detail="Ombi la kurejesha linapatikana baada ya oda iliyolipiwa kufikishwa.",
+            )
+        delivered_at = order["delivered_at"]
+        if not delivered_at:
+            raise HTTPException(
+                status_code=409,
+                detail="Muda wa delivery haujarekodiwa; wasiliana na msaada kuhusu ombi la marejesho.",
+            )
+        if isinstance(delivered_at, str):
+            delivered_at = datetime.fromisoformat(
+                delivered_at.replace("Z", "+00:00")
+            )
+        if delivered_at.tzinfo is None:
+            delivered_at = delivered_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > delivered_at + timedelta(
+            seconds=RETURN_REQUEST_WINDOW_SECONDS
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Muda wa siku 7 wa kuomba marejesho umeisha.",
             )
         cancellation = connection.execute(
             "SELECT status FROM cancellation_requests WHERE order_id = ?",
@@ -6442,6 +6545,47 @@ def list_audit(request: Request):
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_system_alerts(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, alert_type, message, created_at, acknowledged_at
+            FROM system_alerts
+            ORDER BY created_at DESC
+            LIMIT 200
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def acknowledge_system_alert(alert_id: str, request: Request):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE system_alerts SET acknowledged_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND acknowledged_at IS NULL
+            """,
+            (alert_id,),
+        )
+        if result.rowcount == 0:
+            exists = connection.execute(
+                "SELECT 1 FROM system_alerts WHERE id = ?",
+                (alert_id,),
+            ).fetchone()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Arifa haikupatikana.")
+    record_audit(
+        "SYSTEM_ALERT_ACKNOWLEDGED",
+        "system_alert",
+        alert_id,
+        actor=actor,
+        request=request,
+    )
+    return {"id": alert_id, "acknowledged": True}
 
 
 def export_sales(request: Request):

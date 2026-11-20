@@ -139,6 +139,72 @@ class MarketplaceFlowTests(unittest.TestCase):
         main.DATABASE_PATH = self.original_database_path
         self.temp_dir.cleanup()
 
+    def test_admin_system_alerts_record_email_failures_and_are_private(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+
+        with patch.object(
+            main,
+            "send_smtp_email",
+            side_effect=main.HTTPException(status_code=502, detail="Resend rejected"),
+        ):
+            self.assertFalse(
+                main.send_notification_email(
+                    "payment_receipt",
+                    "buyer@example.com",
+                    main.EmailContent(
+                        subject="Receipt",
+                        text="Receipt text",
+                        html="<p>Receipt</p>",
+                    ),
+                )
+            )
+
+        alerts = self.client.get("/api/admin/system-alerts")
+        self.assertEqual(alerts.status_code, 200, alerts.text)
+        email_alert = next(
+            item for item in alerts.json()
+            if item["alert_type"] == "EMAIL_DELIVERY_FAILED"
+        )
+        self.assertEqual(email_alert["message"], "Barua pepe ya mfumo imeshindwa kutumwa.")
+        acknowledged = self.client.patch(
+            f"/api/admin/system-alerts/{email_alert['id']}"
+        )
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+        self.assertTrue(acknowledged.json()["acknowledged"])
+
+        buyer_registration = self.client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Buyer One",
+                "email": "buyer@example.com",
+                "password": "buyer-password-long",
+            },
+        )
+        self.assertEqual(buyer_registration.status_code, 201)
+        buyer_client = TestClient(main.app)
+        with buyer_client:
+            login = buyer_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "buyer@example.com",
+                    "password": "buyer-password-long",
+                },
+            )
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(
+                buyer_client.get("/api/admin/system-alerts").status_code,
+                403,
+            )
+
     def test_frontend_public_files_are_served(self):
         for path in ("manifest.webmanifest", "sw.js"):
             expected = (main.FRONTEND_DIST / path).read_bytes()
@@ -923,8 +989,16 @@ class MarketplaceFlowTests(unittest.TestCase):
                     failed_order["provider_reference"],
                     "FAILED",
                 )
-                self.assertEqual(self.email_sender.call_count, 1)
+                self.assertEqual(self.email_sender.call_count, 2)
                 self.assertIn("hayakukamilika", self.email_sender.call_args.args[1].lower())
+                payment_alerts = self.client.get("/api/admin/system-alerts")
+                self.assertEqual(payment_alerts.status_code, 200)
+                self.assertTrue(
+                    any(
+                        alert["alert_type"] == "PAYMENT_FAILED"
+                        for alert in payment_alerts.json()
+                    )
+                )
                 with main.db_connection() as connection:
                     connection.execute(
                         "DELETE FROM orders WHERE order_id = ?",
@@ -1673,6 +1747,31 @@ class MarketplaceFlowTests(unittest.TestCase):
             self.assertEqual(delivery.json()["delivery_carrier"], "DHL")
             self.assertEqual(delivery.json()["tracking_code"], "TRACK-1")
             self.assertEqual(delivery.json()["delivery_fee"], 3500)
+            pre_ship_cancellation = buyer_client.post(
+                f"/api/orders/{order_id}/cancellation",
+                json={"reason": "Nataka kusitisha kabla ya kusafirishwa."},
+            )
+            self.assertEqual(pre_ship_cancellation.status_code, 200)
+            cancellation_row = next(
+                row
+                for row in self.client.get("/api/admin/cancellations").json()
+                if row["id"] == pre_ship_cancellation.json()["id"]
+            )
+            blocked_shipment = seller_client.put(
+                f"/api/orders/{order_id}/delivery",
+                json={
+                    "delivery_status": "SHIPPED",
+                    "delivery_carrier": "DHL",
+                    "tracking_code": "TRACK-1",
+                    "delivery_fee": 3500,
+                },
+            )
+            self.assertEqual(blocked_shipment.status_code, 409)
+            rejected_cancellation = self.client.patch(
+                f"/api/admin/cancellations/{cancellation_row['id']}",
+                json={"status": "REJECTED", "admin_note": "Inaweza kusafirishwa."},
+            )
+            self.assertEqual(rejected_cancellation.status_code, 200)
             premature_return = buyer_client.post(
                 f"/api/orders/{order_id}/return",
                 json={"reason": "Bidhaa imeharibika"},
@@ -1724,6 +1823,21 @@ class MarketplaceFlowTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(updated_delivery.status_code, 200)
+            with main.db_connection() as connection:
+                connection.execute(
+                    "UPDATE orders SET delivered_at = ? WHERE order_id = ?",
+                    ("2000-01-01 00:00:00", order_id),
+                )
+            expired_return = buyer_client.post(
+                f"/api/orders/{order_id}/return",
+                json={"reason": "Nimegundua tatizo baada ya muda."},
+            )
+            self.assertEqual(expired_return.status_code, 409)
+            with main.db_connection() as connection:
+                connection.execute(
+                    "UPDATE orders SET delivered_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+                    (order_id,),
+                )
             return_request = buyer_client.post(
                 f"/api/orders/{order_id}/return",
                 json={"reason": "Bidhaa ilifika ikiwa imeharibika"},
@@ -1899,7 +2013,11 @@ class MarketplaceFlowTests(unittest.TestCase):
             json={"reason": "Nimebadilisha uamuzi kuhusu oda."},
         )
         self.assertEqual(cancellation.status_code, 200)
-        cancellation_row = self.client.get("/api/admin/cancellations").json()[0]
+        cancellation_row = next(
+            row
+            for row in self.client.get("/api/admin/cancellations").json()
+            if row["id"] == cancellation.json()["id"]
+        )
         self.assertEqual(
             self.client.patch(
                 f"/api/admin/cancellations/{cancellation_row['id']}",

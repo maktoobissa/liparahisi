@@ -13,6 +13,7 @@ from backend.main import (
     SupportTicketUpdateInput,
     SupportTicketInput,
     connect_db,
+    acknowledge_system_alert,
     create_coupon,
     create_support_ticket,
     export_sales,
@@ -21,6 +22,7 @@ from backend.main import (
     list_coupons,
     list_reviews,
     list_sellers,
+    list_system_alerts,
     list_return_requests,
     list_support_tickets,
     moderate_review,
@@ -100,6 +102,19 @@ def set_seller_status(
 @app.get("/audit", dependencies=[Depends(verify_gateway_token)])
 def audit(request: Request):
     return list_audit(request)
+
+
+@app.get("/system-alerts", dependencies=[Depends(verify_gateway_token)])
+def system_alerts(request: Request):
+    return list_system_alerts(request)
+
+
+@app.patch(
+    "/system-alerts/{alert_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def system_alert_acknowledge(alert_id: str, request: Request):
+    return acknowledge_system_alert(alert_id, request)
 
 
 @app.get("/export/sales", dependencies=[Depends(verify_gateway_token)])

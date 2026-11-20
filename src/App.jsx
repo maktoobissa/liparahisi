@@ -865,6 +865,7 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [payoutData, setPayoutData] = useState({ accounts: [], entries: [] });
   const [reviews, setReviews] = useState([]);
   const [tickets, setTickets] = useState([]);
+  const [systemAlerts, setSystemAlerts] = useState([]);
   const [coupons, setCoupons] = useState([]);
   const [couponForm, setCouponForm] = useState({
     code: "",
@@ -931,13 +932,14 @@ function MarketplaceDashboard({ user, onLogout }) {
     setLowStock(await api("/inventory/low-stock"));
     if (isAdmin) setAuditRows(await api("/admin/audit"));
     if (isAdmin) {
-      const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows, couponRows] = await Promise.all([
+      const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows, couponRows, alertRows] = await Promise.all([
         api("/admin/sellers"),
         api("/admin/cancellations"),
         api("/admin/returns"),
         api("/admin/reviews"),
         api("/admin/support-tickets"),
         api("/admin/coupons"),
+        api("/admin/system-alerts"),
       ]);
       setSellers(sellerRows);
       setCancellations(cancellationRows);
@@ -945,6 +947,7 @@ function MarketplaceDashboard({ user, onLogout }) {
       setReviews(reviewRows);
       setTickets(ticketRows);
       setCoupons(couponRows);
+      setSystemAlerts(alertRows);
       if (!seenAdminEventsRef.current) {
         seenAdminEventsRef.current = new Set(adminEventKeys([
           ["seller", sellerRows],
@@ -952,6 +955,7 @@ function MarketplaceDashboard({ user, onLogout }) {
           ["return", returnRows],
           ["review", reviewRows],
           ["ticket", ticketRows],
+          ["alert", alertRows],
         ]));
       }
     }
@@ -979,6 +983,7 @@ function MarketplaceDashboard({ user, onLogout }) {
             api("/admin/returns"),
             api("/admin/reviews"),
             api("/admin/support-tickets"),
+            api("/admin/system-alerts"),
           ]) : Promise.resolve(null),
         ]);
         if (active) {
@@ -991,18 +996,20 @@ function MarketplaceDashboard({ user, onLogout }) {
           seenSalesRef.current = knownSales;
           if (newSales.length) notify("Oda mpya imepokelewa.", "info");
           if (adminData) {
-            const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows] = adminData;
+            const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows, alertRows] = adminData;
             setSellers(sellerRows);
             setCancellations(cancellationRows);
             setReturnRequests(returnRows);
             setReviews(reviewRows);
             setTickets(ticketRows);
+            setSystemAlerts(alertRows);
             const eventRows = [
               ["seller", sellerRows],
               ["cancellation", cancellationRows],
               ["return", returnRows],
               ["review", reviewRows],
               ["ticket", ticketRows],
+              ["alert", alertRows],
             ];
             const knownEvents = seenAdminEventsRef.current || new Set(adminEventKeys(eventRows));
             const currentKeys = adminEventKeys(eventRows);
@@ -1410,6 +1417,15 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function acknowledgeSystemAlert(id) {
+    try {
+      await api(`/admin/system-alerts/${encodeURIComponent(id)}`, { method: "PATCH" });
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function moderateReview(id, status) {
     try {
       await api(`/admin/reviews/${id}`, {
@@ -1508,6 +1524,7 @@ function MarketplaceDashboard({ user, onLogout }) {
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
     ...(isAdmin ? [["categories", "Makundi"], ["coupons", "Kuponi"], ["cancellations", "Kughairi"], ["returns", "Marejesho"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
     ...(isAdmin ? [["audit", "Audit"]] : []),
+    ...(isAdmin ? [["alerts", `Arifa za mfumo${systemAlerts.some((alert) => !alert.acknowledged_at) ? ` (${systemAlerts.filter((alert) => !alert.acknowledged_at).length})` : ""}`], ["policies", "Sera (rasimu)"]] : []),
     ["settings", "Akaunti"],
   ];
 
@@ -1980,6 +1997,54 @@ function MarketplaceDashboard({ user, onLogout }) {
               </table>
             </div>
           ) : <p className="empty-state">Bado hakuna rekodi za audit.</p>}
+        </section>
+      )}
+
+      {tab === "alerts" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <h2>{translate("Arifa za mfumo", language)}</h2>
+          {systemAlerts.map((alert) => (
+            <article className="seller-card" key={alert.id}>
+              <div>
+                <strong>{translate(alert.alert_type, language)}</strong>
+                <span>{translate(alert.message, language)}</span>
+                <small>{alert.created_at}</small>
+              </div>
+              {alert.acknowledged_at
+                ? <small>{translate("Imeshughulikiwa", language)}</small>
+                : <button className="table-action" type="button" onClick={() => acknowledgeSystemAlert(alert.id)}>{translate("Weka imeshughulikiwa", language)}</button>}
+            </article>
+          ))}
+          {!systemAlerts.length && <p className="empty-state">{translate("Hakuna arifa za mfumo.", language)}</p>}
+        </section>
+      )}
+
+      {tab === "policies" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <div className="demo-notice dashboard-notice">
+            <p><strong>{translate("RASIMU — HAIJACHAPISHWA", language)}</strong> {translate("Kurasa hizi ni rasimu za ukaguzi wa admin pekee; hazijawekwa hadharani.", language)}</p>
+            <p>{translate("Jaza jina la kisheria la biashara na mawasiliano ya msaada, kisha pata ukaguzi wa kisheria kabla ya kuchapisha.", language)}</p>
+          </div>
+          <article className="seller-card"><div><strong>{translate("Masharti ya matumizi", language)}</strong><ul>
+            <li>{translate("Marketplace huunganisha wanunuzi na wauzaji; muuzaji anawajibika kwa maelezo na stock ya bidhaa.", language)}</li>
+            <li>{translate("Bei ya delivery huwekwa tofauti na malipo ya bidhaa na huonyeshwa kwa mnunuzi.", language)}</li>
+            <li>{translate("Demo mode haihamishi pesa; PIN au OTP haipaswi kuingizwa kwenye tovuti.", language)}</li>
+          </ul></div></article>
+          <article className="seller-card"><div><strong>{translate("Sera ya faragha", language)}</strong><ul>
+            <li>{translate("Data inayokusanywa: jina, email, simu, anuani ya delivery, oda na ujumbe wa msaada.", language)}</li>
+            <li>{translate("Data hutumika kuendesha akaunti, malipo, ufuatiliaji wa oda na msaada.", language)}</li>
+            <li>{translate("Bainisha muda wa kuhifadhi data, ombi la nakala au kufuta data, na mawasiliano ya kampuni.", language)}</li>
+          </ul></div></article>
+          <article className="seller-card"><div><strong>{translate("Cancellation na refund", language)}</strong><ul>
+            <li>{translate("Cancellation inaruhusiwa kabla oda haijasafirishwa.", language)}</li>
+            <li>{translate("Ombi la return litumwe ndani ya siku 7 tangu delivery na litapitiwa na admin.", language)}</li>
+            <li>{translate("Approval ya return ni uamuzi tu; mfumo hautoi refund ya pesa halisi moja kwa moja.", language)}</li>
+          </ul></div></article>
+          <article className="seller-card"><div><strong>{translate("Delivery na payout", language)}</strong><ul>
+            <li>{translate("Muuzaji huingiza hatua za delivery, kampuni ya usafirishaji na tracking code kwa mikono.", language)}</li>
+            <li>{translate("Payout ya Abliner inalengwa baada ya siku 7 tangu delivery bila dispute inayosubiri.", language)}</li>
+            <li>{translate("Uhamisho wa payout haujawashwa; unahitaji KYC, salio la wallet, API na ratiba ya kuaminika.", language)}</li>
+          </ul></div></article>
         </section>
       )}
 
