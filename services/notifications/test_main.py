@@ -76,6 +76,7 @@ class NotificationServiceTests(unittest.TestCase):
     def test_outbox_sends_using_resend_http_api(self):
         client = MagicMock()
         client.__enter__.return_value = client
+        html = "<p>Reset link</p>"
         with patch.dict(
             os.environ,
             {
@@ -90,6 +91,7 @@ class NotificationServiceTests(unittest.TestCase):
                     "recipient": "buyer@example.com",
                     "subject": "Reset password",
                     "body": "Reset link",
+                    "html_body": html,
                 })
 
         client.post.assert_called_once_with(
@@ -100,6 +102,7 @@ class NotificationServiceTests(unittest.TestCase):
                 "to": ["buyer@example.com"],
                 "subject": "Reset password",
                 "text": "Reset link",
+                "html": html,
             },
         )
 

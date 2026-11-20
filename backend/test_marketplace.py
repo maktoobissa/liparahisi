@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -11,6 +12,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from backend import main
+from backend.clickpesa import create_payload_checksum
 from services.admin.main import app as admin_app
 from services.catalog.main import app as catalog_app
 from services.identity.main import app as identity_app
@@ -84,10 +86,19 @@ class MarketplaceFlowTests(unittest.TestCase):
                 "ORDERS_SERVICE_URL": "http://orders",
                 "DATABASE_URL": "",
                 "DEMO_MODE": "true",
+                "EMAIL_PROVIDER": "resend",
+                "RESEND_API_KEY": "",
+                "EMAIL_FROM": "",
+                "NOTIFICATION_SERVICE_URL": "",
+                "NOTIFICATION_SERVICE_TOKEN": "",
+                "FRONTEND_URL": "",
+                "PUBLIC_APP_URL": "",
             },
             clear=False,
         )
         self.environment.start()
+        self.email_sender_patch = patch("backend.main.send_smtp_email")
+        self.email_sender = self.email_sender_patch.start()
         self.admin_client_patch = patch(
             "backend.main.create_admin_service_client",
             InProcessAdminClient,
@@ -117,6 +128,7 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.identity_client_patch.stop()
         self.admin_client_patch.stop()
         self.catalog_client_patch.stop()
+        self.email_sender_patch.stop()
         self.environment.stop()
         main.DATABASE_PATH = self.original_database_path
         self.temp_dir.cleanup()
@@ -196,6 +208,19 @@ class MarketplaceFlowTests(unittest.TestCase):
             },
         )
         self.assertEqual(registration.status_code, 201)
+        self.assertEqual(self.email_sender.call_count, 1)
+        verification_message = self.email_sender.call_args.args[2]
+        verification_match = re.search(
+            r"/verify-email\?token=([A-Za-z0-9_-]+)",
+            verification_message,
+        )
+        self.assertIsNotNone(verification_match)
+        verified = self.client.get(
+            "/api/auth/verify-email",
+            params={"token": verification_match.group(1)},
+        )
+        self.assertEqual(verified.status_code, 200)
+        self.assertEqual(self.email_sender.call_count, 2)
 
         current_client = TestClient(main.app)
         other_client = TestClient(main.app)
@@ -221,6 +246,11 @@ class MarketplaceFlowTests(unittest.TestCase):
                 },
             )
             self.assertEqual(changed.status_code, 200)
+            self.assertIn("nenosiri", self.email_sender.call_args.args[1].lower())
+            self.assertNotIn(
+                "buyer-new-password-long",
+                self.email_sender.call_args.args[2],
+            )
             self.assertNotEqual(
                 old_token,
                 current_client.cookies.get(main.SESSION_COOKIE),
@@ -250,6 +280,7 @@ class MarketplaceFlowTests(unittest.TestCase):
                 },
             )
             self.assertEqual(reset.status_code, 200)
+            self.assertEqual(self.email_sender.call_count, 4)
             self.assertIsNone(current_client.get("/api/auth/status").json()["user"])
 
     def test_csv_formula_cells_are_neutralized(self):
@@ -273,7 +304,22 @@ class MarketplaceFlowTests(unittest.TestCase):
     def test_integration_status_and_password_reset(self):
         status = self.client.get("/api/config/integrations").json()
         self.assertFalse(status["live_payments_enabled"])
+        self.assertFalse(status["clickpesa_live_enabled"])
         self.assertFalse(status["smtp_configured"])
+        with patch.dict(
+            os.environ,
+            {
+                "DEMO_MODE": "false",
+                "CLICKPESA_CLIENT_ID": "clickpesa-client",
+                "CLICKPESA_API_KEY": "clickpesa-key",
+                "CLICKPESA_CHECKSUM_KEY": "clickpesa-checksum",
+                "CLICKPESA_LIVE_ENABLED": "true",
+                "CLICKPESA_MANUAL_PAYOUTS_CONFIRMED": "true",
+            },
+        ):
+            enabled_status = self.client.get("/api/config/integrations").json()
+        self.assertTrue(enabled_status["live_payments_enabled"])
+        self.assertTrue(enabled_status["clickpesa_live_enabled"])
 
         setup = self.client.post(
             "/api/auth/setup",
@@ -285,11 +331,91 @@ class MarketplaceFlowTests(unittest.TestCase):
             },
         )
         self.assertEqual(setup.status_code, 200)
+        self.email_sender.reset_mock()
         reset_request = self.client.post(
             "/api/auth/password-reset/request",
             json={"email": "admin@example.com"},
         )
-        self.assertEqual(reset_request.status_code, 503)
+        unknown_reset_request = self.client.post(
+            "/api/auth/password-reset/request",
+            json={"email": "missing@example.com"},
+        )
+        self.assertEqual(reset_request.status_code, 200)
+        self.assertEqual(unknown_reset_request.status_code, 200)
+        self.assertEqual(
+            reset_request.json()["message"],
+            unknown_reset_request.json()["message"],
+        )
+        self.assertEqual(self.email_sender.call_count, 1)
+
+    def test_password_reset_throttle_failure_and_expired_token(self):
+        registration = self.client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Reset Buyer",
+                "email": "reset-buyer@example.com",
+                "password": "reset-buyer-password-long",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        self.email_sender.reset_mock()
+
+        request_payload = {"email": "reset-buyer@example.com"}
+        first_request = self.client.post(
+            "/api/auth/password-reset/request",
+            json=request_payload,
+        )
+        repeat_request = self.client.post(
+            "/api/auth/password-reset/request",
+            json=request_payload,
+        )
+        self.assertEqual(first_request.status_code, 200)
+        self.assertEqual(
+            first_request.json()["message"],
+            repeat_request.json()["message"],
+        )
+        self.assertEqual(self.email_sender.call_count, 1)
+        reset_text = self.email_sender.call_args.args[2]
+        token_match = re.search(r"/reset-password\?token=([A-Za-z0-9_-]+)", reset_text)
+        self.assertIsNotNone(token_match)
+
+        with main.db_connection() as connection:
+            connection.execute(
+                "UPDATE users SET reset_expires = ? WHERE email = ?",
+                (time.time() - 1, "reset-buyer@example.com"),
+            )
+        expired = self.client.post(
+            "/api/auth/password-reset/confirm",
+            json={
+                "reset_token": token_match.group(1),
+                "new_password": "reset-buyer-new-password",
+            },
+        )
+        self.assertEqual(expired.status_code, 400)
+
+        with main.db_connection() as connection:
+            connection.execute(
+                """
+                UPDATE users
+                SET reset_token_hash = '', reset_expires = 0
+                WHERE email = ?
+                """,
+                ("reset-buyer@example.com",),
+            )
+        self.email_sender.side_effect = main.HTTPException(
+            status_code=502,
+            detail="Provider response containing private data",
+        )
+        failed_delivery = self.client.post(
+            "/api/auth/password-reset/request",
+            json=request_payload,
+        )
+        self.assertEqual(failed_delivery.status_code, 200)
+        self.assertEqual(
+            first_request.json()["message"],
+            failed_delivery.json()["message"],
+        )
+        self.assertNotIn("private data", failed_delivery.text)
 
     def test_seller_approval_sales_commission_and_archive_isolation(self):
         status = self.client.get("/api/auth/status").json()
@@ -435,12 +561,19 @@ class MarketplaceFlowTests(unittest.TestCase):
                 ).json()
                 self.assertEqual(cart_status["total_amount"], 10000)
                 self.assertEqual(len(cart_status["splits"]), 1)
+                self.email_sender.reset_mock()
                 cart_completed = buyer_client.post(
                     f"/api/checkouts/{cart['checkout_id']}/demo-complete"
                 )
                 self.assertEqual(cart_completed.status_code, 200)
                 self.assertEqual(cart_completed.json()["payment_status"], "COMPLETED")
+                self.assertEqual(self.email_sender.call_count, 1)
                 cart_split_order_id = cart_completed.json()["splits"][0]["order_id"]
+                repeated_cart_completion = buyer_client.post(
+                    f"/api/checkouts/{cart['checkout_id']}/demo-complete"
+                )
+                self.assertEqual(repeated_cart_completion.status_code, 200)
+                self.assertEqual(self.email_sender.call_count, 1)
                 checkout_payload = {
                     "request_key": "a" * 32,
                     "buyer_name": "Buyer One",
@@ -464,13 +597,181 @@ class MarketplaceFlowTests(unittest.TestCase):
                 receipt = buyer_client.get(f"/api/orders/{order_id}").json()
                 self.assertEqual(receipt["payment_status"], "PENDING")
                 self.assertNotIn("bank_branch", receipt)
+                self.email_sender.reset_mock()
                 completed = buyer_client.post(f"/api/orders/{order_id}/demo-complete")
                 self.assertEqual(completed.status_code, 200)
                 self.assertEqual(completed.json()["platform_fee"], 250)
+                self.assertEqual(self.email_sender.call_count, 1)
+
+                class FakeClickPesaClient:
+                    async def initiate_ussd_push(self, phone_number, amount, order_reference):
+                        if phone_number != "255712345678" or amount != 5000:
+                            raise AssertionError("Unexpected ClickPesa payment arguments.")
+                        return {
+                            "id": "clickpesa-payment-id",
+                            "status": "PROCESSING",
+                            "orderReference": order_reference,
+                        }
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "DEMO_MODE": "false",
+                        "CLICKPESA_CLIENT_ID": "clickpesa-client",
+                        "CLICKPESA_API_KEY": "clickpesa-key",
+                        "CLICKPESA_CHECKSUM_KEY": "clickpesa-checksum",
+                        "CLICKPESA_LIVE_ENABLED": "true",
+                        "CLICKPESA_MANUAL_PAYOUTS_CONFIRMED": "true",
+                    },
+                ), patch(
+                    "backend.main.get_clickpesa_client",
+                    return_value=FakeClickPesaClient(),
+                ):
+                    live_checkout = buyer_client.post(
+                        f"/api/products/{product_id}/checkout",
+                        json={
+                            **checkout_payload,
+                            "request_key": "d" * 32,
+                            "payment_method": "M-Pesa",
+                        },
+                    )
+                self.assertEqual(live_checkout.status_code, 200, live_checkout.text)
+                self.assertFalse(live_checkout.json()["demo"])
+                self.assertEqual(live_checkout.json()["payment_status"], "PENDING")
+                live_order_id = live_checkout.json()["order_id"]
+                with main.db_connection() as connection:
+                    live_order = connection.execute(
+                        "SELECT provider_reference, checkout_url FROM orders WHERE order_id = ?",
+                        (live_order_id,),
+                    ).fetchone()
+                    stock_before_callback = connection.execute(
+                        "SELECT stock_quantity FROM products WHERE id = ?",
+                        (product_id,),
+                    ).fetchone()["stock_quantity"]
+                self.assertTrue(live_order["provider_reference"].startswith("LR"))
+                self.assertNotIn("&demo=1", live_order["checkout_url"])
+
+                callback_payload = {
+                    "event": "PAYMENT RECEIVED",
+                    "data": {
+                        "id": "clickpesa-payment-id",
+                        "status": "SUCCESS",
+                        "orderReference": live_order["provider_reference"],
+                        "collectedAmount": "5000",
+                        "collectedCurrency": "TZS",
+                        "paymentReference": "clickpesa-reference",
+                        "clientId": "clickpesa-client",
+                    },
+                }
+                callback_payload["checksum"] = create_payload_checksum(
+                    "clickpesa-checksum",
+                    callback_payload,
+                )
+                self.email_sender.reset_mock()
+                with patch.dict(
+                    os.environ,
+                    {
+                        "CLICKPESA_CLIENT_ID": "clickpesa-client",
+                        "CLICKPESA_CHECKSUM_KEY": "clickpesa-checksum",
+                    },
+                ):
+                    callback = buyer_client.post(
+                        "/api/webhooks/clickpesa",
+                        json=callback_payload,
+                    )
+                    self.assertEqual(callback.status_code, 200, callback.text)
+                    repeated_callback = buyer_client.post(
+                        "/api/webhooks/clickpesa",
+                        json=callback_payload,
+                    )
+                    self.assertEqual(repeated_callback.status_code, 200, repeated_callback.text)
+                self.assertEqual(self.email_sender.call_count, 1)
+                self.assertEqual(
+                    self.email_sender.call_args.args[0],
+                    "buyer@example.com",
+                )
+                self.assertIn("Risiti", self.email_sender.call_args.args[1])
+                live_receipt = buyer_client.get(
+                    f"/api/orders/{live_order_id}"
+                ).json()
+                self.assertEqual(live_receipt["payment_status"], "COMPLETED")
+                with main.db_connection() as connection:
+                    stock_after_callback = connection.execute(
+                        "SELECT stock_quantity FROM products WHERE id = ?",
+                        (product_id,),
+                    ).fetchone()["stock_quantity"]
+                self.assertEqual(stock_after_callback, stock_before_callback - 1)
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "DEMO_MODE": "false",
+                        "CLICKPESA_CLIENT_ID": "clickpesa-client",
+                        "CLICKPESA_API_KEY": "clickpesa-key",
+                        "CLICKPESA_CHECKSUM_KEY": "clickpesa-checksum",
+                        "CLICKPESA_LIVE_ENABLED": "true",
+                        "CLICKPESA_MANUAL_PAYOUTS_CONFIRMED": "true",
+                    },
+                ), patch(
+                    "backend.main.get_clickpesa_client",
+                    return_value=FakeClickPesaClient(),
+                ):
+                    failed_checkout = buyer_client.post(
+                        f"/api/products/{product_id}/checkout",
+                        json={
+                            **checkout_payload,
+                            "request_key": "e" * 32,
+                            "payment_method": "M-Pesa",
+                        },
+                    )
+                self.assertEqual(failed_checkout.status_code, 200, failed_checkout.text)
+                with main.db_connection() as connection:
+                    failed_order = connection.execute(
+                        "SELECT provider_reference FROM orders WHERE order_id = ?",
+                        (failed_checkout.json()["order_id"],),
+                    ).fetchone()
+                self.email_sender.reset_mock()
+                main.update_clickpesa_reference_status(
+                    failed_order["provider_reference"],
+                    "FAILED",
+                )
+                main.update_clickpesa_reference_status(
+                    failed_order["provider_reference"],
+                    "FAILED",
+                )
+                self.assertEqual(self.email_sender.call_count, 1)
+                self.assertIn("hayakukamilika", self.email_sender.call_args.args[1].lower())
+                with main.db_connection() as connection:
+                    connection.execute(
+                        "DELETE FROM orders WHERE order_id = ?",
+                        (failed_checkout.json()["order_id"],),
+                    )
+
+                invalid_callback_payload = dict(callback_payload)
+                invalid_callback_payload["data"] = {
+                    **callback_payload["data"],
+                    "collectedAmount": "4999",
+                }
+                invalid_callback_payload["checksum"] = create_payload_checksum(
+                    "clickpesa-checksum",
+                    invalid_callback_payload,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "CLICKPESA_CLIENT_ID": "clickpesa-client",
+                        "CLICKPESA_CHECKSUM_KEY": "clickpesa-checksum",
+                    },
+                ):
+                    invalid_callback = buyer_client.post(
+                        "/api/webhooks/clickpesa",
+                        json=invalid_callback_payload,
+                    )
+                self.assertEqual(invalid_callback.status_code, 422)
             dashboard = seller_client.get("/api/dashboard").json()
-            self.assertEqual(dashboard["gross_sales"], 15000)
-            self.assertEqual(dashboard["platform_fees"], 750)
-            self.assertEqual(dashboard["net_profit"], 6750)
+            self.assertEqual(dashboard["gross_sales"], 20000)
+            self.assertEqual(dashboard["platform_fees"], 1000)
+            self.assertEqual(dashboard["net_profit"], 9000)
 
             archived = seller_client.post(f"/api/sales/{order_id}/archive")
             self.assertEqual(archived.status_code, 200)
@@ -478,6 +779,10 @@ class MarketplaceFlowTests(unittest.TestCase):
                 f"/api/sales/{cart_split_order_id}/archive"
             )
             self.assertEqual(cart_archived.status_code, 200)
+            live_archived = seller_client.post(
+                f"/api/sales/{live_order_id}/archive"
+            )
+            self.assertEqual(live_archived.status_code, 200)
             self.assertEqual(seller_client.get("/api/sales").json(), [])
 
         admin_sales = self.client.get("/api/sales").json()

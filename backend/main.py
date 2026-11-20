@@ -12,17 +12,26 @@ import io
 import unicodedata
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
 import psycopg
+from backend.clickpesa import ClickPesaClient, ClickPesaError, verify_webhook_checksum
 from backend.email_delivery import (
     EmailDeliveryError,
     deliver_email,
     email_is_configured,
     email_provider,
+)
+from backend.email_templates import (
+    password_changed_email,
+    password_reset_email,
+    payment_email,
+    verification_email,
+    welcome_email,
 )
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
@@ -42,6 +51,8 @@ SESSION_COOKIE = "liparahisi_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
+RESET_TOKEN_TTL_SECONDS = 60 * 60
+PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
 PAYMENT_METHODS = {
     "M-Pesa",
@@ -223,6 +234,8 @@ def initialize_db():
                 cancelled_at {timestamp_type},
                 payment_status TEXT NOT NULL DEFAULT 'PENDING',
                 checkout_url TEXT,
+                provider_reference TEXT NOT NULL DEFAULT '',
+                provider_payment_id TEXT NOT NULL DEFAULT '',
                 product_cost INTEGER NOT NULL DEFAULT 0,
                 provider_fee INTEGER NOT NULL DEFAULT 0,
                 platform_fee INTEGER NOT NULL DEFAULT 0,
@@ -324,6 +337,8 @@ def initialize_db():
             "buyer_phone": "TEXT NOT NULL DEFAULT ''",
             "buyer_id": "TEXT",
             "payment_method": "TEXT NOT NULL DEFAULT ''",
+            "provider_reference": "TEXT NOT NULL DEFAULT ''",
+            "provider_payment_id": "TEXT NOT NULL DEFAULT ''",
             "bank_branch": "TEXT NOT NULL DEFAULT ''",
             "delivery_address": "TEXT NOT NULL DEFAULT ''",
             "delivery_status": "TEXT NOT NULL DEFAULT 'UNFULFILLED'",
@@ -372,6 +387,12 @@ def initialize_db():
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS order_items_order_idx ON order_items(order_id)"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS orders_provider_reference_idx
+            ON orders(provider_reference) WHERE provider_reference <> ''
+            """
         )
         connection.execute(
             """
@@ -424,6 +445,13 @@ class PasswordChangeInput(BaseModel):
 
 class PasswordResetRequestInput(BaseModel):
     email: str = Field(min_length=5, max_length=254)
+
+    @validator("email")
+    def validate_email(cls, value):
+        value = value.strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+            raise ValueError("Weka barua pepe sahihi.")
+        return value
 
 
 class PasswordResetInput(BaseModel):
@@ -634,7 +662,13 @@ def hash_password(password):
     )
 
 
-def send_smtp_email(to_email, subject, text):
+def create_email_verification_token():
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return token, token_hash
+
+
+def send_smtp_email(to_email, subject, text, html=None):
     notification_service_url = os.getenv("NOTIFICATION_SERVICE_URL", "").strip()
     if notification_service_url:
         service_token = os.getenv("NOTIFICATION_SERVICE_TOKEN", "").strip()
@@ -645,14 +679,17 @@ def send_smtp_email(to_email, subject, text):
             )
         try:
             with httpx.Client(timeout=5.0) as client:
+                notification = {
+                    "to_email": to_email,
+                    "subject": subject,
+                    "text": text,
+                }
+                if html:
+                    notification["html"] = html
                 response = client.post(
                     f"{notification_service_url.rstrip('/')}/internal/emails",
                     headers={"X-Internal-Token": service_token},
-                    json={
-                        "to_email": to_email,
-                        "subject": subject,
-                        "text": text,
-                    },
+                    json=notification,
                 )
                 response.raise_for_status()
         except httpx.TimeoutException as error:
@@ -673,12 +710,39 @@ def send_smtp_email(to_email, subject, text):
         return
 
     try:
-        deliver_email(to_email, subject, text)
+        deliver_email(to_email, subject, text, html)
     except EmailDeliveryError as error:
         raise HTTPException(
             status_code=502 if email_is_configured() else 503,
             detail=str(error),
         ) from error
+
+
+def send_notification_email(event, to_email, content):
+    try:
+        send_smtp_email(to_email, content.subject, content.text, content.html)
+    except HTTPException as error:
+        logger.warning(
+            "Email notification failed: %s (HTTP %s).",
+            event,
+            error.status_code,
+        )
+        return False
+    logger.info("Email notification sent: %s", event)
+    return True
+
+
+def send_app_email(event, to_email, content_builder, request_base_url=None):
+    try:
+        app_url = public_app_url(request_base_url)
+    except HTTPException as error:
+        logger.warning(
+            "Email notification skipped: %s (HTTP %s).",
+            event,
+            error.status_code,
+        )
+        return False
+    return send_notification_email(event, to_email, content_builder(app_url))
 
 
 def verify_password(password, encoded):
@@ -855,12 +919,55 @@ def is_demo_mode():
     return os.getenv("DEMO_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
+_clickpesa_client = None
+_clickpesa_client_credentials = None
+
+
+def clickpesa_is_configured():
+    return all(
+        os.getenv(key, "").strip()
+        for key in (
+            "CLICKPESA_CLIENT_ID",
+            "CLICKPESA_API_KEY",
+            "CLICKPESA_CHECKSUM_KEY",
+        )
+    )
+
+
+def clickpesa_live_enabled():
+    return (
+        not is_demo_mode()
+        and os.getenv("CLICKPESA_LIVE_ENABLED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and os.getenv("CLICKPESA_MANUAL_PAYOUTS_CONFIRMED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and clickpesa_is_configured()
+    )
+
+
+def get_clickpesa_client():
+    global _clickpesa_client, _clickpesa_client_credentials
+    credentials = (
+        os.getenv("CLICKPESA_CLIENT_ID", "").strip(),
+        os.getenv("CLICKPESA_API_KEY", "").strip(),
+        os.getenv("CLICKPESA_CHECKSUM_KEY", "").strip(),
+    )
+    if not all(credentials):
+        raise ClickPesaError("ClickPesa credentials hazijawekwa.")
+    if credentials != _clickpesa_client_credentials:
+        _clickpesa_client = ClickPesaClient(*credentials)
+        _clickpesa_client_credentials = credentials
+    return _clickpesa_client
+
+
 def public_app_url(request_base_url=None):
-    value = os.getenv("PUBLIC_APP_URL", "").strip()
+    frontend_url = os.getenv("FRONTEND_URL", "").strip()
+    public_url = os.getenv("PUBLIC_APP_URL", "").strip()
     candidates = [
-        "https://liparahisi.onrender.com",
-        value,
+        frontend_url,
+        public_url,
         str(request_base_url).rstrip("/") if request_base_url else "",
+        "https://liparahisi.onrender.com",
     ]
     for candidate in candidates:
         if not candidate:
@@ -913,20 +1020,90 @@ def expire_pending_orders(connection=None):
             context.__exit__(None, None, None)
 
 
-def complete_demo_order(order_id):
-    order = get_order(order_id)
-    if not order["order_id"].startswith("DEMO"):
-        raise HTTPException(status_code=400, detail="Hili si oda ya majaribio.")
-    if order["payment_status"] == "EXPIRED":
-        raise HTTPException(status_code=410, detail="Oda hii imekwisha muda; anzisha oda mpya.")
-    if order["payment_status"] != "COMPLETED":
-        fee = commission_amount(order["amount"])
-        payout = order["amount"] - fee - order["provider_fee"]
-        profit = payout - order["product_cost"]
-        with db_connection() as connection:
+def send_payment_notification(order_ids, failed=False, demo=False):
+    orders = []
+    with db_connection() as connection:
+        for order_id in order_ids:
+            row = connection.execute(
+                """
+                SELECT orders.*, products.name AS product_name
+                FROM orders
+                LEFT JOIN products ON products.id = orders.product_id
+                WHERE orders.order_id = ?
+                """,
+                (order_id,),
+            ).fetchone()
+            if row is not None:
+                orders.append(dict(row))
+    if not orders:
+        return False
+    recipients = {
+        (order.get("buyer_email") or "").strip().lower()
+        for order in orders
+    }
+    if len(recipients) != 1 or not next(iter(recipients), ""):
+        logger.warning("Payment email skipped: checkout has no single valid recipient.")
+        return False
+    recipient = next(iter(recipients))
+    full_name = orders[0].get("buyer_name") or "Mteja"
+    return send_app_email(
+        "payment_failed" if failed else "payment_receipt",
+        recipient,
+        lambda app_url: payment_email(
+            full_name,
+            orders,
+            app_url,
+            failed=failed,
+            demo=demo,
+        ),
+    )
+
+
+def complete_order_group(order_ids, provider_verified=False):
+    expire_pending_orders()
+    newly_completed_ids = []
+    with db_connection() as connection:
+        orders = []
+        for order_id in order_ids:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Oda haikupatikana.")
+            order = dict(row)
+            if not provider_verified:
+                if not order["order_id"].startswith("DEMO"):
+                    raise HTTPException(status_code=400, detail="Hili si oda ya majaribio.")
+                if order["payment_status"] == "EXPIRED":
+                    raise HTTPException(
+                        status_code=410,
+                        detail="Oda hii imekwisha muda; anzisha oda mpya.",
+                    )
+            orders.append(order)
+
+        for order in orders:
+            if order["payment_status"] == "COMPLETED":
+                continue
+            fee = commission_amount(order["amount"])
+            payout = order["amount"] - fee - order["provider_fee"]
+            profit = payout - order["product_cost"]
+            claimed = connection.execute(
+                """
+                UPDATE orders
+                SET payment_status = 'COMPLETED',
+                    platform_fee = ?, seller_payout = ?, net_profit = ?,
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE order_id = ? AND payment_status != 'COMPLETED'
+                """,
+                (fee, payout, profit, order["order_id"]),
+            )
+            if claimed.rowcount == 0:
+                continue
+            newly_completed_ids.append(order["order_id"])
             items = connection.execute(
                 "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
-                (order_id,),
+                (order["order_id"],),
             ).fetchall()
             if items:
                 for item in items:
@@ -975,17 +1152,173 @@ def complete_demo_order(order_id):
                     -1,
                     "ORDER_SALE",
                 )
-            connection.execute(
+    completed_orders = [get_order(order_id) for order_id in order_ids]
+    if newly_completed_ids:
+        send_payment_notification(
+            newly_completed_ids,
+            demo=not provider_verified,
+        )
+    return completed_orders
+
+
+def complete_demo_order(order_id):
+    orders = complete_order_group([order_id])
+    return orders[0]
+
+
+def clickpesa_orders_for_reference(order_reference):
+    with db_connection() as connection:
+        anchor = connection.execute(
+            "SELECT order_id, checkout_id FROM orders WHERE provider_reference = ?",
+            (order_reference,),
+        ).fetchone()
+        if anchor is None:
+            raise HTTPException(status_code=404, detail="Rejea ya malipo haikupatikana.")
+        if anchor["checkout_id"]:
+            rows = connection.execute(
+                "SELECT * FROM orders WHERE checkout_id = ? ORDER BY created_at",
+                (anchor["checkout_id"],),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM orders WHERE order_id = ?",
+                (anchor["order_id"],),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_clickpesa_reference_status(order_reference, status, payment_id=""):
+    orders = clickpesa_orders_for_reference(order_reference)
+    newly_failed_ids = []
+    with db_connection() as connection:
+        for order in orders:
+            updated = connection.execute(
                 """
                 UPDATE orders
-                SET payment_status = 'COMPLETED',
-                    platform_fee = ?, seller_payout = ?, net_profit = ?,
-                    completed_at = CURRENT_TIMESTAMP
+                SET payment_status = ?,
+                    provider_payment_id = CASE WHEN ? <> '' THEN ? ELSE provider_payment_id END
                 WHERE order_id = ? AND payment_status != 'COMPLETED'
                 """,
-                (fee, payout, profit, order_id),
+                (status, payment_id, payment_id, order["order_id"]),
             )
-    return get_order(order_id)
+            if (
+                status == "FAILED"
+                and order["payment_status"] != "FAILED"
+                and updated.rowcount
+            ):
+                newly_failed_ids.append(order["order_id"])
+    if newly_failed_ids:
+        send_payment_notification(newly_failed_ids, failed=True)
+
+
+def complete_clickpesa_payment(
+    order_reference,
+    collected_amount,
+    collected_currency,
+    payment_id="",
+):
+    if collected_currency != "TZS":
+        raise HTTPException(status_code=422, detail="Sarafu ya malipo ya ClickPesa si sahihi.")
+    try:
+        amount = Decimal(str(collected_amount))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo ya ClickPesa si sahihi.")
+    if not amount.is_finite() or amount != amount.to_integral_value():
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo ya ClickPesa si sahihi.")
+
+    orders = clickpesa_orders_for_reference(order_reference)
+    expected_amount = sum(order["amount"] for order in orders)
+    if amount != expected_amount:
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo hakilingani na oda.")
+    completed = complete_order_group(
+        [order["order_id"] for order in orders],
+        provider_verified=True,
+    )
+    if payment_id:
+        with db_connection() as connection:
+            connection.execute(
+                "UPDATE orders SET provider_payment_id = ? WHERE provider_reference = ?",
+                (payment_id, order_reference),
+            )
+    return completed
+
+
+async def begin_clickpesa_payment(order_reference, phone_number, amount):
+    try:
+        result = await get_clickpesa_client().initiate_ussd_push(
+            phone_number,
+            amount,
+            order_reference,
+        )
+    except ClickPesaError as error:
+        if error.uncertain:
+            logger.warning(
+                "ClickPesa payment outcome is uncertain for reference %s.",
+                order_reference,
+            )
+            return "PENDING"
+        update_clickpesa_reference_status(order_reference, "FAILED")
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    status = result["status"]
+    payment_id = result.get("id", "")
+    if status in {"SUCCESS", "SETTLED"}:
+        if "collectedAmount" in result and "collectedCurrency" in result:
+            complete_clickpesa_payment(
+                order_reference,
+                result["collectedAmount"],
+                result["collectedCurrency"],
+                payment_id,
+            )
+            return "COMPLETED"
+        update_clickpesa_reference_status(
+            order_reference,
+            "PENDING",
+            payment_id,
+        )
+        return "PENDING"
+    if status == "FAILED":
+        update_clickpesa_reference_status(order_reference, "FAILED", payment_id)
+        return "FAILED"
+    update_clickpesa_reference_status(order_reference, "PENDING", payment_id)
+    return "PENDING"
+
+
+def process_clickpesa_webhook(payload: dict):
+    checksum_key = os.getenv("CLICKPESA_CHECKSUM_KEY", "").strip()
+    if not verify_webhook_checksum(payload, checksum_key):
+        raise HTTPException(status_code=401, detail="Saini ya callback ya ClickPesa si sahihi.")
+    event = payload.get("event")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Taarifa za callback ya ClickPesa si sahihi.")
+    client_id = data.get("clientId")
+    configured_client_id = os.getenv("CLICKPESA_CLIENT_ID", "").strip()
+    if client_id and client_id != configured_client_id:
+        raise HTTPException(status_code=401, detail="Callback imetoka kwa akaunti isiyotambulika.")
+    if event not in {"PAYMENT RECEIVED", "PAYMENT FAILED"}:
+        return {"received": True, "ignored": True}
+
+    order_reference = data.get("orderReference")
+    if not isinstance(order_reference, str) or not order_reference:
+        raise HTTPException(status_code=400, detail="Callback haina rejea ya oda.")
+    if event == "PAYMENT FAILED":
+        update_clickpesa_reference_status(
+            order_reference,
+            "FAILED",
+            data.get("id", ""),
+        )
+        return {"received": True}
+
+    if data.get("status") not in {"SUCCESS", "SETTLED"}:
+        raise HTTPException(status_code=409, detail="Malipo ya ClickPesa bado hayajathibitishwa.")
+    complete_clickpesa_payment(
+        order_reference,
+        data.get("collectedAmount"),
+        data.get("collectedCurrency"),
+        data.get("paymentReference", ""),
+    )
+    return {"received": True}
 
 
 @app.get("/api/health")
@@ -1036,7 +1369,9 @@ def integration_status():
     smtp_configured = configured_email_provider == "smtp" and email_configured
     return {
         "demo_mode": is_demo_mode(),
-        "live_payments_enabled": False,
+        "live_payments_enabled": clickpesa_live_enabled(),
+        "clickpesa_configured": clickpesa_is_configured(),
+        "clickpesa_live_enabled": clickpesa_live_enabled(),
         "selcom_configured": selcom_configured,
         "smtp_configured": smtp_configured,
         "email_configured": email_configured,
@@ -1398,6 +1733,19 @@ async def order_cart_checkout_gateway(request: Request):
     )
 
 
+@app.api_route("/api/webhooks/clickpesa", methods=["POST"])
+async def clickpesa_webhook_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "webhooks/clickpesa",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
 @app.api_route(
     "/api/checkouts/{checkout_id}",
     methods=["GET"],
@@ -1581,6 +1929,7 @@ def setup_admin(payload: AdminSetupInput, request: Request, response: Response):
     if not secrets.compare_digest(payload.setup_token, expected_token):
         raise HTTPException(status_code=401, detail="Tokeni ya kuanzisha admin si sahihi.")
     full_name, email = clean_identity(payload.full_name, payload.email)
+    verification_token, verification_hash = create_email_verification_token()
     with db_connection() as connection:
         if connection.execute(
             "SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1"
@@ -1601,6 +1950,10 @@ def setup_admin(payload: AdminSetupInput, request: Request, response: Response):
                     hash_password(payload.password),
                     "LipaRahisi",
                 ),
+            )
+            connection.execute(
+                "UPDATE users SET verification_token_hash = ? WHERE id = ?",
+                (verification_hash, user_id),
             )
         except Exception as error:
             if is_integrity_error(error):
@@ -1624,6 +1977,16 @@ def setup_admin(payload: AdminSetupInput, request: Request, response: Response):
         )
         token = create_session(connection, user_id)
     set_session_cookie(response, request, token)
+    send_app_email(
+        "admin_verification",
+        email,
+        lambda app_url: verification_email(
+            full_name,
+            f"{app_url}/verify-email?token={quote(verification_token, safe='')}",
+            app_url,
+        ),
+        str(request.base_url),
+    )
     return {"user": {"id": user_id, "full_name": full_name, "email": email, "role": "ADMIN", "status": "ACTIVE", "shop_name": "LipaRahisi", "phone": ""}}
 
 
@@ -1655,8 +2018,7 @@ def register_seller(payload: SellerRegistrationInput, request: Request):
                 "UPDATE users SET store_slug = ? WHERE id = ?",
                 (make_store_slug(shop_name, user_id), user_id),
             )
-            verification_token = secrets.token_urlsafe(32)
-            verification_hash = hashlib.sha256(verification_token.encode("utf-8")).hexdigest()
+            verification_token, verification_hash = create_email_verification_token()
             connection.execute(
                 "UPDATE users SET verification_token_hash = ? WHERE id = ?",
                 (verification_hash, user_id),
@@ -1668,23 +2030,19 @@ def register_seller(payload: SellerRegistrationInput, request: Request):
                 detail="Barua pepe hii tayari imesajiliwa.",
             ) from error
         raise
-    email_delivery_notice = ""
-    try:
-        app_url = public_app_url(str(request.base_url))
-        send_smtp_email(
-            email,
-            "LipaRahisi — thibitisha akaunti",
-            f"Thibitisha akaunti: {app_url}/verify-email?token={quote(verification_token, safe='')}",
-        )
-    except HTTPException as error:
-        logger.warning("Seller verification email was not sent: %s", error.detail)
-        email_delivery_notice = f" Barua pepe ya uthibitisho haikutumwa: {error.detail}"
+    send_app_email(
+        "seller_verification",
+        email,
+        lambda app_url: verification_email(
+            full_name,
+            f"{app_url}/verify-email?token={quote(verification_token, safe='')}",
+            app_url,
+        ),
+        str(request.base_url),
+    )
     return {
         "status": "PENDING",
-        "message": (
-            "Usajili umehifadhiwa. Msimamizi mkuu ataidhinisha akaunti yako kabla ya kuuza."
-            + email_delivery_notice
-        ),
+        "message": "Usajili umehifadhiwa. Msimamizi mkuu ataidhinisha akaunti yako kabla ya kuuza.",
     }
 
 
@@ -1692,6 +2050,7 @@ def register_customer(payload: CustomerRegistrationInput):
     full_name, email = clean_identity(payload.full_name, payload.email)
     phone = normalize_phone(payload.phone)
     user_id = secrets.token_hex(16)
+    verification_token, verification_hash = create_email_verification_token()
     try:
         with db_connection() as connection:
             connection.execute(
@@ -1708,6 +2067,10 @@ def register_customer(payload: CustomerRegistrationInput):
                     phone,
                 ),
             )
+            connection.execute(
+                "UPDATE users SET verification_token_hash = ? WHERE id = ?",
+                (verification_hash, user_id),
+            )
     except Exception as error:
         if is_integrity_error(error):
             raise HTTPException(
@@ -1715,8 +2078,17 @@ def register_customer(payload: CustomerRegistrationInput):
                 detail="Barua pepe hii tayari imesajiliwa.",
             ) from error
         raise
+    send_app_email(
+        "customer_verification",
+        email,
+        lambda app_url: verification_email(
+            full_name,
+            f"{app_url}/verify-email?token={quote(verification_token, safe='')}",
+            app_url,
+        ),
+    )
     return {
-        "message": "Akaunti ya mnunuzi imefunguliwa. Sasa unaweza kuingia.",
+        "message": "Akaunti ya mnunuzi imefunguliwa. Angalia barua pepe yako kuthibitisha akaunti.",
         "user_id": user_id,
     }
 
@@ -1796,31 +2168,60 @@ def change_password(payload: PasswordChangeInput, request: Request, response: Re
         connection.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
         token = create_session(connection, user["id"])
     set_session_cookie(response, request, token)
+    send_app_email(
+        "password_changed",
+        user["email"],
+        lambda app_url: password_changed_email(user["full_name"], app_url),
+        str(request.base_url),
+    )
     return {"message": "Nenosiri limebadilishwa."}
 
 
 def request_password_reset(payload: PasswordResetRequestInput, request: Request):
-    email = payload.email.strip().lower()
+    email = payload.email
+    now = time.time()
+    should_send = False
     with db_connection() as connection:
         user = connection.execute(
-            "SELECT id FROM users WHERE email = ?",
+            "SELECT id, full_name, email, reset_expires FROM users WHERE email = ?",
             (email,),
         ).fetchone()
         if user is not None:
-            reset_token = secrets.token_urlsafe(32)
-            reset_hash = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
-            connection.execute(
-                "UPDATE users SET reset_token_hash = ?, reset_expires = ? WHERE id = ?",
-                (reset_hash, time.time() + 60 * 60, user["id"]),
+            last_expiry = float(user["reset_expires"] or 0)
+            recently_requested = last_expiry > (
+                now + RESET_TOKEN_TTL_SECONDS - PASSWORD_RESET_COOLDOWN_SECONDS
             )
-            app_url = public_app_url(str(request.base_url))
-            send_smtp_email(
-                email,
-                "LipaRahisi — password reset",
-                "Reset link: "
-                f"{app_url}/reset-password?token={quote(reset_token, safe='')}\n"
-                "Link hii inaisha baada ya saa 1.",
-            )
+            if not recently_requested:
+                reset_token = secrets.token_urlsafe(32)
+                reset_hash = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
+                connection.execute(
+                    "UPDATE users SET reset_token_hash = ?, reset_expires = ? WHERE id = ?",
+                    (reset_hash, now + RESET_TOKEN_TTL_SECONDS, user["id"]),
+                )
+                should_send = True
+    if user is not None and should_send:
+        reset_url = (
+            f"{{app_url}}/reset-password?token={quote(reset_token, safe='')}"
+        )
+        sent = send_app_email(
+            "password_reset",
+            user["email"],
+            lambda app_url: password_reset_email(
+                user["full_name"],
+                reset_url.format(app_url=app_url),
+                app_url,
+            ),
+            str(request.base_url),
+        )
+        if not sent:
+            with db_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE users SET reset_token_hash = ''
+                    WHERE id = ? AND reset_token_hash = ?
+                    """,
+                    (user["id"], reset_hash),
+                )
     return {"message": "Ikiwa akaunti ipo, link ya kubadilisha nenosiri imetumwa."}
 
 
@@ -1828,7 +2229,7 @@ def confirm_password_reset(payload: PasswordResetInput):
     reset_hash = hashlib.sha256(payload.reset_token.encode("utf-8")).hexdigest()
     with db_connection() as connection:
         user = connection.execute(
-            "SELECT id FROM users WHERE reset_token_hash = ? AND reset_expires > ?",
+            "SELECT id, full_name, email FROM users WHERE reset_token_hash = ? AND reset_expires > ?",
             (reset_hash, time.time()),
         ).fetchone()
         if user is None:
@@ -1838,6 +2239,11 @@ def confirm_password_reset(payload: PasswordResetInput):
             (hash_password(payload.new_password), user["id"]),
         )
         connection.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+    send_app_email(
+        "password_changed",
+        user["email"],
+        lambda app_url: password_changed_email(user["full_name"], app_url),
+    )
     return {"message": "Nenosiri limebadilishwa."}
 
 
@@ -1845,7 +2251,7 @@ def verify_email(token: str):
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with db_connection() as connection:
         user = connection.execute(
-            "SELECT id FROM users WHERE verification_token_hash = ?",
+            "SELECT id, full_name, email FROM users WHERE verification_token_hash = ?",
             (token_hash,),
         ).fetchone()
         if user is None:
@@ -1854,6 +2260,11 @@ def verify_email(token: str):
             "UPDATE users SET email_verified = 1, verification_token_hash = '' WHERE id = ?",
             (user["id"],),
         )
+    send_app_email(
+        "welcome",
+        user["email"],
+        lambda app_url: welcome_email(user["full_name"], app_url),
+    )
     return {"message": "Barua pepe imethibitishwa."}
 
 
@@ -2473,11 +2884,22 @@ def delete_product_image(product_id: str, request: Request):
     return {"product_id": product_id, "image_url": ""}
 
 
-def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
-    if not is_demo_mode():
+async def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
+    demo_mode = is_demo_mode()
+    if not demo_mode and not clickpesa_live_enabled():
         raise HTTPException(
             status_code=503,
-            detail="Malipo halisi yamezimwa hadi akaunti na mgawanyo wa malipo wa kila muuzaji viunganishwe.",
+            detail="Malipo ya ClickPesa hayajaanzishwa au hayajakamilisha mipangilio salama.",
+        )
+    if not demo_mode and payload.payment_method not in {
+        "M-Pesa",
+        "Halo Pesa",
+        "Tigo Pesa",
+        "Airtel Money",
+    }:
+        raise HTTPException(
+            status_code=422,
+            detail="ClickPesa USSD Push inakubali malipo ya simu pekee.",
         )
     product = get_product(product_id)
     if not product["seller_id"]:
@@ -2497,10 +2919,20 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
             if order["product_id"] != product_id:
                 raise HTTPException(status_code=409, detail="Ombi hili la malipo tayari limetumika.")
             if order["checkout_url"]:
-                return {"order_id": order["order_id"], "checkout_url": order["checkout_url"]}
-            return {"order_id": order["order_id"], "payment_status": order["payment_status"], "demo": True}
+                return {
+                    "order_id": order["order_id"],
+                    "checkout_url": order["checkout_url"],
+                    "payment_status": order["payment_status"],
+                    "demo": not bool(order["provider_reference"]),
+                }
+            return {
+                "order_id": order["order_id"],
+                "payment_status": order["payment_status"],
+                "demo": not bool(order["provider_reference"]),
+            }
 
-    order_id = "DEMO" + secrets.token_hex(10).upper()
+    order_id = ("DEMO" if demo_mode else "ORD") + secrets.token_hex(10).upper()
+    provider_reference = "" if demo_mode else "LR" + secrets.token_hex(9).upper()
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
     try:
@@ -2510,9 +2942,9 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                 INSERT INTO orders
                     (order_id, request_key, product_id, seller_id, amount,
                      buyer_name, buyer_email, buyer_phone, buyer_id,
-                     payment_method, bank_branch, delivery_address,
+                     payment_method, bank_branch, delivery_address, provider_reference,
                      product_cost, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -2524,9 +2956,10 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                     payload.buyer_email,
                     payload.buyer_phone,
                     buyer_id,
-                    payload.payment_method,
+                    payload.payment_method if demo_mode else "ClickPesa USSD Push",
                     payload.bank_branch or "",
                     payload.delivery_address.strip(),
+                    provider_reference,
                     product["cost_amount"],
                     time.time() + ORDER_TTL_SECONDS,
                 ),
@@ -2550,26 +2983,52 @@ def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
                 return {
                     "order_id": existing["order_id"],
                     "payment_status": existing["payment_status"],
-                    "demo": True,
+                    "demo": not bool(existing["provider_reference"]),
                 }
             raise HTTPException(status_code=409, detail="Ombi hili la malipo tayari limetumika.") from error
         raise
 
     app_url = public_app_url(str(request.base_url))
-    checkout_url = f"{app_url}/pay/{product_id}?order_id={quote(order_id)}&demo=1"
+    checkout_url = (
+        f"{app_url}/pay/{product_id}?order_id={quote(order_id)}"
+        + ("&demo=1" if demo_mode else "")
+    )
     with db_connection() as connection:
         connection.execute(
             "UPDATE orders SET checkout_url = ? WHERE order_id = ?",
             (checkout_url, order_id),
         )
-    return {"order_id": order_id, "checkout_url": checkout_url, "demo": True}
+    payment_status = "PENDING"
+    if not demo_mode:
+        payment_status = await begin_clickpesa_payment(
+            provider_reference,
+            payload.buyer_phone,
+            product["amount"],
+        )
+    return {
+        "order_id": order_id,
+        "checkout_url": checkout_url,
+        "payment_status": payment_status,
+        "demo": demo_mode,
+    }
 
 
-def create_cart_checkout(payload: CartCheckoutInput, request: Request):
-    if not is_demo_mode():
+async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
+    demo_mode = is_demo_mode()
+    if not demo_mode and not clickpesa_live_enabled():
         raise HTTPException(
             status_code=503,
-            detail="Malipo halisi yamezimwa hadi mgawanyo wa malipo wa wauzaji viunganishwe.",
+            detail="Malipo ya ClickPesa hayajaanzishwa au hayajakamilisha mipangilio salama.",
+        )
+    if not demo_mode and payload.payment_method not in {
+        "M-Pesa",
+        "Halo Pesa",
+        "Tigo Pesa",
+        "Airtel Money",
+    }:
+        raise HTTPException(
+            status_code=422,
+            detail="ClickPesa USSD Push inakubali malipo ya simu pekee.",
         )
     if payload.payment_method.endswith("Branch") and not payload.bank_branch:
         raise HTTPException(status_code=422, detail="Chagua tawi la benki.")
@@ -2607,10 +3066,11 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             return get_cart_checkout(existing["checkout_id"], request)
 
         checkout_id = "CART" + secrets.token_hex(16).upper()
+        provider_reference = "" if demo_mode else "LR" + secrets.token_hex(9).upper()
         expires_at = time.time() + ORDER_TTL_SECONDS
         order_ids = []
         for seller_index, (seller_id, seller_items) in enumerate(merged.items()):
-            order_id = "DEMO" + secrets.token_hex(10).upper()
+            order_id = ("DEMO" if demo_mode else "ORD") + secrets.token_hex(10).upper()
             amount = sum(product["amount"] * quantity for product, quantity in seller_items)
             product_cost = sum(product["cost_amount"] * quantity for product, quantity in seller_items)
             fee = commission_amount(amount)
@@ -2622,10 +3082,10 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                 INSERT INTO orders
                     (order_id, request_key, product_id, seller_id, amount,
                      buyer_name, buyer_email, buyer_phone, buyer_id,
-                     payment_method, bank_branch, delivery_address,
+                     payment_method, bank_branch, delivery_address, provider_reference,
                      product_cost, platform_fee, seller_payout, net_profit,
                      checkout_id, cart_request_key, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -2637,9 +3097,10 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     payload.buyer_email,
                     payload.buyer_phone,
                     buyer_id,
-                    payload.payment_method,
+                    payload.payment_method if demo_mode else "ClickPesa USSD Push",
                     payload.bank_branch or "",
                     payload.delivery_address.strip(),
+                    provider_reference if seller_index == 0 else "",
                     product_cost,
                     fee,
                     payout,
@@ -2673,11 +3134,23 @@ def create_cart_checkout(payload: CartCheckoutInput, request: Request):
             "UPDATE orders SET checkout_url = ? WHERE checkout_id = ?",
             (checkout_url, checkout_id),
         )
+    payment_status = "PENDING"
+    if not demo_mode:
+        total_amount = sum(
+            sum(product["amount"] * quantity for product, quantity in seller_items)
+            for seller_items in merged.values()
+        )
+        payment_status = await begin_clickpesa_payment(
+            provider_reference,
+            payload.buyer_phone,
+            total_amount,
+        )
     return {
         "checkout_id": checkout_id,
         "checkout_url": checkout_url,
         "order_ids": order_ids,
-        "demo": True,
+        "payment_status": payment_status,
+        "demo": demo_mode,
     }
 
 
@@ -2721,11 +3194,12 @@ def get_cart_checkout(checkout_id: str, request: Request):
     result = {
         "checkout_id": checkout_id,
         "payment_status": "COMPLETED" if all(split["payment_status"] == "COMPLETED" for split in splits)
+        else "FAILED" if any(split["payment_status"] == "FAILED" for split in splits)
         else "EXPIRED" if all(split["payment_status"] == "EXPIRED" for split in splits)
         else "PENDING",
         "payment_method": orders[0]["payment_method"],
         "expires_at": orders[0]["expires_at"],
-        "demo": True,
+        "demo": not any(order["provider_reference"] for order in orders),
         "commission_percent": COMMISSION_PERCENT,
         "total_amount": sum(split["amount"] for split in splits),
         "platform_fee": sum(split["platform_fee"] for split in splits),
@@ -2764,15 +3238,12 @@ def complete_cart_checkout(checkout_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Kikapu cha malipo hakikupatikana.")
     if any(order["payment_status"] == "EXPIRED" for order in orders):
         raise HTTPException(status_code=410, detail="Kikapu hiki kimekwisha muda; anzisha oda mpya.")
-    for order in orders:
-        complete_demo_order(order["order_id"])
+    complete_order_group([order["order_id"] for order in orders])
     return get_cart_checkout(checkout_id, request)
 
 
 def order_status(order_id: str, request: Request):
     order = get_order(order_id)
-    if not is_demo_mode():
-        raise HTTPException(status_code=503, detail="Hali ya malipo halisi haijaunganishwa.")
     with db_connection() as connection:
         product = connection.execute(
             "SELECT name FROM products WHERE id = ?",
@@ -2788,7 +3259,7 @@ def order_status(order_id: str, request: Request):
         "platform_fee": order["platform_fee"],
         "seller_payout": order["seller_payout"],
         "commission_percent": COMMISSION_PERCENT,
-        "demo": True,
+        "demo": not bool(order["provider_reference"]),
     }
     buyer = optional_current_user(request)
     if buyer and buyer["role"] == "BUYER" and buyer["id"] == order["buyer_id"]:

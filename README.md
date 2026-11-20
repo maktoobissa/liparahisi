@@ -37,21 +37,46 @@ issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
 checkout, but neither is connected to a live payment provider. Coupons are not
 included in this feature set.
 
-## Important payment limitation
+## Payments
 
-The application currently runs in demo-payment mode. Completing checkout
-records a clearly marked demo transaction; no mobile-money or bank payment is
-made, and no money is transferred to a seller. The 5% commission and seller
-proceeds are recorded in the ledger for testing. Provider fees are zero in demo
-mode. Do not describe demo orders as real paid transactions.
+The app supports ClickPesa Mobile Money USSD Push for a single product or a
+multi-seller cart. ClickPesa collects the total into the platform's merchant
+account. The app records the 5% platform commission and each seller's payout
+in its ledger, but does **not** transfer money to sellers; the platform must
+pay them manually and reconcile those payouts.
 
-Live payments require provider approval, seller-specific merchant accounts,
-settlement/split-payment support, verified payment callbacks, and production
-testing. The app deliberately refuses to start live checkout until that work
-has been completed. Do not collect a buyer's PIN or OTP in this app.
-The current Selcom helper is not connected to checkout or payment callbacks;
-setting Selcom credentials or `SELCOM_LIVE_ENABLED` does not enable real
-payments. The integration status therefore keeps `live_payments_enabled` false.
+Demo mode remains the default (`DEMO_MODE=true`), and the Render Blueprint
+keeps live payments disabled. A successful demo checkout transfers no money.
+Never ask buyers for their wallet PIN or OTP.
+
+ClickPesa requires merchant KYC and API access. Its public docs state that API
+calls are made against production (there is no sandbox), so integration tests
+mock the API and do not initiate real charges. Enable live payments only after
+the merchant account, payment methods, webhook checksum, durable database, and
+manual seller-payout process are ready:
+
+1. Register with ClickPesa, complete KYC, and create an API application with
+   the Payment API feature.
+2. In Render's Environment page, set `CLICKPESA_CLIENT_ID`,
+   `CLICKPESA_API_KEY`, and `CLICKPESA_CHECKSUM_KEY` as secrets. Never put them
+   in source control or chat.
+3. Configure application webhooks for `PAYMENT RECEIVED` and `PAYMENT FAILED`
+   to `https://<your-app-domain>/api/webhooks/clickpesa`, and enable checksum
+   validation using the same checksum key.
+4. Ensure the app uses a durable production database, then set
+   `CLICKPESA_MANUAL_PAYOUTS_CONFIRMED=true`, `CLICKPESA_LIVE_ENABLED=true`,
+   and `DEMO_MODE=false`. Keep live disabled until those conditions are met.
+
+ClickPesa's published [pricing](https://clickpesa.com/payment-gateway/pricing/)
+lists free account creation up to a total transaction limit of TZS 100,000,
+KYC search/onboarding at TZS 25,000, and M-Pesa channel setup/activation at
+TZS 250,000. Mobile-money USSD Push fees are charged to the customer in
+addition to mobile-network fees; the exact fee should be confirmed in the
+ClickPesa payment flow. Fees and terms can change; confirm them with ClickPesa
+before accepting live payments.
+
+The current Selcom helper remains unused; setting Selcom credentials does not
+enable live payments.
 
 ## Local setup
 
@@ -180,24 +205,45 @@ The QR contains a public product URL at `PUBLIC_APP_URL`; scanning it opens
 the product name, price, and available checkout methods. It does not contain
 payment credentials.
 
-Render Free blocks outbound SMTP ports, so use Resend's HTTPS API for account
-verification and password recovery:
+Render Free blocks outbound SMTP ports, so the FastAPI backend sends mail
+through Resend's official HTTPS email API. It sends verification and welcome
+messages, password-reset links, password-change alerts, payment-failure
+notices, and payment receipts. Emails have HTML and plain-text versions.
 
-1. Verify a sender domain in Resend and choose a sender address on that domain.
-2. In Render's Environment page, set `EMAIL_PROVIDER=resend`, add `RESEND_API_KEY`
-   as a secret, and set `EMAIL_FROM` to the verified sender address.
-3. Check `GET /api/config/integrations`; `email_configured` should be `true`.
+Configure each Render web service in **Environment**:
 
-Do not put the Resend API key in source control or chat. SMTP remains available
-for local environments that permit outbound SMTP. The Render Blueprint keeps
-`DEMO_MODE=true` and live payments disabled.
+1. In Resend, verify a domain you own and choose a sender on that domain, such
+   as `LipaRahisi <no-reply@mail.your-domain.tld>`. The shared
+   `onboarding@resend.dev` sender is for limited testing, not production users.
+2. Set `EMAIL_PROVIDER=resend`, add `RESEND_API_KEY` as a secret, and set
+   `EMAIL_FROM` to the verified sender. Never put API keys in source control
+   or chat; rotate any key that has been exposed.
+3. Set `FRONTEND_URL` to that service's public HTTPS origin with no trailing
+   slash. For the existing `liparahisi.onrender.com` service, use
+   `https://liparahisi.onrender.com`. Set `BACKEND_URL` to the same origin:
+   this deployment serves the React frontend and FastAPI API from one origin,
+   and the frontend uses relative `/api` paths. `BACKEND_URL` is reserved for
+   a future split deployment; email links use `FRONTEND_URL`.
+4. Save the environment and redeploy. Check
+   `GET /api/config/integrations`; `email_configured` should be `true`.
+
+The second Render service, if used, must use its own public origin for both
+URL variables. `PUBLIC_APP_URL` remains as a backward-compatible fallback for
+older configurations. The forgot-password endpoint responds with the same
+message whether an account exists or not, and rate-limits reset email delivery
+to one request per account every 15 minutes. Delivery logs record event type
+and outcome only; they do not include recipient addresses, email bodies, or
+reset tokens. SMTP remains available for local environments that permit
+outbound SMTP. The Render Blueprint keeps `DEMO_MODE=true` and live payments
+disabled.
 
 The Free Postgres database in this Blueprint is for testing only: it does not
 provide durable backups and expires. Do not use it for production records or
 enable live payments until moving to a database plan with backups and testing
-restores. `DEMO_MODE` remains enabled, and Selcom split settlement, verified
-payment callbacks, and production reconciliation still require Selcom's
-confirmed integration specifications and merchant credentials.
+restores. `DEMO_MODE` remains enabled and ClickPesa live payments remain disabled in the
+Blueprint. The Free Postgres database is not suitable for live financial
+records; move to durable production storage with backups before enabling
+payments. The app does not perform seller payouts.
 
 ## Verify
 

@@ -21,6 +21,7 @@ from backend.main import (
     order_status,
     order_history,
     moderate_review,
+    process_clickpesa_webhook,
     read_cart_checkout,
     request_cancellation,
     resolve_cancellation,
@@ -66,6 +67,11 @@ app.add_api_route(
     create_cart_checkout,
     methods=["POST"],
     dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/webhooks/clickpesa",
+    process_clickpesa_webhook,
+    methods=["POST"],
 )
 app.add_api_route(
     "/checkouts/{checkout_id}",

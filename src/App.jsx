@@ -1668,6 +1668,7 @@ function CheckoutPage({ productId }) {
   const { language } = useLanguage();
   const { notify } = useNotification();
   const [product, setProduct] = useState(null);
+  const [paymentConfig, setPaymentConfig] = useState(null);
   const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
   const [orderId, setOrderId] = useState(new URLSearchParams(window.location.search).get("order_id") || "");
   const [order, setOrder] = useState(null);
@@ -1679,6 +1680,20 @@ function CheckoutPage({ productId }) {
   useEffect(() => {
     api(`/products/${productId}`).then(setProduct).catch((requestError) => setError(requestError.message));
   }, [productId]);
+
+  useEffect(() => {
+    let active = true;
+    api("/config/integrations")
+      .then((config) => {
+        if (active) setPaymentConfig(config);
+      })
+      .catch((requestError) => {
+        if (active) setError(requestError.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!orderId) return;
@@ -1742,7 +1757,11 @@ function CheckoutPage({ productId }) {
       });
       if (!result.order_id) throw new Error("Mfumo haukurudisha namba ya oda.");
       setOrderId(result.order_id);
-      window.history.replaceState({}, "", `/pay/${productId}?order_id=${encodeURIComponent(result.order_id)}&demo=1`);
+      window.history.replaceState(
+        {},
+        "",
+        `/pay/${productId}?order_id=${encodeURIComponent(result.order_id)}${result.demo ? "&demo=1" : ""}`,
+      );
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -1763,6 +1782,14 @@ function CheckoutPage({ productId }) {
     } finally {
       setBusy(false);
     }
+  }
+
+  function retryPayment() {
+    setOrderId("");
+    setOrder(null);
+    setError("");
+    previousOrderStatus.current = null;
+    window.history.replaceState({}, "", `/pay/${productId}`);
   }
 
   async function downloadOrderReceipt() {
@@ -1791,6 +1818,7 @@ function CheckoutPage({ productId }) {
   }
 
   const isCompleted = order?.payment_status === "COMPLETED";
+  const isLivePayment = paymentConfig?.live_payments_enabled === true;
   const selectedMethod = networks.find((method) => method.value === form.payment_method);
   return localize(
     <main className="page-shell checkout-shell">
@@ -1813,17 +1841,21 @@ function CheckoutPage({ productId }) {
               <input id="buyer-phone" className="text-input" type="tel" inputMode="tel" autoComplete="tel" placeholder="Mf. 0712 345 678" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
               <label className="field-label" htmlFor="buyer-address">Anuani ya delivery (hiari)</label>
               <input id="buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
-              <fieldset className="payment-fieldset">
-                <legend>Chagua mtandao wa malipo</legend>
-                <div className="method-grid">
-                  {networks.map((method) => (
-                    <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value, bank_branch: method.value.endsWith("Branch") ? form.bank_branch : "", bank_branch_name: method.value.endsWith("Branch") ? form.bank_branch_name : "" })}>
-                      <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
-                    </button>
-                  ))}
-                </div>
-              </fieldset>
-              {form.payment_method.endsWith("Branch") && (
+              {isLivePayment ? (
+                <p className="field-hint">ClickPesa itatuma ombi la USSD kwenye namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha malipo kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</p>
+              ) : (
+                <fieldset className="payment-fieldset">
+                  <legend>Chagua mtandao wa malipo</legend>
+                  <div className="method-grid">
+                    {networks.map((method) => (
+                      <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value, bank_branch: method.value.endsWith("Branch") ? form.bank_branch : "", bank_branch_name: method.value.endsWith("Branch") ? form.bank_branch_name : "" })}>
+                        <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                      </button>
+                    ))}
+                  </div>
+                </fieldset>
+              )}
+              {!isLivePayment && form.payment_method.endsWith("Branch") && (
                 <>
                   <label className="field-label" htmlFor="bank-branch">Tawi la benki</label>
                   <select id="bank-branch" className="text-input" required value={form.bank_branch} onChange={(event) => setForm({ ...form, bank_branch: event.target.value })}>
@@ -1843,36 +1875,52 @@ function CheckoutPage({ productId }) {
             </form>
             <button className="cart-secondary-button" type="button" onClick={addToCart}>Ongeza bidhaa nyingine kwenye kikapu</button>
             {cartCount > 0 && <a className="cart-link" href="/cart">Nenda kikapu ({cartCount})</a>}
-            <p className="checkout-footnote">Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji.</p>
+            <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : "Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji."}</p>
           </section>
         )}
-        {orderId && order && !isCompleted && (
+        {orderId && order && !isCompleted && order.payment_status !== "FAILED" && (
           <section className="checkout-card">
-            <div className="eyebrow"><span /> MALIPO YA MAJARIBIO</div>
-            <h1>Thibitisha oda yako</h1>
+            <div className="eyebrow"><span /> {order.demo ? "MALIPO YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+            <h1>{order.demo ? "Thibitisha oda yako" : "Subiri ombi la malipo"}</h1>
             <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
-            <div className="payment-result pending"><strong>Haijalipwa bado</strong><span>Njia uliyochagua: {order.payment_method || selectedMethod?.label}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span><span>Bonyeza kitufe chini kuthibitisha demo. Hakuna pesa halisi itakayohamishwa.</span></div>
+            <div className="payment-result pending">
+              <strong>Haijalipwa bado</strong>
+              {order.demo ? (
+                <span>Bonyeza kitufe chini kuthibitisha demo. Hakuna pesa halisi itakayohamishwa.</span>
+              ) : (
+                <span>Ombi la malipo limetumwa kwa namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
+              )}
+              <span>Njia ya malipo: {order.payment_method || selectedMethod?.label}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
+            </div>
             {error && <p className="form-error" role="alert">{error}</p>}
-            <button className="generate-button" type="button" disabled={busy} onClick={completeDemo}>{busy ? "Inathibitisha..." : "Thibitisha malipo ya majaribio"}</button>
+            {order.demo && <button className="generate-button" type="button" disabled={busy} onClick={completeDemo}>{busy ? "Inathibitisha..." : "Thibitisha malipo ya majaribio"}</button>}
+          </section>
+        )}
+        {orderId && order?.payment_status === "FAILED" && (
+          <section className="checkout-card">
+            <div className="eyebrow"><span /> MALIPO HAYAKUKAMILIKA</div>
+            <h1>Malipo hayakupokelewa</h1>
+            <p className="buyer-intro">Hakuna uthibitisho wa malipo uliopokelewa. Unaweza kuanzisha ombi jipya.</p>
+            <button className="generate-button" type="button" onClick={retryPayment}>Jaribu tena</button>
           </section>
         )}
         {orderId && isCompleted && (
           <section className="checkout-card receipt-card">
             <div className="receipt-success" aria-hidden="true">✓</div>
-            <p className="receipt-kicker">RISITI YA MAJARIBIO</p>
+            <p className="receipt-kicker">{order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
             <h1>Oda imekamilika</h1>
             <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
             <dl className="receipt-details">
               <div><dt>Namba ya oda</dt><dd>{order.order_id}</dd></div>
               <div><dt>Mnunuzi</dt><dd>{order.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
               <div><dt>Njia ya malipo</dt><dd>{order.payment_method}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
-              <div><dt>Hali</dt><dd>Imekamilika (demo)</dd></div>
+              <div><dt>Hali</dt><dd>{order.demo ? "Imekamilika (demo)" : "Malipo yamepokelewa"}</dd></div>
               <div><dt>Jumla ya malipo</dt><dd>TZS {formatMoney(order.amount)}</dd></div>
               <div><dt>Kamisheni ya jukwaa ({order.commission_percent}%)</dt><dd>TZS {formatMoney(order.platform_fee)}</dd></div>
               <div><dt>Mgao wa muuzaji baada ya kamisheni</dt><dd>TZS {formatMoney(order.seller_payout)}</dd></div>
               <div><dt>Tarehe</dt><dd>{order.completed_at || "—"}</dd></div>
             </dl>
-            <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>
+            {order.demo && <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>}
             <button type="button" className="document-button" onClick={() => window.print()}>Chapisha / hifadhi kama PDF</button>
             <button type="button" className="document-button" onClick={() => downloadOrderReceipt().catch((downloadError) => setError(`Imeshindikana kutengeneza PDF: ${downloadError.message}`))}>Pakua risiti PDF</button>
             <a className="retry-link" href="/">Rudi mwanzo</a>
@@ -1890,6 +1938,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   const { notify } = useNotification();
   const [items, setItems] = useState(loadCart());
   const [products, setProducts] = useState([]);
+  const [paymentConfig, setPaymentConfig] = useState(null);
   const [checkoutId, setCheckoutId] = useState(initialCheckoutId);
   const [checkout, setCheckout] = useState(null);
   const previousCheckoutStatus = useRef(null);
@@ -1900,6 +1949,20 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   useEffect(() => {
     Promise.all(items.map((item) => api(`/products/${item.product_id}`).then((product) => ({ ...item, ...product })).catch(() => null)))
       .then((rows) => setProducts(rows.filter(Boolean)));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    api("/config/integrations")
+      .then((config) => {
+        if (active) setPaymentConfig(config);
+      })
+      .catch((requestError) => {
+        if (active) setError(requestError.message);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -1989,6 +2052,14 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
     }
   }
 
+  function retryCartPayment() {
+    setCheckoutId("");
+    setCheckout(null);
+    setError("");
+    previousCheckoutStatus.current = null;
+    window.history.replaceState({}, "", "/cart");
+  }
+
   async function downloadCartReceipt() {
     if (!checkout || checkout.payment_status !== "COMPLETED") return;
     await downloadReceiptPdf({
@@ -2014,6 +2085,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   }
 
   const total = products.reduce((sum, product) => sum + product.amount * (items.find((item) => item.product_id === product.id)?.quantity || 0), 0);
+  const isLivePayment = paymentConfig?.live_payments_enabled === true;
 
   return localize(
     <main className="page-shell checkout-shell">
@@ -2042,27 +2114,31 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <input id="cart-buyer-phone" className="text-input" type="tel" inputMode="tel" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
                   <label className="field-label" htmlFor="cart-buyer-address">Anuani ya delivery (hiari)</label>
                   <input id="cart-buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
-                  <fieldset className="payment-fieldset">
-                    <legend>Chagua mtandao wa malipo</legend>
-                    <div className="method-grid">
-                      {networks.map((method) => (
-                        <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
-                          <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
-                        </button>
-                      ))}
-                    </div>
-                  </fieldset>
+                  {isLivePayment ? (
+                    <p className="field-hint">ClickPesa itatuma ombi moja la USSD kwa jumla ya kikapu. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
+                  ) : (
+                    <fieldset className="payment-fieldset">
+                      <legend>Chagua mtandao wa malipo</legend>
+                      <div className="method-grid">
+                        {networks.map((method) => (
+                          <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
+                            <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                          </button>
+                        ))}
+                      </div>
+                    </fieldset>
+                  )}
                   {error && <p className="form-error" role="alert">{error}</p>}
                   <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}</button>
                 </form>
               )}
-              <p className="checkout-footnote">Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa.</p>
+              <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : "Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa."}</p>
             </>
           )}
           {checkoutId && checkout && (
             <>
-              <div className="eyebrow"><span /> ODA YA MAJARIBIO</div>
-              <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : "Gawanya kwa wauzaji"}</h1>
+              <div className="eyebrow"><span /> {checkout.demo ? "ODA YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+              <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : checkout.demo ? "Gawanya kwa wauzaji" : "Subiri ombi la malipo"}</h1>
               {checkout.splits.map((split) => (
                 <div className="cart-split" key={split.order_id}>
                   <strong>{split.shop_name}</strong>
@@ -2074,10 +2150,18 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               ))}
               <div className="checkout-amount">Jumla ya mteja: TZS {formatMoney(checkout.total_amount)}</div>
               <p className="field-hint">Kamisheni inakatwa kwenye mgao wa kila muuzaji; haiongezwi kwenye bili ya mnunuzi.</p>
-              {checkout.payment_status === "PENDING" && (
+              {checkout.payment_status === "PENDING" && !checkout.demo && <p className="payment-result pending">Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti.</p>}
+              {checkout.payment_status === "PENDING" && checkout.demo && (
                 <button className="generate-button" type="button" disabled={busy} onClick={completeCart}>{busy ? "Inathibitisha..." : "Thibitisha demo kwa wauzaji wote"}</button>
               )}
-              {checkout.payment_status === "COMPLETED" && <p className="success-message">Oda zote za wauzaji zimekamilika kama majaribio.</p>}
+              {checkout.payment_status === "COMPLETED" && <p className="success-message">{checkout.demo ? "Oda zote za wauzaji zimekamilika kama majaribio." : "Malipo yamepokelewa. Mgao wa wauzaji utalipwa kwa mikono."}</p>}
+              {checkout.payment_status === "FAILED" && (
+                <div className="payment-result pending">
+                  <strong>Malipo hayakupokelewa</strong>
+                  <span>Hakuna uthibitisho wa malipo uliopokelewa. Unaweza kuanzisha ombi jipya.</span>
+                  <button className="generate-button" type="button" onClick={retryCartPayment}>Jaribu tena</button>
+                </div>
+              )}
               {checkout.payment_status === "EXPIRED" && <p className="form-error">Oda imekwisha muda; anzisha kikapu kipya.</p>}
               {error && <p className="form-error" role="alert">{error}</p>}
               {checkout.payment_status === "COMPLETED" && (
@@ -2089,6 +2173,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                     <div><dt>Mgao wa wauzaji baada ya kamisheni</dt><dd>TZS {formatMoney(checkout.splits.reduce((sum, split) => sum + Number(split.seller_payout || 0), 0))}</dd></div>
                     <div><dt>Tarehe</dt><dd>{checkout.completed_at || "—"}</dd></div>
                   </dl>
+                  {checkout.demo && <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>}
                   <button type="button" className="document-button" onClick={() => window.print()}>Chapisha / hifadhi risiti kama PDF</button>
                   <button type="button" className="document-button" onClick={() => downloadCartReceipt().catch((downloadError) => setError(`Imeshindikana kutengeneza PDF: ${downloadError.message}`))}>Pakua risiti PDF</button>
                 </>

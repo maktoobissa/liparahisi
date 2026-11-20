@@ -9,6 +9,10 @@ services:
         value: "true"
       - key: PUBLIC_APP_URL
         value: https://liparahisi.onrender.com
+      - key: FRONTEND_URL
+        value: https://liparahisi.onrender.com
+      - key: BACKEND_URL
+        value: https://liparahisi.onrender.com
       - key: SELCOM_BASE_URL
         value: ""
       - key: SELCOM_API_KEY
@@ -17,6 +21,16 @@ services:
         sync: false
       - key: SELCOM_VENDOR
         sync: false
+      - key: CLICKPESA_CLIENT_ID
+        sync: false
+      - key: CLICKPESA_API_KEY
+        sync: false
+      - key: CLICKPESA_CHECKSUM_KEY
+        sync: false
+      - key: CLICKPESA_LIVE_ENABLED
+        value: "false"
+      - key: CLICKPESA_MANUAL_PAYOUTS_CONFIRMED
+        value: "false"
       - key: EMAIL_PROVIDER
         value: resend
       - key: RESEND_API_KEY

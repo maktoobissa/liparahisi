@@ -37,7 +37,7 @@ def email_is_configured():
     return False
 
 
-def deliver_email(to_email, subject, text):
+def deliver_email(to_email, subject, text, html=None):
     provider = email_provider()
     if provider == "resend":
         api_key = os.getenv("RESEND_API_KEY", "").strip()
@@ -48,15 +48,18 @@ def deliver_email(to_email, subject, text):
             )
         try:
             with httpx.Client(timeout=20.0) as client:
+                payload = {
+                    "from": sender,
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": text,
+                }
+                if html:
+                    payload["html"] = html
                 response = client.post(
                     RESEND_API_URL,
                     headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "from": sender,
-                        "to": [to_email],
-                        "subject": subject,
-                        "text": text,
-                    },
+                    json=payload,
                 )
                 response.raise_for_status()
         except httpx.TimeoutException as error:
@@ -88,6 +91,8 @@ def deliver_email(to_email, subject, text):
     message["From"] = sender
     message["To"] = to_email
     message.set_content(text)
+    if html:
+        message.add_alternative(html, subtype="html")
     use_ssl = (
         os.getenv("SMTP_USE_SSL", "false").strip().lower()
         in {"1", "true", "yes", "on"}

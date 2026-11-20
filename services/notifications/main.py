@@ -20,6 +20,7 @@ class EmailNotification(BaseModel):
     to_email: str = Field(min_length=5, max_length=254)
     subject: str = Field(min_length=1, max_length=200)
     text: str = Field(min_length=1, max_length=20000)
+    html: str | None = Field(default=None, max_length=50000)
 
     @validator("to_email")
     def validate_email(cls, value):
@@ -49,6 +50,7 @@ def initialize_db():
                 recipient TEXT NOT NULL,
                 subject TEXT NOT NULL,
                 body TEXT NOT NULL,
+                html_body TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'QUEUED',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -57,6 +59,12 @@ def initialize_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 sent_at TIMESTAMPTZ
             )
+            """
+        )
+        connection.execute(
+            """
+            ALTER TABLE email_outbox
+            ADD COLUMN IF NOT EXISTS html_body TEXT NOT NULL DEFAULT ''
             """
         )
         connection.execute(
@@ -83,7 +91,7 @@ def claim_email():
         with connection.transaction():
             row = connection.execute(
                 """
-                SELECT id, recipient, subject, body, attempts
+                SELECT id, recipient, subject, body, html_body, attempts
                 FROM email_outbox
                 WHERE (
                     status IN ('QUEUED', 'RETRY')
@@ -114,7 +122,12 @@ def claim_email():
 
 
 def send_email(row):
-    deliver_email(row["recipient"], row["subject"], row["body"])
+    deliver_email(
+        row["recipient"],
+        row["subject"],
+        row["body"],
+        row.get("html_body") or None,
+    )
 
 
 def finish_email(row, error=None):
@@ -125,7 +138,7 @@ def finish_email(row, error=None):
                 UPDATE email_outbox
                 SET status = 'SENT', sent_at = CURRENT_TIMESTAMP,
                     locked_at = NULL, last_error = '',
-                    recipient = '', subject = '', body = ''
+                    recipient = '', subject = '', body = '', html_body = ''
                 WHERE id = %s
                 """,
                 (row["id"],),
@@ -143,13 +156,15 @@ def finish_email(row, error=None):
                 locked_at = NULL, last_error = %s,
                 recipient = CASE WHEN %s = 'FAILED' THEN '' ELSE recipient END,
                 subject = CASE WHEN %s = 'FAILED' THEN '' ELSE subject END,
-                body = CASE WHEN %s = 'FAILED' THEN '' ELSE body END
+                body = CASE WHEN %s = 'FAILED' THEN '' ELSE body END,
+                html_body = CASE WHEN %s = 'FAILED' THEN '' ELSE html_body END
             WHERE id = %s
             """,
             (
                 "FAILED" if failed else "RETRY",
                 delay_seconds,
                 type(error).__name__,
+                "FAILED" if failed else "RETRY",
                 "FAILED" if failed else "RETRY",
                 "FAILED" if failed else "RETRY",
                 "FAILED" if failed else "RETRY",
@@ -233,9 +248,15 @@ def enqueue_email(
     with connect_db() as connection:
         connection.execute(
             """
-            INSERT INTO email_outbox (id, recipient, subject, body)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO email_outbox (id, recipient, subject, body, html_body)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (notification_id, payload.to_email, payload.subject, payload.text),
+            (
+                notification_id,
+                payload.to_email,
+                payload.subject,
+                payload.text,
+                payload.html or "",
+            ),
         )
     return {"notification_id": notification_id, "status": "QUEUED"}

@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
+import httpx
 
 from backend.main import integration_status, send_smtp_email
 from backend.email_delivery import RESEND_API_URL
@@ -105,6 +106,7 @@ class SmtpEmailTests(unittest.TestCase):
     def test_sends_through_resend_over_https(self):
         client = MagicMock()
         client.__enter__.return_value = client
+        html = "<p>Body</p>"
         with patch.dict(
             os.environ,
             {
@@ -115,7 +117,7 @@ class SmtpEmailTests(unittest.TestCase):
         ):
             with patch("backend.email_delivery.httpx.Client") as client_factory:
                 client_factory.return_value = client
-                send_smtp_email("buyer@example.com", "Subject", "Body")
+                send_smtp_email("buyer@example.com", "Subject", "Body", html)
 
         client.post.assert_called_once_with(
             RESEND_API_URL,
@@ -125,8 +127,52 @@ class SmtpEmailTests(unittest.TestCase):
                 "to": ["buyer@example.com"],
                 "subject": "Subject",
                 "text": "Body",
+                "html": html,
             },
         )
+
+    def test_sends_multipart_html_over_smtp(self):
+        server = MagicMock()
+        server.__enter__.return_value = server
+        with patch("backend.email_delivery.smtplib.SMTP", return_value=server):
+            send_smtp_email(
+                "buyer@example.com",
+                "Subject",
+                "Plain text",
+                "<p>HTML content</p>",
+            )
+
+        message = server.send_message.call_args.args[0]
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        self.assertEqual(
+            [part.get_content_type() for part in message.iter_parts()],
+            ["text/plain", "text/html"],
+        )
+
+    def test_resend_failure_does_not_expose_provider_details(self):
+        response = httpx.Response(
+            403,
+            request=httpx.Request("POST", RESEND_API_URL),
+        )
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value = response
+        with patch.dict(
+            os.environ,
+            {
+                "EMAIL_PROVIDER": "resend",
+                "RESEND_API_KEY": "test-resend-key",
+                "EMAIL_FROM": "mail@example.com",
+            },
+        ):
+            with patch("backend.email_delivery.httpx.Client") as client_factory:
+                client_factory.return_value = client
+                with self.assertRaises(HTTPException) as raised:
+                    send_smtp_email("buyer@example.com", "Subject", "Body")
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertNotIn("test-resend-key", raised.exception.detail)
+        self.assertNotIn("buyer@example.com", raised.exception.detail)
 
     def test_resend_fails_clearly_without_configuration(self):
         with patch.dict(
