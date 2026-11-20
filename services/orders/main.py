@@ -7,16 +7,19 @@ from backend.main import (
     CancellationInput,
     CancellationResolutionInput,
     DeliveryUpdateInput,
+    PayoutEntryInput,
     ReturnRequestInput,
     ReviewInput,
     archive_sale,
     complete_cart_checkout,
     create_cart_checkout,
     create_checkout,
+    create_manual_payout,
     create_review,
     dashboard,
     demo_complete,
     list_cancellations,
+    list_payout_ledger,
     list_sales,
     list_reviews,
     order_status,
@@ -120,6 +123,18 @@ app.add_api_route(
 app.add_api_route(
     "/orders/{order_id}/return",
     request_return,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/payouts",
+    list_payout_ledger,
+    methods=["GET"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/payouts",
+    create_manual_payout,
     methods=["POST"],
     dependencies=[Depends(verify_gateway_token)],
 )

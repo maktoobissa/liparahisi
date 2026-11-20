@@ -802,6 +802,7 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [stockMovements, setStockMovements] = useState([]);
   const [cancellations, setCancellations] = useState([]);
   const [returnRequests, setReturnRequests] = useState([]);
+  const [payoutData, setPayoutData] = useState({ accounts: [], entries: [] });
   const [reviews, setReviews] = useState([]);
   const [tickets, setTickets] = useState([]);
   const [coupons, setCoupons] = useState([]);
@@ -810,6 +811,13 @@ function MarketplaceDashboard({ user, onLogout }) {
     discount_type: "PERCENT",
     discount_value: "10",
     max_redemptions: "",
+  });
+  const [payoutForm, setPayoutForm] = useState({
+    seller_id: "",
+    amount: "",
+    payment_method: "MOBILE_MONEY",
+    payment_reference: "",
+    note: "",
   });
   const [productForm, setProductForm] = useState({
     name: "", description: "", image_url: "", category: "", amount: "",
@@ -844,14 +852,16 @@ function MarketplaceDashboard({ user, onLogout }) {
     const salesParams = new URLSearchParams(Object.fromEntries(
       Object.entries(salesFilters).filter(([, value]) => value),
     ));
-    const [dashboard, productRows, salesRows] = await Promise.all([
+    const [dashboard, productRows, salesRows, payouts] = await Promise.all([
       api("/dashboard"),
       api(`/products?q=${encodeURIComponent(productQuery)}`),
       api(`/sales?${salesParams.toString()}`),
+      api("/payouts"),
     ]);
     setStats(dashboard);
     setProducts(productRows);
     setSales(salesRows);
+    setPayoutData(payouts);
     if (!seenSalesRef.current) {
       seenSalesRef.current = new Set(salesRows.map((sale) => sale.order_id));
     }
@@ -897,9 +907,10 @@ function MarketplaceDashboard({ user, onLogout }) {
       inFlight = true;
       try {
         const params = new URLSearchParams(Object.entries(salesFilters).filter(([, value]) => value));
-        const [dashboard, latestSales, adminData] = await Promise.all([
+        const [dashboard, latestSales, payouts, adminData] = await Promise.all([
           api("/dashboard"),
           api(`/sales?${params.toString()}`),
+          api("/payouts"),
           isAdmin ? Promise.all([
             api("/admin/sellers"),
             api("/admin/cancellations"),
@@ -911,6 +922,7 @@ function MarketplaceDashboard({ user, onLogout }) {
         if (active) {
           setStats(dashboard);
           setSales(latestSales);
+          setPayoutData(payouts);
           const knownSales = seenSalesRef.current || new Set();
           const newSales = latestSales.filter((sale) => !knownSales.has(sale.order_id));
           latestSales.forEach((sale) => knownSales.add(sale.order_id));
@@ -1330,10 +1342,46 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function recordManualPayout(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    const sellerId = payoutForm.seller_id || payoutData.accounts[0]?.seller_id;
+    if (!sellerId) {
+      setError("Hakuna muuzaji mwenye akaunti ya malipo.");
+      return;
+    }
+    try {
+      await api("/payouts", {
+        method: "POST",
+        body: JSON.stringify({
+          ...payoutForm,
+          seller_id: sellerId,
+          amount: Number(payoutForm.amount),
+        }),
+      });
+      setPayoutForm((current) => ({
+        ...current,
+        seller_id: sellerId,
+        amount: "",
+        payment_reference: "",
+        note: "",
+      }));
+      setMessage("Rekodi ya malipo imehifadhiwa; mfumo haukutuma pesa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  const selectedPayoutAccount = payoutData.accounts.find(
+    (account) => account.seller_id === payoutForm.seller_id,
+  ) || payoutData.accounts[0];
   const nav = [
     ["overview", "Muhtasari"],
     ["products", "Bidhaa"],
     ["sales", "Mauzo"],
+    ["payouts", isAdmin ? "Malipo ya wauzaji" : "Malipo yangu"],
     ...(!isAdmin ? [["storefront", "Duka lako"], ["stock", "Stock"]] : []),
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
     ...(isAdmin ? [["categories", "Makundi"], ["coupons", "Kuponi"], ["cancellations", "Kughairi"], ["returns", "Marejesho"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
@@ -1512,6 +1560,121 @@ function MarketplaceDashboard({ user, onLogout }) {
           </form>
           <SalesTable sales={sales} isAdmin={isAdmin} onArchive={archiveSale} onUpdateDelivery={updateDelivery} />
           {!isAdmin && <p className="field-hint">Ukificha rekodi, itaondoka kwenye orodha yako lakini admin ataendelea kuiona.</p>}
+        </section>
+      )}
+
+      {tab === "payouts" && (
+        <section className="dashboard-content feature-list">
+          <div className="dashboard-section-heading">
+            <h2>{isAdmin ? "Malipo ya wauzaji" : "Malipo yangu"}</h2>
+            <span>{payoutData.accounts.length} akaunti</span>
+          </div>
+          <p className="field-hint">Salio linatokana na oda zilizokamilika ukiondoa malipo yaliyorekodiwa. Rekodi haianzi uhamisho wa pesa.</p>
+          <div className="feature-columns">
+            <div className="feature-list">
+              {payoutData.accounts.map((account) => (
+                <article className="seller-card" key={account.seller_id}>
+                  <div>
+                    <strong>{account.shop_name || account.seller_name}</strong>
+                    <span>{account.seller_name}</span>
+                    <small>Mapato yaliyokamilika: TZS {formatMoney(account.completed_earned)}</small>
+                    <small>Malipo yaliyorekodiwa: TZS {formatMoney(account.recorded_paid)}</small>
+                    <small>Salio linalodaiwa: TZS {formatMoney(account.outstanding_amount)}</small>
+                    {account.overpaid_amount > 0 && <small>Malipo yanayozidi salio: TZS {formatMoney(account.overpaid_amount)}</small>}
+                  </div>
+                </article>
+              ))}
+              {!payoutData.accounts.length && <p className="empty-state">Hakuna akaunti ya malipo ya muuzaji.</p>}
+            </div>
+            {isAdmin && (
+              <form className="form-card" onSubmit={recordManualPayout}>
+                <h3>Rekodi malipo yaliyofanywa nje ya mfumo</h3>
+                <label className="field-label" htmlFor="payout-seller">Muuzaji</label>
+                <select
+                  id="payout-seller"
+                  className="text-input"
+                  required
+                  value={payoutForm.seller_id || selectedPayoutAccount?.seller_id || ""}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, seller_id: event.target.value })}
+                >
+                  {payoutData.accounts.map((account) => (
+                    <option key={account.seller_id} value={account.seller_id}>
+                      {account.shop_name || account.seller_name} · TZS {formatMoney(account.outstanding_amount)}
+                    </option>
+                  ))}
+                </select>
+                <label className="field-label" htmlFor="payout-amount">Kiasi (TZS)</label>
+                <input
+                  id="payout-amount"
+                  className="text-input"
+                  type="number"
+                  min="1"
+                  max={selectedPayoutAccount?.outstanding_amount || 0}
+                  step="1"
+                  required
+                  value={payoutForm.amount}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, amount: event.target.value })}
+                />
+                <label className="field-label" htmlFor="payout-method">Njia ya malipo</label>
+                <select
+                  id="payout-method"
+                  className="text-input"
+                  value={payoutForm.payment_method}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, payment_method: event.target.value })}
+                >
+                  <option value="MOBILE_MONEY">MOBILE_MONEY</option>
+                  <option value="BANK_TRANSFER">BANK_TRANSFER</option>
+                  <option value="CASH">CASH</option>
+                  <option value="OTHER">OTHER</option>
+                </select>
+                <label className="field-label" htmlFor="payout-reference">Rejea ya muamala</label>
+                <input
+                  id="payout-reference"
+                  className="text-input"
+                  minLength={3}
+                  maxLength={100}
+                  required
+                  value={payoutForm.payment_reference}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, payment_reference: event.target.value })}
+                />
+                <label className="field-label" htmlFor="payout-note">Maelezo (hiari)</label>
+                <input
+                  id="payout-note"
+                  className="text-input"
+                  maxLength={500}
+                  value={payoutForm.note}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, note: event.target.value })}
+                />
+                <button
+                  className="generate-button"
+                  type="submit"
+                  disabled={
+                    !selectedPayoutAccount
+                    || selectedPayoutAccount.outstanding_amount <= 0
+                    || !Number.isInteger(Number(payoutForm.amount))
+                    || Number(payoutForm.amount) <= 0
+                    || Number(payoutForm.amount) > selectedPayoutAccount.outstanding_amount
+                  }
+                >
+                  Rekodi malipo yaliyofanywa
+                </button>
+                <p className="field-hint">Hakikisha malipo yamefanywa kwanza; usiweke PIN, nenosiri, au taarifa za siri za akaunti.</p>
+              </form>
+            )}
+          </div>
+          <div className="feature-list">
+            <h3>Historia ya malipo</h3>
+            {payoutData.entries.map((entry) => (
+              <article className="seller-card" key={entry.id}>
+                <div>
+                  <strong>{entry.shop_name || entry.seller_name} · TZS {formatMoney(entry.amount)}</strong>
+                  <span><span>{entry.payment_method}</span> · {entry.payment_reference} · {entry.created_at}</span>
+                  <small>{entry.recorded_by_name || "Admin"}{entry.note && ` · ${entry.note}`}</small>
+                </div>
+              </article>
+            ))}
+            {!payoutData.entries.length && <p className="empty-state">Hakuna malipo yaliyorekodiwa.</p>}
+          </div>
         </section>
       )}
 

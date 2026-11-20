@@ -23,6 +23,9 @@ sales.
 - Buyer cancellation requests and return/refund requests for delivered orders,
   with administrator resolution. Return approval records a decision only; no
   payment is refunded or transferred by the system.
+- Seller payout ledger that reconciles completed-order earnings against
+  admin-recorded partial payments; entries document external transfers and
+  never initiate one.
 - Verified-order reviews subject to administrator moderation.
 - Buyer support tickets with administrator responses.
 - Admin-managed marketplace-wide percentage or fixed-value coupons, limited to

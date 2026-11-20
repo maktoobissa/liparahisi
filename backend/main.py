@@ -505,6 +505,17 @@ def initialize_db():
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 resolved_at {timestamp_type}
             );
+            CREATE TABLE IF NOT EXISTS seller_payouts (
+                id TEXT PRIMARY KEY,
+                seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                amount INTEGER NOT NULL CHECK (amount > 0),
+                payment_method TEXT NOT NULL,
+                payment_reference TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                recorded_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (seller_id, payment_reference)
+            );
             CREATE TABLE IF NOT EXISTS support_tickets (
                 id TEXT PRIMARY KEY,
                 user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -840,6 +851,21 @@ class ReturnRequestInput(BaseModel):
 class ReturnResolutionInput(BaseModel):
     status: Literal["APPROVED", "REJECTED"]
     admin_note: str = Field(default="", max_length=1000)
+
+
+class PayoutEntryInput(BaseModel):
+    seller_id: str = Field(min_length=1, max_length=64)
+    amount: int = Field(gt=0, le=999999999)
+    payment_method: Literal["MOBILE_MONEY", "BANK_TRANSFER", "CASH", "OTHER"]
+    payment_reference: str = Field(min_length=3, max_length=100)
+    note: str = Field(default="", max_length=500)
+
+    @validator("payment_reference")
+    def normalize_payment_reference(cls, value):
+        normalized = value.strip()
+        if len(normalized) < 3:
+            raise ValueError("Rejea ya malipo lazima iwe na angalau herufi 3.")
+        return normalized
 
 
 class ReviewInput(BaseModel):
@@ -2695,6 +2721,32 @@ async def order_dashboard_gateway(request: Request):
     return await proxy_internal_api(
         request,
         "dashboard",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/payouts", methods=["GET"])
+async def order_payout_ledger_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "payouts",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/payouts", methods=["POST"])
+async def order_manual_payout_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "payouts",
         "Orders",
         "ORDERS_SERVICE_URL",
         "ORDERS_SERVICE_TOKEN",
@@ -5380,6 +5432,150 @@ def dashboard(request: Request):
         "product_count": product_count,
         "commission_percent": COMMISSION_PERCENT,
         "demo": is_demo_mode(),
+    }
+
+
+def list_payout_ledger(request: Request):
+    actor = get_current_user(request)
+    if actor["role"] not in {"ADMIN", "SELLER"}:
+        raise HTTPException(status_code=403, detail="Taarifa za malipo zinapatikana kwa wauzaji na admin pekee.")
+    seller_filter = "WHERE u.role = 'SELLER'"
+    parameters = ()
+    if actor["role"] == "SELLER":
+        seller_filter += " AND u.id = ?"
+        parameters = (actor["id"],)
+    with db_connection() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT u.id AS seller_id, u.full_name AS seller_name, u.shop_name,
+                   COALESCE(earned.total, 0) AS completed_earned,
+                   COALESCE(paid.total, 0) AS recorded_paid
+            FROM users u
+            LEFT JOIN (
+                SELECT seller_id, SUM(seller_payout) AS total
+                FROM orders
+                WHERE payment_status = 'COMPLETED'
+                GROUP BY seller_id
+            ) earned ON earned.seller_id = u.id
+            LEFT JOIN (
+                SELECT seller_id, SUM(amount) AS total
+                FROM seller_payouts
+                GROUP BY seller_id
+            ) paid ON paid.seller_id = u.id
+            {seller_filter}
+            ORDER BY u.shop_name, u.full_name
+            LIMIT 500
+            """,
+            parameters,
+        ).fetchall()
+        entry_query = """
+            SELECT p.id, p.seller_id, p.amount, p.payment_method,
+                   p.payment_reference, p.note, p.created_at,
+                   u.full_name AS seller_name, u.shop_name,
+                   admin.full_name AS recorded_by_name
+            FROM seller_payouts p
+            JOIN users u ON u.id = p.seller_id
+            LEFT JOIN users admin ON admin.id = p.recorded_by
+        """
+        entry_parameters = ()
+        if actor["role"] == "SELLER":
+            entry_query += " WHERE p.seller_id = ?"
+            entry_parameters = (actor["id"],)
+        entry_query += " ORDER BY p.created_at DESC LIMIT 500"
+        entries = connection.execute(entry_query, entry_parameters).fetchall()
+
+    accounts = []
+    for row in rows:
+        account = dict(row)
+        eligible_total = max(0, account["completed_earned"])
+        account["outstanding_amount"] = max(
+            0,
+            eligible_total - account["recorded_paid"],
+        )
+        account["overpaid_amount"] = max(
+            0,
+            account["recorded_paid"] - eligible_total,
+        )
+        accounts.append(account)
+    return {
+        "accounts": accounts,
+        "entries": [dict(row) for row in entries],
+        "automatic_transfers_enabled": False,
+    }
+
+
+def create_manual_payout(payload: PayoutEntryInput, request: Request):
+    actor = require_admin(request)
+    payout_id = secrets.token_hex(16)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE users SET id = id WHERE id = ? AND role = 'SELLER'",
+            (payload.seller_id,),
+        )
+        seller = connection.execute(
+            "SELECT id FROM users WHERE id = ? AND role = 'SELLER'",
+            (payload.seller_id,),
+        ).fetchone()
+        if seller is None:
+            raise HTTPException(status_code=404, detail="Muuzaji hakupatikana.")
+        completed_earned = connection.execute(
+            """
+            SELECT COALESCE(SUM(seller_payout), 0) AS total
+            FROM orders
+            WHERE seller_id = ? AND payment_status = 'COMPLETED'
+            """,
+            (payload.seller_id,),
+        ).fetchone()["total"]
+        recorded_paid = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM seller_payouts WHERE seller_id = ?",
+            (payload.seller_id,),
+        ).fetchone()["total"]
+        outstanding = max(0, max(0, completed_earned) - recorded_paid)
+        if payload.amount > outstanding:
+            raise HTTPException(
+                status_code=409,
+                detail="Malipo yanazidi salio la muuzaji.",
+            )
+        try:
+            connection.execute(
+                """
+                INSERT INTO seller_payouts
+                    (id, seller_id, amount, payment_method, payment_reference, note, recorded_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payout_id,
+                    payload.seller_id,
+                    payload.amount,
+                    payload.payment_method,
+                    payload.payment_reference,
+                    payload.note.strip(),
+                    actor["id"],
+                ),
+            )
+        except Exception as error:
+            if is_integrity_error(error):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Rejea ya malipo hii tayari imerekodiwa kwa muuzaji.",
+                ) from error
+            raise
+    record_audit(
+        "MANUAL_PAYOUT_RECORDED",
+        "seller_payout",
+        payout_id,
+        f"amount={payload.amount}; method={payload.payment_method}; no transfer initiated",
+        actor=actor,
+        request=request,
+    )
+    return {
+        "id": payout_id,
+        "seller_id": payload.seller_id,
+        "amount": payload.amount,
+        "payment_method": payload.payment_method,
+        "payment_reference": payload.payment_reference,
+        "outstanding_amount": outstanding - payload.amount,
+        "transfer_initiated": False,
     }
 
 

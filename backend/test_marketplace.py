@@ -1599,6 +1599,72 @@ class MarketplaceFlowTests(unittest.TestCase):
                     (product_id,),
                 ).fetchone()["stock_quantity"]
             self.assertEqual(stock_after_approval, stock_before_approval)
+            payout_ledger = self.client.get("/api/payouts")
+            self.assertEqual(payout_ledger.status_code, 200)
+            self.assertFalse(payout_ledger.json()["automatic_transfers_enabled"])
+            payout_account = next(
+                account
+                for account in payout_ledger.json()["accounts"]
+                if account["seller_id"] == seller["id"]
+            )
+            self.assertEqual(payout_account["completed_earned"], 2850)
+            self.assertEqual(payout_account["outstanding_amount"], 2850)
+            payout = self.client.post(
+                "/api/payouts",
+                json={
+                    "seller_id": seller["id"],
+                    "amount": 1000,
+                    "payment_method": "MOBILE_MONEY",
+                    "payment_reference": "TXN-REF-001",
+                    "note": "Imelipwa nje ya mfumo",
+                },
+            )
+            self.assertEqual(payout.status_code, 200)
+            self.assertFalse(payout.json()["transfer_initiated"])
+            self.assertEqual(payout.json()["outstanding_amount"], 1850)
+            duplicate_payout = self.client.post(
+                "/api/payouts",
+                json={
+                    "seller_id": seller["id"],
+                    "amount": 1000,
+                    "payment_method": "MOBILE_MONEY",
+                    "payment_reference": "TXN-REF-001",
+                },
+            )
+            self.assertEqual(duplicate_payout.status_code, 409)
+            overpayment = self.client.post(
+                "/api/payouts",
+                json={
+                    "seller_id": seller["id"],
+                    "amount": 2000,
+                    "payment_method": "BANK_TRANSFER",
+                    "payment_reference": "BANK-REF-002",
+                },
+            )
+            self.assertEqual(overpayment.status_code, 409)
+            seller_payout_ledger = seller_client.get("/api/payouts")
+            self.assertEqual(seller_payout_ledger.status_code, 200)
+            self.assertEqual(
+                seller_payout_ledger.json()["accounts"][0]["outstanding_amount"],
+                1850,
+            )
+            self.assertEqual(len(seller_payout_ledger.json()["entries"]), 1)
+            self.assertEqual(
+                buyer_client.get("/api/payouts").status_code,
+                403,
+            )
+            self.assertEqual(
+                seller_client.post(
+                    "/api/payouts",
+                    json={
+                        "seller_id": seller["id"],
+                        "amount": 1,
+                        "payment_method": "CASH",
+                        "payment_reference": "SELLER-REF-001",
+                    },
+                ).status_code,
+                403,
+            )
             dated_sales = seller_client.get(
                 "/api/sales?start_date=2020-01-01&end_date=2099-12-31"
             )
