@@ -1442,7 +1442,13 @@ class MarketplaceFlowTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(stored_order["buyer_email"], "buyer@example.com")
             guest_order_status = guest_client.get(f"/api/orders/{order_id}").json()
-            for field in ("buyer_name", "delivery_address", "tracking_code"):
+            for field in (
+                "buyer_name",
+                "delivery_address",
+                "delivery_carrier",
+                "tracking_code",
+                "delivery_fee",
+            ):
                 self.assertNotIn(field, guest_order_status)
             history = buyer_client.get("/api/orders/history")
             self.assertEqual(history.status_code, 200)
@@ -1469,18 +1475,52 @@ class MarketplaceFlowTests(unittest.TestCase):
         with seller_client:
             delivery = seller_client.put(
                 f"/api/orders/{order_id}/delivery",
-                json={"delivery_status": "PROCESSING", "tracking_code": ""},
+                json={
+                    "delivery_status": "PROCESSING",
+                    "delivery_carrier": "DHL",
+                    "tracking_code": "TRACK-1",
+                    "delivery_fee": 3500,
+                },
             )
             self.assertEqual(delivery.status_code, 200)
+            self.assertEqual(delivery.json()["delivery_carrier"], "DHL")
+            self.assertEqual(delivery.json()["tracking_code"], "TRACK-1")
+            self.assertEqual(delivery.json()["delivery_fee"], 3500)
             invalid_delivery = seller_client.put(
                 f"/api/orders/{order_id}/delivery",
-                json={"delivery_status": "DELIVERED", "tracking_code": "TRACK-1"},
+                json={
+                    "delivery_status": "DELIVERED",
+                    "delivery_carrier": "DHL",
+                    "tracking_code": "TRACK-1",
+                    "delivery_fee": 3500,
+                },
             )
             self.assertEqual(invalid_delivery.status_code, 409)
+            negative_fee = seller_client.put(
+                f"/api/orders/{order_id}/delivery",
+                json={
+                    "delivery_status": "PROCESSING",
+                    "delivery_carrier": "DHL",
+                    "tracking_code": "TRACK-1",
+                    "delivery_fee": -1,
+                },
+            )
+            self.assertEqual(negative_fee.status_code, 422)
             sales = seller_client.get("/api/sales?status=COMPLETED")
             self.assertEqual(sales.status_code, 200)
             self.assertEqual(sales.json()[0]["delivery_status"], "PROCESSING")
             self.assertEqual(sales.json()[0]["delivery_address"], "Dar es Salaam")
+            self.assertEqual(sales.json()[0]["delivery_carrier"], "DHL")
+            self.assertEqual(sales.json()[0]["tracking_code"], "TRACK-1")
+            self.assertEqual(sales.json()[0]["delivery_fee"], 3500)
+            buyer_order_status = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(buyer_order_status["delivery_carrier"], "DHL")
+            self.assertEqual(buyer_order_status["tracking_code"], "TRACK-1")
+            self.assertEqual(buyer_order_status["delivery_fee"], 3500)
+            self.assertEqual(buyer_order_status["amount"], 3000)
+            buyer_history = buyer_client.get("/api/orders/history").json()
+            self.assertEqual(buyer_history[0]["delivery_carrier"], "DHL")
+            self.assertEqual(buyer_history[0]["delivery_fee"], 3500)
             dated_sales = seller_client.get(
                 "/api/sales?start_date=2020-01-01&end_date=2099-12-31"
             )
@@ -1743,6 +1783,8 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.assertEqual(len(sales), 1)
         self.assertEqual(sales[0]["order_id"], "OLD-ORDER")
         self.assertEqual(sales[0]["platform_fee"], 0)
+        self.assertEqual(sales[0]["delivery_carrier"], "")
+        self.assertEqual(sales[0]["delivery_fee"], 0)
 
     def test_abliner_checkout_and_signed_webhook_are_idempotent(self):
         with patch.dict(

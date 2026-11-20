@@ -1155,10 +1155,15 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
-  async function updateDelivery(orderId, status, trackingCode) {
+  async function updateDelivery(orderId, status, deliveryCarrier, trackingCode, deliveryFee) {
     await api(`/orders/${encodeURIComponent(orderId)}/delivery`, {
       method: "PUT",
-      body: JSON.stringify({ delivery_status: status, tracking_code: trackingCode }),
+      body: JSON.stringify({
+        delivery_status: status,
+        delivery_carrier: deliveryCarrier,
+        tracking_code: trackingCode,
+        delivery_fee: deliveryFee,
+      }),
     });
     await refresh();
   }
@@ -1687,14 +1692,22 @@ function SalesTable({ sales, isAdmin, onArchive, onUpdateDelivery }) {
 function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
   const localize = useLocalize();
   const [deliveryStatus, setDeliveryStatus] = useState(sale.delivery_status || "UNFULFILLED");
+  const [deliveryCarrier, setDeliveryCarrier] = useState(sale.delivery_carrier || "");
   const [trackingCode, setTrackingCode] = useState(sale.tracking_code || "");
+  const [deliveryFee, setDeliveryFee] = useState(String(sale.delivery_fee || 0));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useFeedbackState("error");
   async function saveDelivery() {
     setBusy(true);
     setError("");
     try {
-      await onUpdateDelivery(sale.order_id, deliveryStatus, trackingCode);
+      await onUpdateDelivery(
+        sale.order_id,
+        deliveryStatus,
+        deliveryCarrier,
+        trackingCode,
+        Number(deliveryFee),
+      );
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -1713,8 +1726,11 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
             <select className="text-input" aria-label="Hali ya delivery" value={deliveryStatus} onChange={(event) => setDeliveryStatus(event.target.value)}>
               <option value="UNFULFILLED">Haijaanza</option><option value="PROCESSING">Inaandaliwa</option><option value="SHIPPED">Imesafirishwa</option><option value="DELIVERED">Imefikishwa</option>
             </select>
+            <input className="text-input" aria-label="Jina la kampuni ya usafirishaji" maxLength={100} placeholder="Jina la kampuni ya usafirishaji" value={deliveryCarrier} onChange={(event) => setDeliveryCarrier(event.target.value)} />
             <input className="text-input" aria-label="Namba ya ufuatiliaji" maxLength={100} placeholder="Tracking code" value={trackingCode} onChange={(event) => setTrackingCode(event.target.value)} />
-            <button type="button" className="table-action" disabled={busy || deliveryStatus === "UNFULFILLED"} onClick={saveDelivery}>{busy ? "..." : "Hifadhi"}</button>
+            <input className="text-input" aria-label="Ada ya delivery (TZS)" type="number" min="0" max="999999999" step="1" value={deliveryFee} onChange={(event) => setDeliveryFee(event.target.value)} />
+            <small>Ada ya delivery inalipwa moja kwa moja kwa muuzaji; haijajumuishwa kwenye malipo ya bidhaa.</small>
+            <button type="button" className="table-action" disabled={busy || deliveryStatus === "UNFULFILLED" || !Number.isInteger(Number(deliveryFee)) || Number(deliveryFee) < 0} onClick={saveDelivery}>{busy ? "..." : "Hifadhi"}</button>
             {error && <small className="form-error">{error}</small>}
           </div>
         ) : <span>{sale.delivery_status || "UNFULFILLED"}</span>}
@@ -2074,7 +2090,19 @@ function BuyerOrderRow({ order, onAction }) {
       <td><strong>{order.order_id}</strong><small>{order.created_at}</small></td>
       <td>{order.product_name}{order.variant_label && <small>{order.variant_label}</small>}<small>{order.shop_name || "Muuzaji"}</small></td>
       <td>{order.payment_status}</td>
-      <td>{order.delivery_status}{order.tracking_code && <small>{order.tracking_code}</small>}{order.delivery_address && <small>{order.delivery_address}</small>}</td>
+      <td>
+        {order.delivery_status}
+        {order.delivery_carrier && <small><span>Kampuni ya usafirishaji:</span> {order.delivery_carrier}</small>}
+        {order.tracking_code && <small><span>Tracking code:</span> {order.tracking_code}</small>}
+        {order.delivery_fee > 0 && (
+          <small>
+            <span>Ada ya delivery:</span> TZS {formatMoney(order.delivery_fee)}
+            <br />
+            Ada ya delivery inalipwa moja kwa moja kwa muuzaji; haijajumuishwa kwenye malipo ya bidhaa.
+          </small>
+        )}
+        {order.delivery_address && <small>{order.delivery_address}</small>}
+      </td>
       <td>TZS {formatMoney(order.amount)}</td>
       <td>
         <a className="table-action" href={`/pay/${order.product_id}?order_id=${encodeURIComponent(order.order_id)}`}>Fungua</a>

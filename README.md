@@ -18,8 +18,10 @@ sales.
   CSV import/export, and date/status-filtered sales.
 - Product variants with separate stock counts; each variant uses its product's
   base price and can be selected in single-item or cart checkout.
-- Order delivery status and tracking codes, buyer cancellation requests, and
-  verified-order reviews subject to administrator moderation.
+- Seller-managed delivery status, carrier, tracking code, and a separately
+  collected delivery fee shown to buyers (not included in the product payment).
+  Also includes buyer cancellation requests and verified-order reviews subject
+  to administrator moderation.
 - Buyer support tickets with administrator responses.
 - Admin-managed marketplace-wide percentage or fixed-value coupons, limited to
   demo checkout and one completed redemption per buyer.

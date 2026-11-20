@@ -423,7 +423,9 @@ def initialize_db():
                 bank_branch TEXT NOT NULL DEFAULT '',
                 delivery_address TEXT NOT NULL DEFAULT '',
                 delivery_status TEXT NOT NULL DEFAULT 'UNFULFILLED',
+                delivery_carrier TEXT NOT NULL DEFAULT '',
                 tracking_code TEXT NOT NULL DEFAULT '',
+                delivery_fee INTEGER NOT NULL DEFAULT 0 CHECK (delivery_fee >= 0),
                 delivered_at {timestamp_type},
                 cancelled_at {timestamp_type},
                 payment_status TEXT NOT NULL DEFAULT 'PENDING',
@@ -557,7 +559,9 @@ def initialize_db():
             "bank_branch": "TEXT NOT NULL DEFAULT ''",
             "delivery_address": "TEXT NOT NULL DEFAULT ''",
             "delivery_status": "TEXT NOT NULL DEFAULT 'UNFULFILLED'",
+            "delivery_carrier": "TEXT NOT NULL DEFAULT ''",
             "tracking_code": "TEXT NOT NULL DEFAULT ''",
+            "delivery_fee": "INTEGER NOT NULL DEFAULT 0",
             "delivered_at": timestamp_type,
             "cancelled_at": timestamp_type,
             "product_cost": "INTEGER NOT NULL DEFAULT 0",
@@ -798,7 +802,9 @@ class StorefrontInput(BaseModel):
 
 class DeliveryUpdateInput(BaseModel):
     delivery_status: Literal["PROCESSING", "SHIPPED", "DELIVERED"]
+    delivery_carrier: str = Field(default="", max_length=100)
     tracking_code: str = Field(default="", max_length=100)
+    delivery_fee: int = Field(default=0, ge=0, le=999999999)
 
 
 class CancellationInput(BaseModel):
@@ -4732,7 +4738,9 @@ def order_status(order_id: str, request: Request):
             "bank_branch": order["bank_branch"],
             "delivery_address": order["delivery_address"],
             "delivery_status": order["delivery_status"],
+            "delivery_carrier": order["delivery_carrier"],
             "tracking_code": order["tracking_code"],
+            "delivery_fee": order["delivery_fee"],
         })
     return result
 
@@ -4743,7 +4751,8 @@ def order_history(request: Request):
         rows = connection.execute(
             """
             SELECT o.order_id, o.product_id, o.amount, o.payment_status,
-                   o.delivery_status, o.tracking_code, o.delivery_address,
+                   o.delivery_status, o.delivery_carrier, o.tracking_code,
+                   o.delivery_fee, o.delivery_address,
                    o.created_at, o.completed_at, p.name AS product_name,
                    p.image_url, u.shop_name, oi.variant_label
             FROM orders o
@@ -4787,24 +4796,34 @@ def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Reques
         connection.execute(
             """
             UPDATE orders
-            SET delivery_status = ?, tracking_code = ?,
+            SET delivery_status = ?, delivery_carrier = ?, tracking_code = ?,
+                delivery_fee = ?,
                 delivered_at = CASE WHEN ? = 'DELIVERED' THEN CURRENT_TIMESTAMP ELSE delivered_at END
             WHERE order_id = ?
             """,
-            (payload.delivery_status, payload.tracking_code.strip(), payload.delivery_status, order_id),
+            (
+                payload.delivery_status,
+                payload.delivery_carrier.strip(),
+                payload.tracking_code.strip(),
+                payload.delivery_fee,
+                payload.delivery_status,
+                order_id,
+            ),
         )
     record_audit(
         "DELIVERY_STATUS_UPDATED",
         "order",
         order_id,
-        payload.delivery_status,
+        f"status={payload.delivery_status}; carrier={payload.delivery_carrier.strip()}; fee={payload.delivery_fee}",
         actor=actor,
         request=request,
     )
     return {
         "order_id": order_id,
         "delivery_status": payload.delivery_status,
+        "delivery_carrier": payload.delivery_carrier.strip(),
         "tracking_code": payload.tracking_code.strip(),
+        "delivery_fee": payload.delivery_fee,
     }
 
 
@@ -5183,7 +5202,8 @@ def list_sales(
         SELECT o.order_id, o.product_id, o.seller_id, o.amount, o.buyer_name,
                o.buyer_email, o.payment_method, o.payment_status, o.product_cost,
                o.provider_fee, o.platform_fee, o.seller_payout, o.net_profit,
-               o.delivery_address, o.delivery_status, o.tracking_code,
+               o.delivery_address, o.delivery_status, o.delivery_carrier,
+               o.tracking_code, o.delivery_fee,
                o.completed_at, o.archived_at,
                o.created_at, p.name AS product_name,
                u.shop_name, oi.variant_label
