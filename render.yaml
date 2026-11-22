@@ -31,6 +31,14 @@ services:
         value: "false"
       - key: CLICKPESA_MANUAL_PAYOUTS_CONFIRMED
         value: "false"
+      - key: PESAPAL_SANDBOX_ENABLED
+        value: "false"
+      - key: PESAPAL_CONSUMER_KEY
+        sync: false
+      - key: PESAPAL_CONSUMER_SECRET
+        sync: false
+      - key: PESAPAL_NOTIFICATION_ID
+        sync: false
       - key: EMAIL_PROVIDER
         value: resend
       - key: RESEND_API_KEY
@@ -55,6 +63,28 @@ services:
           property: connectionString
       - key: ADMIN_SETUP_TOKEN
         generateValue: true
+      - key: MFA_ENCRYPTION_KEY
+        sync: false
+      - key: SELLER_KYC_ENCRYPTION_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: BUSINESS_AI_PROVIDER
+        value: openai
+      - key: OPENAI_BUSINESS_MODEL
+        value: gpt-4o-mini
+      - key: BACKUP_S3_BUCKET
+        sync: false
+      - key: BACKUP_S3_PREFIX
+        value: liparahisi
+      - key: BACKUP_S3_ENDPOINT_URL
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_DEFAULT_REGION
+        sync: false
       - key: ADMIN_SERVICE_TOKEN
         generateValue: true
       - key: ADMIN_SERVICE_URL
@@ -73,6 +103,28 @@ services:
         value: ""
       - key: NOTIFICATION_SERVICE_URL
         value: ""
+      - key: SMS_PROVIDER
+        value: ""
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_API_VERSION
+        value: "v22.0"
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: FCM_SERVER_KEY
+        sync: false
 databases:
   - name: liparahisi-db
     databaseName: liparahisi

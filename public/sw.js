@@ -63,6 +63,25 @@ self.addEventListener("fetch", (event) => {
   );
 });
 
+self.addEventListener("push", (event) => {
+  let payload = {};
+  if (event.data) {
+    try {
+      payload = event.data.json();
+    } catch {
+      payload = { body: event.data.text() };
+    }
+  }
+  const title = payload.title || "LipaRahisi";
+  const options = {
+    body: payload.body || "",
+    icon: "/icons/icon.svg",
+    badge: "/icons/icon.svg",
+    data: { url: payload.link || "/" },
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(

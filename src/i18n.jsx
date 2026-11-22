@@ -1,12 +1,31 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
+import {
+  isTranslationKey,
+  supportedLanguages,
+  translateKey,
+} from "./translations.js";
 
 const languageContext = createContext(null);
 const languageStorageKey = "liparahisi_language";
-const supportedLanguages = ["sw", "en", "fr"];
+const backgroundStorageKey = "liparahisi_background";
+export const backgroundThemes = [
+  { color: "#f5f8ff", labelKey: "settings.background.default" },
+  { color: "#f1f8f4", labelKey: "settings.background.mint" },
+  { color: "#fff8eb", labelKey: "settings.background.cream" },
+  { color: "#f5f1ff", labelKey: "settings.background.lavender" },
+  { color: "#fff3f2", labelKey: "settings.background.rose" },
+];
 const translations = Object.fromEntries([
   ["Lugha", "Language", "Langue"],
   ["API endpoint haikupatikana.", "The API endpoint could not be found.", "Le point de terminaison de l’API est introuvable."],
   ["Ombi halikukamilika.", "The request could not be completed.", "La demande n’a pas pu aboutir."],
+  ["Biashara haikupatikana.", "The business could not be found.", "Entreprise introuvable."],
+  ["Huna ufikiaji wa biashara hii.", "You do not have access to this business.", "Vous n’avez pas accès à cette entreprise."],
+  ["Huna ufikiaji wa tawi hili.", "You do not have access to this branch.", "Vous n’avez pas accès à cette agence."],
+  ["Huna ruhusa ya shughuli hii.", "You do not have permission for this action.", "Vous n’êtes pas autorisé à effectuer cette action."],
+  ["Huduma ya AI haipatikani kwa sasa. Takwimu zako hazijabadilishwa.", "The AI service is currently unavailable. Your business data was not changed.", "Le service d’IA est momentanément indisponible. Les données de votre entreprise n’ont pas été modifiées."],
+  ["Badilisha rangi ya mandharinyuma", "Change background color", "Changer la couleur d’arrière-plan"],
+  ["Rangi ya mandharinyuma imehifadhiwa.", "Background color saved.", "La couleur d’arrière-plan a été enregistrée."],
   ["Ingia kwenye akaunti yako.", "Sign in to your account.", "Connectez-vous à votre compte."],
   ["Kikao kimeisha; ingia tena.", "Your session expired; please sign in again.", "Votre session a expiré ; veuillez vous reconnecter."],
   ["Jina au barua pepe si sahihi.", "The name or email address is invalid.", "Le nom ou l'adresse e-mail est invalide."],
@@ -405,8 +424,11 @@ const translations = Object.fromEntries([
 
 export function translate(text, language) {
   const phrase = String(text).trim();
+  if (isTranslationKey(phrase)) return translateKey(phrase, language);
   return translations[phrase]?.[language] || text;
 }
+
+export { supportedLanguages, translateKey };
 
 function localizeNode(node, language) {
   if (typeof node === "string") {
@@ -444,8 +466,19 @@ export function LanguageProvider({ children }) {
       return "sw";
     }
   });
+  const [backgroundColor, setBackgroundColorState] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem(backgroundStorageKey);
+      return backgroundThemes.some((theme) => theme.color === saved)
+        ? saved
+        : backgroundThemes[0].color;
+    } catch {
+      return backgroundThemes[0].color;
+    }
+  });
 
   const setLanguage = useCallback((nextLanguage) => {
+    if (!supportedLanguages.includes(nextLanguage)) return;
     setLanguageState(nextLanguage);
     try {
       window.localStorage.setItem(languageStorageKey, nextLanguage);
@@ -453,6 +486,19 @@ export function LanguageProvider({ children }) {
       console.error("Could not save language preference.", error);
     }
   }, []);
+  const setBackgroundColor = useCallback((nextColor) => {
+    if (!backgroundThemes.some((theme) => theme.color === nextColor)) return;
+    setBackgroundColorState(nextColor);
+    try {
+      window.localStorage.setItem(backgroundStorageKey, nextColor);
+    } catch (error) {
+      console.error("Could not save background preference.", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--page-background", backgroundColor);
+  }, [backgroundColor]);
 
   useEffect(() => {
     const htmlLanguage = language === "sw" ? "sw-TZ" : language;
@@ -473,7 +519,7 @@ export function LanguageProvider({ children }) {
   }, [language]);
 
   return (
-    <languageContext.Provider value={{ language, setLanguage }}>
+    <languageContext.Provider value={{ language, setLanguage, backgroundColor, setBackgroundColor }}>
       {children}
     </languageContext.Provider>
   );

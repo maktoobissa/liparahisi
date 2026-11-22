@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { translate, useLanguage } from "./i18n.jsx";
+import { api } from "./api.js";
 
 const notificationContext = createContext(null);
 const soundStorageKey = "liparahisi_notification_sound";
@@ -205,14 +206,53 @@ export function NotificationProvider({ children }) {
     }
   }
 
+  async function enableWebPush() {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      notify("Web Push haipatikani kwenye kivinjari hiki.", "error");
+      return false;
+    }
+    try {
+      const config = await api("/config/push");
+      if (!config.vapid_public_key) {
+        notify("Web Push VAPID haijawekwa kwenye server.", "error");
+        return false;
+      }
+      const registration = await navigator.serviceWorker.ready;
+      const existing = await registration.pushManager.getSubscription();
+      const subscription = existing || await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(config.vapid_public_key),
+      });
+      await api("/notifications/subscriptions", {
+        method: "POST",
+        body: JSON.stringify({
+          channel: "WEB_PUSH",
+          subscription: subscription.toJSON(),
+        }),
+      });
+      notify("Web Push imewashwa.", "success");
+      return true;
+    } catch (error) {
+      notify(error.message || "Imeshindikana kuwasha Web Push.", "error");
+      return false;
+    }
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = "=".repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = window.atob(base64);
+    return Uint8Array.from([...raw].map((character) => character.charCodeAt(0)));
+  }
+
   const labels = {
-    sw: { soundOn: "Sauti imewashwa", soundOff: "Washa sauti", system: "Washa arifa za kifaa", granted: "Arifa za kifaa zimewashwa", denied: "Arifa zimezuiwa kwenye kivinjari", install: "Sakinisha app", close: "Funga arifa" },
-    en: { soundOn: "Sound on", soundOff: "Turn sound on", system: "Enable device notifications", granted: "Device notifications enabled", denied: "Notifications are blocked in browser", install: "Install app", close: "Dismiss notification" },
-    fr: { soundOn: "Son activé", soundOff: "Activer le son", system: "Activer les notifications", granted: "Notifications activées", denied: "Notifications bloquées par le navigateur", install: "Installer l'application", close: "Fermer la notification" },
+    sw: { soundOn: "Sauti imewashwa", soundOff: "Washa sauti", system: "Washa arifa za kifaa", webPush: "Washa Web Push", granted: "Arifa za kifaa zimewashwa", denied: "Arifa zimezuiwa kwenye kivinjari", install: "Sakinisha app", close: "Funga arifa" },
+    en: { soundOn: "Sound on", soundOff: "Turn sound on", system: "Enable device notifications", webPush: "Enable Web Push", granted: "Device notifications enabled", denied: "Notifications are blocked in browser", install: "Install app", close: "Dismiss notification" },
+    fr: { soundOn: "Son activé", soundOff: "Activer le son", system: "Activer les notifications", webPush: "Activer Web Push", granted: "Notifications activées", denied: "Notifications bloquées par le navigateur", install: "Installer l'application", close: "Fermer la notification" },
   }[language];
 
   return (
-    <notificationContext.Provider value={{ notify }}>
+    <notificationContext.Provider value={{ notify, enableWebPush }}>
       {children}
       <aside
         className="notification-tools"
@@ -226,6 +266,7 @@ export function NotificationProvider({ children }) {
         )}
         {permission === "granted" && <span>{labels.granted}</span>}
         {permission === "denied" && <span>{labels.denied}</span>}
+        <button type="button" onClick={() => enableWebPush()}>{labels.webPush}</button>
         {installPrompt && (
           <button type="button" onClick={() => installApp().catch((error) => setInstallError(error.message))}>
             {labels.install}

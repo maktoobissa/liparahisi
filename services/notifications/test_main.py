@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
 
 from services.notifications.main import internal_status, require_internal_token, send_email
+from backend.notification_providers import send_sms, send_whatsapp
 
 
 class NotificationServiceTests(unittest.TestCase):
@@ -105,6 +106,47 @@ class NotificationServiceTests(unittest.TestCase):
                 "html": html,
             },
         )
+
+    def test_sms_provider_uses_twilio_sandbox_credentials(self):
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value.raise_for_status.return_value = None
+        client.post.return_value.json.return_value = {"sid": "SM_TEST"}
+        with patch.dict(
+            os.environ,
+            {
+                "SMS_PROVIDER": "twilio",
+                "TWILIO_ACCOUNT_SID": "AC_TEST",
+                "TWILIO_AUTH_TOKEN": "TEST_TOKEN",
+                "TWILIO_FROM_NUMBER": "+255700000000",
+            },
+        ):
+            with patch("backend.notification_providers.httpx.Client") as client_factory:
+                client_factory.return_value = client
+                result = send_sms("+255711111111", "LipaRahisi test")
+
+        self.assertEqual(result, "SM_TEST")
+        self.assertIn("/Accounts/AC_TEST/Messages.json", client.post.call_args.args[0])
+
+    def test_whatsapp_provider_uses_official_cloud_api(self):
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value.raise_for_status.return_value = None
+        client.post.return_value.json.return_value = {"messages": [{"id": "wamid.TEST"}]}
+        with patch.dict(
+            os.environ,
+            {
+                "WHATSAPP_PHONE_NUMBER_ID": "123456",
+                "WHATSAPP_ACCESS_TOKEN": "TEST_TOKEN",
+                "WHATSAPP_API_VERSION": "v22.0",
+            },
+        ):
+            with patch("backend.notification_providers.httpx.Client") as client_factory:
+                client_factory.return_value = client
+                result = send_whatsapp("+255711111111", "LipaRahisi test")
+
+        self.assertEqual(result, "wamid.TEST")
+        self.assertIn("graph.facebook.com/v22.0/123456/messages", client.post.call_args.args[0])
 
 
 if __name__ == "__main__":

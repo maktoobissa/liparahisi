@@ -1,12 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import JsBarcode from "jsbarcode";
-import { translate, useLanguage, useLocalize } from "./i18n.jsx";
+import { backgroundThemes, translate, translateKey, useLanguage, useLocalize } from "./i18n.jsx";
+import { formatDate, formatNumber } from "./translations.js";
 import { useFeedbackState, useNotification } from "./notifications.jsx";
+import { api, validateDocument, validateProductImage } from "./api.js";
 
-const API = "/api";
-const productImageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
-const maxProductImageBytes = 5 * 1024 * 1024;
 const networks = [
   { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa" },
   { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo" },
@@ -28,15 +27,14 @@ const bankBranches = [
   "Tawi lingine",
 ];
 
-function formatMoney(amount) {
+function formatMoney(amount, preferredLanguage) {
   let language = "sw";
   try {
-    language = window.localStorage.getItem("liparahisi_language") || "sw";
+    language = preferredLanguage || window.localStorage.getItem("liparahisi_language") || "sw";
   } catch {
-    language = "sw";
+    language = preferredLanguage || "sw";
   }
-  const locale = language === "fr" ? "fr-FR" : language === "en" ? "en-TZ" : "sw-TZ";
-  return new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(Number(amount) || 0);
+  return formatNumber(amount, language);
 }
 
 async function downloadReceiptPdf(receipt, language) {
@@ -46,6 +44,7 @@ async function downloadReceiptPdf(receipt, language) {
   const margin = 16;
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
+  const isSandbox = receipt.sandbox === true;
   let y = 28;
 
   function writeLine(text, { size = 10, bold = false, indent = 0, gap = 1 } = {}) {
@@ -68,14 +67,20 @@ async function downloadReceiptPdf(receipt, language) {
   if (!logoResponse.ok) throw new Error("Imeshindikana kupakia logo ya LipaRahisi.");
   await pdf.addSvgAsImage(await logoResponse.text(), margin, 8, 58, 17.4);
   pdf.setTextColor(7, 27, 82);
-  writeLine(t("RISITI YA MALIPO - DEMO"), { size: 11, bold: true, gap: 4 });
+  writeLine(
+    t(isSandbox ? "RISITI YA MALIPO - PESA PAL SANDBOX" : "RISITI YA MALIPO - DEMO"),
+    { size: 11, bold: true, gap: 4 },
+  );
   writeLine(`${t("Oda:")} ${receipt.checkoutId}`, { bold: true });
   writeLine(`${t("Mnunuzi:")} ${receipt.buyerName}`);
   if (receipt.buyerEmail) writeLine(`${t("Barua pepe:")} ${receipt.buyerEmail}`);
   if (receipt.buyerPhone) writeLine(`${t("Simu:")} ${receipt.buyerPhone}`);
   writeLine(`${t("Njia ya malipo:")} ${receipt.paymentMethod}${receipt.bankBranch ? ` - ${receipt.bankBranch}` : ""}`);
   if (receipt.deliveryAddress) writeLine(`${t("Anuani ya delivery:")} ${receipt.deliveryAddress}`);
-  writeLine(t("Hali: Imekamilika (DEMO)"), { bold: true, gap: 4 });
+  writeLine(
+    t(isSandbox ? "Hali: Imehakikiwa kwenye sandbox" : "Hali: Imekamilika (DEMO)"),
+    { bold: true, gap: 4 },
+  );
 
   for (const split of receipt.splits) {
     writeLine(split.shopName || t("Muuzaji"), { size: 12, bold: true, gap: 1 });
@@ -105,8 +110,11 @@ async function downloadReceiptPdf(receipt, language) {
   writeLine(`${t("JUMLA YA MNUNUZI:")} TZS ${formatMoney(receipt.totalAmount)}`, { size: 12, bold: true });
   writeLine(`${t("Kamisheni jumla")} (${receipt.commissionPercent}%): TZS ${formatMoney(receipt.platformFee)}`, { bold: true });
   writeLine(`${t("Jumla ya mgao wa wauzaji:")} TZS ${formatMoney(receipt.sellerPayout)}`, { bold: true });
-  writeLine(`${t("Tarehe:")} ${receipt.completedAt || "-"}`);
-  writeLine(t("Risiti hii ni ya majaribio; hakuna pesa halisi iliyohamishwa."), { size: 9, gap: 0 });
+  writeLine(`${t("Tarehe:")} ${formatDate(receipt.completedAt, language)}`);
+  writeLine(
+    t("Risiti hii ni ya majaribio; hakuna pesa halisi iliyohamishwa."),
+    { size: 9, gap: 0 },
+  );
 
   const filename = String(receipt.checkoutId || "oda").replace(/[^a-z0-9-]/gi, "");
   pdf.save(`risiti-${filename || "oda"}.pdf`);
@@ -117,37 +125,6 @@ function newRequestKey() {
   const bytes = new Uint8Array(16);
   window.crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function responseMessage(detail, fallback) {
-  if (typeof detail === "string") return detail;
-  if (Array.isArray(detail) && detail[0]?.msg) return detail[0].msg;
-  if (detail && typeof detail === "object" && detail.message) return detail.message;
-  return fallback;
-}
-
-async function api(path, options = {}) {
-  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
-  const response = await fetch(`${API}${path}`, {
-    credentials: "same-origin",
-    ...options,
-    headers: {
-      ...(options.body && !isFormData ? { "Content-Type": "application/json" } : {}),
-      ...options.headers,
-    },
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(responseMessage(result.detail, "Ombi halikukamilika."));
-  return result;
-}
-
-function validateProductImage(file) {
-  if (!productImageTypes.has(file.type)) {
-    throw new Error("Tumia picha ya JPEG, PNG au WebP.");
-  }
-  if (file.size > maxProductImageBytes) {
-    throw new Error("Picha imezidi ukubwa wa MB 5.");
-  }
 }
 
 async function uploadProductImage(productId, file) {
@@ -163,6 +140,17 @@ async function uploadProductImage(productId, file) {
 function Header({ label = "Demo", user, onLogout }) {
   const { language, setLanguage } = useLanguage();
   const localize = useLocalize();
+  const { notify } = useNotification();
+  function changeLanguage(nextLanguage) {
+    setLanguage(nextLanguage);
+    if (!user) return;
+    api("/auth/language", {
+      method: "PUT",
+      body: JSON.stringify({ language: nextLanguage }),
+    }).catch((requestError) => {
+      notify(requestError.message, "error");
+    });
+  }
   return localize(
     <header className="topbar">
       <a className="brand" href="/" aria-label="LipaRahisi mwanzo" key="brand">
@@ -174,8 +162,8 @@ function Header({ label = "Demo", user, onLogout }) {
       </a>
       <div className="header-right" key="controls">
         <label className="language-control" key="language">
-          <span className="sr-only" key="language-label">Lugha</span>
-          <select key="language-select" aria-label="Lugha" value={language} onChange={(event) => setLanguage(event.target.value)}>
+          <span className="sr-only" key="language-label">{translateKey("language.label", language)}</span>
+          <select key="language-select" aria-label={translateKey("language.label", language)} value={language} onChange={(event) => changeLanguage(event.target.value)}>
             <option key="sw" value="sw">🇹🇿 Kiswahili</option>
             <option key="en" value="en">🇬🇧 English</option>
             <option key="fr" value="fr">🇫🇷 Français</option>
@@ -197,6 +185,7 @@ function Header({ label = "Demo", user, onLogout }) {
     </header>
   );
 }
+
 function BrandFooter({ children }) {
   return (
     <footer className="site-footer">
@@ -210,7 +199,6 @@ function BrandFooter({ children }) {
   );
 }
 
-
 function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
   const localize = useLocalize();
   const [mode, setMode] = useState(setupRequired ? "setup" : "login");
@@ -219,6 +207,7 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
     full_name: "",
     email: "",
     password: "",
+    totp_code: "",
     shop_name: "",
     phone: "",
   });
@@ -269,7 +258,11 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
       } else {
         const result = await api("/auth/login", {
           method: "POST",
-          body: JSON.stringify({ email: form.email, password: form.password }),
+          body: JSON.stringify({
+            email: form.email,
+            password: form.password,
+            totp_code: form.totp_code,
+          }),
         });
         onAuth(result.user);
       }
@@ -327,6 +320,12 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
           )}
           <label className="field-label" htmlFor="auth-password">Nenosiri {isSetup || isRegister ? "(angalau herufi 10)" : ""}</label>
           <input id="auth-password" className="text-input" name="password" type="password" autoComplete={isSetup || isRegister ? "new-password" : "current-password"} minLength={isSetup || isRegister ? 10 : 1} required value={form.password} onChange={change} />
+          {mode === "login" && (
+            <>
+              <label className="field-label" htmlFor="auth-totp">Nambari ya authenticator au recovery code (ikiwa 2FA imewashwa)</label>
+              <input id="auth-totp" className="text-input" name="totp_code" inputMode="text" maxLength={32} autoComplete="one-time-code" value={form.totp_code} onChange={change} />
+            </>
+          )}
           {message && <p className="success-message" role="status">{message}</p>}
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="generate-button" type="submit" disabled={busy}>
@@ -464,15 +463,532 @@ function StatCard({ title, value, note }) {
   );
 }
 
+function DashboardTrendChart({ title, rows = [] }) {
+  const localize = useLocalize();
+  const values = rows.map((row) => Number(row.sales || 0));
+  const maxValue = Math.max(1, ...values);
+  return localize(
+    <section className="dashboard-panel">
+      <h2>{title}</h2>
+      {rows.length ? (
+        <div className="dashboard-chart" role="img" aria-label={title}>
+          {rows.map((row) => {
+            const value = Number(row.sales || 0);
+            return (
+              <div className="dashboard-chart-column" key={row.day}>
+                <strong>TZS {formatMoney(value)}</strong>
+                <div className="dashboard-chart-track">
+                  <span style={{ height: `${Math.max(4, value / maxValue * 100)}%` }} />
+                </div>
+                <small>{row.day}</small>
+              </div>
+            );
+          })}
+        </div>
+      ) : <p className="empty-state">Hakuna mauzo katika kipindi hiki.</p>}
+    </section>
+  );
+}
+
+function DashboardStatusList({ title, rows = [] }) {
+  const localize = useLocalize();
+  return localize(
+    <section className="dashboard-panel">
+      <h2>{title}</h2>
+      {rows.length ? (
+        <div className="dashboard-status-list">
+          {rows.map((row) => (
+            <div className="dashboard-status-row" key={row.status}>
+              <span>{row.status.replace(/_/g, " ")}</span>
+              <strong>{row.count}</strong>
+            </div>
+          ))}
+        </div>
+      ) : <p className="empty-state">Hakuna taarifa kwa sasa.</p>}
+    </section>
+  );
+}
+
+function DashboardActivityFeed({ rows = [] }) {
+  const localize = useLocalize();
+  return localize(
+    <section className="dashboard-panel">
+      <h2>Shughuli za hivi karibuni</h2>
+      {rows.length ? (
+        <div className="dashboard-activity-list">
+          {rows.map((row, index) => (
+            <article key={`${row.created_at}-${row.action}-${index}`}>
+              <strong>{row.action.replace(/_/g, " ")}</strong>
+              <span>{row.actor_email || "Mfumo"} · {row.target_type || "jukwaa"}</span>
+              <small>{row.created_at}</small>
+            </article>
+          ))}
+        </div>
+      ) : <p className="empty-state">Hakuna shughuli zilizorekodiwa bado.</p>}
+    </section>
+  );
+}
+
+function AccountSecurity() {
+  const [status, setStatus] = useState({ enabled: false, enrollment_available: false });
+  const [sessions, setSessions] = useState([]);
+  const [setupUri, setSetupUri] = useState("");
+  const [setupSecret, setSetupSecret] = useState("");
+  const [qr, setQr] = useState("");
+  const [code, setCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [recoveryCodes, setRecoveryCodes] = useState([]);
+  const [notificationPreferences, setNotificationPreferences] = useState({
+    email_enabled: true,
+    sms_enabled: false,
+    web_push_enabled: true,
+    mobile_push_enabled: false,
+    whatsapp_enabled: false,
+    security_alerts_enabled: true,
+    marketing_enabled: false,
+  });
+  const [notificationHistory, setNotificationHistory] = useState([]);
+  const [error, setError] = useFeedbackState("error");
+  const [message, setMessage] = useFeedbackState("success");
+
+  async function refresh() {
+    const [mfaStatus, sessionRows, preferences, history] = await Promise.all([
+      api("/auth/mfa/status"),
+      api("/auth/sessions"),
+      api("/notifications/preferences"),
+      api("/notifications/history"),
+    ]);
+    setStatus(mfaStatus);
+    setSessions(sessionRows);
+    setNotificationPreferences(preferences);
+    setNotificationHistory(history);
+  }
+
+  useEffect(() => {
+    refresh().catch((requestError) => setError(requestError.message));
+  }, []);
+
+  useEffect(() => {
+    if (!selectedBusinessId) return;
+    loadBusinessSummary(selectedBusinessId).catch((requestError) => setError(requestError.message));
+  }, [selectedBusinessId]);
+
+  useEffect(() => {
+    let active = true;
+    if (!setupUri) {
+      setQr("");
+      return () => { active = false; };
+    }
+    QRCode.toDataURL(setupUri, { width: 220, margin: 1 })
+      .then((image) => { if (active) setQr(image); })
+      .catch((requestError) => {
+        if (active) setError(`Imeshindikana kutengeneza QR ya 2FA: ${requestError.message}`);
+      });
+    return () => { active = false; };
+  }, [setupUri, setError]);
+
+  async function startSetup() {
+    try {
+      const setup = await api("/auth/mfa/setup", { method: "POST" });
+      setSetupUri(setup.otpauth_uri);
+      setSetupSecret(setup.secret);
+      setCode("");
+      setRecoveryCodes([]);
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function enable(event) {
+    event.preventDefault();
+    try {
+      const result = await api("/auth/mfa/enable", {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      });
+      setSetupUri("");
+      setSetupSecret("");
+      setCode("");
+      setRecoveryCodes(result.recovery_codes);
+      setMessage("2FA imewashwa. Hifadhi recovery codes hizi mahali salama.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function disable(event) {
+    event.preventDefault();
+    try {
+      await api("/auth/mfa/disable", {
+        method: "POST",
+        body: JSON.stringify({ password, code }),
+      });
+      setCode("");
+      setPassword("");
+      setRecoveryCodes([]);
+      setMessage("2FA imezimwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function revokeOtherDevices() {
+    try {
+      const result = await api("/auth/sessions/revoke-others", { method: "POST" });
+      setMessage(`Vikao ${result.revoked_count} vya vifaa vingine vimefungwa.`);
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+
+    async function saveNotificationPreferences(event) {
+      event.preventDefault();
+      try {
+        await api("/notifications/preferences", {
+          method: "PUT",
+          body: JSON.stringify(notificationPreferences),
+        });
+        setMessage("Mapendeleo ya arifa yamehifadhiwa.");
+      } catch (requestError) {
+        setError(requestError.message);
+      }
+    }
+  }
+
+  return (
+    <div className="dashboard-content">
+      {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
+      {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
+      <section className="form-card settings-form">
+        <h2>Uthibitishaji wa hatua mbili (2FA)</h2>
+        <p className="field-hint">Hali: {status.enabled ? "Umewashwa" : "Umezimwa"}. Tumia authenticator app yenye TOTP.</p>
+        {!status.enabled && !setupUri && <button className="generate-button" type="button" disabled={!status.enrollment_available} onClick={startSetup}>Sanidi 2FA</button>}
+        {!status.enrollment_available && <p className="field-hint">MFA_ENCRYPTION_KEY haijawekwa kwenye server; 2FA haiwezi kusanidiwa bado.</p>}
+        {setupUri && (
+          <form className="buyer-form" onSubmit={enable}>
+            {qr && <img src={qr} alt="QR code ya 2FA" width="220" height="220" />}
+            <p className="field-hint">Siri ya kuingiza kwa mkono: <code>{setupSecret}</code></p>
+            <label className="field-label" htmlFor="mfa-setup-code">Weka nambari ya tarakimu 6 kutoka kwenye app</label>
+            <input id="mfa-setup-code" className="text-input" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required value={code} onChange={(event) => setCode(event.target.value)} />
+            <button className="generate-button" type="submit">Thibitisha na washa 2FA</button>
+          </form>
+        )}
+        {status.enabled && (
+          <form className="buyer-form" onSubmit={disable}>
+            <label className="field-label" htmlFor="mfa-disable-password">Nenosiri la akaunti</label>
+            <input id="mfa-disable-password" className="text-input" type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} />
+            <label className="field-label" htmlFor="mfa-disable-code">Nambari ya authenticator au recovery code</label>
+            <input id="mfa-disable-code" className="text-input" required value={code} onChange={(event) => setCode(event.target.value)} />
+            <button className="danger-action" type="submit">Zima 2FA</button>
+          </form>
+        )}
+        {recoveryCodes.length > 0 && (
+          <div className="feature-list" role="status">
+            <strong>Recovery codes: kila msimbo unatumika mara moja.</strong>
+            <ul>{recoveryCodes.map((item) => <li key={item}><code>{item}</code></li>)}</ul>
+          </div>
+        )}
+      </section>
+      <section className="form-card settings-form">
+        <h2>Vikao vya vifaa</h2>
+        <div className="feature-list">
+          {sessions.map((session, index) => (
+            <article className="seller-card" key={`${session.created_at}-${index}`}>
+              <div><strong>{session.current ? "Kifaa hiki" : session.user_agent || "Kifaa kingine"}</strong><span>{session.ip_address || "IP haijarekodiwa"} · Ilitumika: {session.last_seen_at}</span></div>
+              {session.current && <span className="seller-status active">Sasa</span>}
+            </article>
+          ))}
+          {!sessions.length && <p className="empty-state">Hakuna kikao kinachoendelea.</p>}
+        </div>
+        {sessions.length > 1 && <button className="danger-action" type="button" onClick={revokeOtherDevices}>Toka kwenye vifaa vingine</button>}
+      </section>
+      <section className="form-card settings-form">
+        <h2>Mapendeleo ya arifa</h2>
+        <form className="buyer-form" onSubmit={saveNotificationPreferences}>
+          {[
+            ["email_enabled", "Barua pepe"],
+            ["sms_enabled", "SMS"],
+            ["web_push_enabled", "Web Push"],
+            ["mobile_push_enabled", "Mobile Push"],
+            ["whatsapp_enabled", "WhatsApp Business"],
+            ["security_alerts_enabled", "Tahadhari za usalama"],
+            ["marketing_enabled", "Taarifa za matangazo"],
+          ].map(([key, label]) => (
+            <label className="field-label" key={key}>
+              <input
+                type="checkbox"
+                checked={Boolean(notificationPreferences[key])}
+                onChange={(event) => setNotificationPreferences({
+                  ...notificationPreferences,
+                  [key]: event.target.checked,
+                })}
+              /> {label}
+            </label>
+          ))}
+          <button className="generate-button" type="submit">Hifadhi mapendeleo</button>
+        </form>
+      </section>
+      <section className="form-card settings-form">
+        <h2>Historia ya arifa</h2>
+        <div className="feature-list">
+          {notificationHistory.map((item) => (
+            <article className="seller-card" key={item.id}>
+              <div>
+                <strong>{item.title}</strong>
+                <span>{item.channel} · {item.status}</span>
+                <small>{item.body}</small>
+                {item.error && <small>{item.error}</small>}
+              </div>
+            </article>
+          ))}
+          {!notificationHistory.length && <p className="empty-state">Hakuna historia ya arifa.</p>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function BusinessAssistant({ businessId }) {
+  const { language } = useLanguage();
+  const [conversations, setConversations] = useState([]);
+  const [conversationId, setConversationId] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [question, setQuestion] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useFeedbackState("error");
+
+  async function loadConversations() {
+    if (!businessId) {
+      setConversations([]);
+      setConversationId("");
+      setMessages([]);
+      return;
+    }
+    const rows = await api(`/businesses/${encodeURIComponent(businessId)}/assistant/conversations`);
+    setConversations(rows);
+    if (rows.length) {
+      setConversationId(rows[0].id);
+      const history = await api(`/businesses/${encodeURIComponent(businessId)}/assistant/conversations/${encodeURIComponent(rows[0].id)}`);
+      setMessages(history.messages);
+    } else {
+      setConversationId("");
+      setMessages([]);
+    }
+  }
+
+  useEffect(() => {
+    loadConversations().catch((requestError) => setError(requestError.message));
+  }, [businessId]);
+
+  async function openConversation(id) {
+    setError("");
+    try {
+      const history = await api(`/businesses/${encodeURIComponent(businessId)}/assistant/conversations/${encodeURIComponent(id)}`);
+      setConversationId(id);
+      setMessages(history.messages);
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function submitQuestion(event) {
+    event.preventDefault();
+    const text = question.trim();
+    if (!text || !businessId || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api(`/businesses/${encodeURIComponent(businessId)}/assistant/messages`, {
+        method: "POST",
+        body: JSON.stringify({
+          question: text,
+          conversation_id: conversationId || null,
+        }),
+      });
+      setConversationId(result.conversation_id);
+      setMessages((current) => [
+        ...current,
+        { id: result.user_message_id, role: "USER", content: result.question },
+        {
+          id: result.assistant_message_id,
+          role: "ASSISTANT",
+          content: result.answer,
+          period_start: result.period.start,
+          period_end: result.period.end,
+          sources: result.sources,
+          recommendations: result.recommendation_codes,
+          ai_status: result.ai_status,
+          ai_note: result.ai_note,
+        },
+      ]);
+      setConversations((current) => {
+        const existing = current.filter((item) => item.id !== result.conversation_id);
+        return [
+          { id: result.conversation_id, title: text.slice(0, 120), updated_at: new Date().toISOString() },
+          ...existing,
+        ];
+      });
+      setQuestion("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function recommendationLabel(code) {
+    const keys = {
+      REVIEW_REPLENISHMENT: "assistant.recommendation.reorder",
+      COMPARE_BRANCHES: "assistant.recommendation.compareBranches",
+    };
+    return keys[code] ? translateKey(keys[code], language) : code;
+  }
+
+  const sourceKeys = {
+    orders: "assistant.source.orders",
+    order_items: "assistant.source.orderItems",
+    products: "assistant.source.products",
+    branches: "assistant.source.branches",
+  };
+
+  if (!businessId) {
+    return <section className="dashboard-panel"><p>{translateKey("assistant.businessRequired", language)}</p></section>;
+  }
+
+  return (
+    <section className="dashboard-content business-assistant">
+      <header className="assistant-heading">
+        <div>
+          <h2>{translateKey("assistant.title", language)}</h2>
+          <p>{translateKey("assistant.description", language)}</p>
+        </div>
+        <button type="button" className="table-action" onClick={() => { setConversationId(""); setMessages([]); setError(""); }}>
+          {translateKey("assistant.newConversation", language)}
+        </button>
+      </header>
+      <p className="field-hint">{translateKey("assistant.disclosure", language)}</p>
+      {error && <p className="form-error" role="alert">{translate(error, language)}</p>}
+      <div className="assistant-layout">
+        <aside className="dashboard-panel assistant-history">
+          <h3>{translateKey("assistant.history", language)}</h3>
+          {conversations.map((conversation) => (
+            <button
+              type="button"
+              key={conversation.id}
+              className={conversation.id === conversationId ? "assistant-history-active" : ""}
+              onClick={() => openConversation(conversation.id)}
+            >
+              <span data-no-translate="true">{conversation.title}</span>
+              <small>{formatDate(conversation.updated_at, language)}</small>
+            </button>
+          ))}
+          {!conversations.length && <p className="empty-state">{translateKey("assistant.noHistory", language)}</p>}
+        </aside>
+        <div className="dashboard-panel assistant-chat">
+          <div className="assistant-messages" aria-live="polite">
+            {messages.map((item) => (
+              <article className={`assistant-message assistant-message-${item.role.toLowerCase()}`} key={item.id || `${item.role}-${item.created_at}-${item.content}`}>
+                <strong>{item.role === "USER" ? translateKey("common.send", language) : translateKey("assistant.title", language)}</strong>
+                <p data-no-translate="true">{item.content}</p>
+                {item.role === "ASSISTANT" && item.period_start && (
+                  <small>{translateKey("assistant.period", language)}: {formatDate(`${item.period_start}T12:00:00Z`, language, { timeStyle: undefined })} – {formatDate(`${item.period_end}T12:00:00Z`, language, { timeStyle: undefined })}</small>
+                )}
+                {item.role === "ASSISTANT" && item.sources?.length > 0 && (
+                  <small>{translateKey("assistant.sources", language)}: {item.sources.map((source) => translateKey(sourceKeys[source] || source, language)).join(", ")}</small>
+                )}
+                {item.role === "ASSISTANT" && item.recommendations?.length > 0 && (
+                  <ul>{item.recommendations.map((code) => <li key={code}>{recommendationLabel(code)}</li>)}</ul>
+                )}
+                {item.role === "ASSISTANT" && item.ai_status === "NOT_CONFIGURED" && (
+                  <small>{translateKey("assistant.notConfigured", language)}</small>
+                )}
+              </article>
+            ))}
+            {!messages.length && <p className="empty-state">{translateKey("assistant.description", language)}</p>}
+          </div>
+          <form className="assistant-question" onSubmit={submitQuestion}>
+            <label className="sr-only" htmlFor="business-assistant-question">{translateKey("assistant.title", language)}</label>
+            <textarea
+              id="business-assistant-question"
+              className="text-input"
+              maxLength={1000}
+              required
+              value={question}
+              placeholder={translateKey("assistant.placeholder", language)}
+              onChange={(event) => setQuestion(event.target.value)}
+            />
+            <button className="generate-button" type="submit" disabled={busy || !question.trim()}>
+              {busy ? translateKey("assistant.loading", language) : translateKey("assistant.send", language)}
+            </button>
+          </form>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function MarketplaceDashboard({ user, onLogout }) {
   const localize = useLocalize();
+  const { language, backgroundColor, setBackgroundColor } = useLanguage();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
   const [stats, setStats] = useState(null);
   const [products, setProducts] = useState([]);
   const [sales, setSales] = useState([]);
+  const [adminSummary, setAdminSummary] = useState(null);
   const [sellers, setSellers] = useState([]);
   const [auditRows, setAuditRows] = useState([]);
+  const [securityAlerts, setSecurityAlerts] = useState([]);
+  const [securityAppeals, setSecurityAppeals] = useState([]);
+  const [securityAlertDetail, setSecurityAlertDetail] = useState(null);
+  const [mySecurityAlerts, setMySecurityAlerts] = useState([]);
+  const [appealDrafts, setAppealDrafts] = useState({});
+  const [securityFilters, setSecurityFilters] = useState({ status: "", severity: "", category: "" });
+  const [securityActionNote, setSecurityActionNote] = useState("");
+  const [securityAppealNote, setSecurityAppealNote] = useState("");
+  const [adminDocuments, setAdminDocuments] = useState([]);
+  const [systemHealth, setSystemHealth] = useState(null);
+  const [notificationSettings, setNotificationSettings] = useState(null);
+  const [sellerKyc, setSellerKyc] = useState(null);
+  const [sellerKycRows, setSellerKycRows] = useState([]);
+  const [kycForm, setKycForm] = useState({
+    seller_type: "INDIVIDUAL",
+    phone: user.phone || "",
+    identity_name: "",
+    identity_number: "",
+    business_name: "",
+    business_registration_number: "",
+    tin_number: "",
+    business_license_number: "",
+    business_address: "",
+  });
+  const [businesses, setBusinesses] = useState([]);
+  const [selectedBusinessId, setSelectedBusinessId] = useState("");
+  const [businessSummary, setBusinessSummary] = useState(null);
+  const [businessForm, setBusinessForm] = useState({
+    name: "",
+    business_type: "Supermarket",
+    address: "",
+    phone: "",
+    email: "",
+  });
+  const [branchForm, setBranchForm] = useState({
+    name: "",
+    address: "",
+    phone: "",
+    email: "",
+  });
+  const [staffForm, setStaffForm] = useState({
+    email: "",
+    role: "STAFF",
+    branch_id: "",
+  });
+  const [documents, setDocuments] = useState([]);
+  const [documentKind, setDocumentKind] = useState("seller_verification");
+  const [documentProductId, setDocumentProductId] = useState("");
   const [categories, setCategories] = useState([]);
   const [lowStock, setLowStock] = useState([]);
   const [stockProductId, setStockProductId] = useState("");
@@ -525,18 +1041,50 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
     setCategories(await api("/categories"));
     setLowStock(await api("/inventory/low-stock"));
+    if (!isAdmin) {
+      const [documentRows, kycStatus, businessRows, securityRows] = await Promise.all([
+        api("/documents"),
+        api("/auth/kyc"),
+        api("/businesses"),
+        api("/security/alerts"),
+      ]);
+      setDocuments(documentRows);
+      setSellerKyc(kycStatus);
+      setMySecurityAlerts(securityRows);
+      setBusinesses(businessRows);
+      if (!selectedBusinessId && businessRows.length) {
+        setSelectedBusinessId(businessRows[0].id);
+      }
+    }
     if (isAdmin) setAuditRows(await api("/admin/audit"));
     if (isAdmin) {
-      const [sellerRows, cancellationRows, reviewRows, ticketRows] = await Promise.all([
+      const securityQuery = new URLSearchParams(
+        Object.entries(securityFilters).filter(([, value]) => value),
+      );
+      const [sellerRows, cancellationRows, reviewRows, ticketRows, documentRows, health, notificationConfig, kycRows, alertRows, appealRows, dashboardSummary] = await Promise.all([
         api("/admin/sellers"),
         api("/admin/cancellations"),
         api("/admin/reviews"),
         api("/admin/support-tickets"),
+        api("/admin/documents"),
+        api("/admin/health/system"),
+        api("/admin/notification-settings"),
+        api("/admin/kyc"),
+        api(`/admin/security/alerts?${securityQuery.toString()}`),
+        api("/admin/security/appeals"),
+        api("/admin/dashboard"),
       ]);
       setSellers(sellerRows);
       setCancellations(cancellationRows);
       setReviews(reviewRows);
       setTickets(ticketRows);
+      setAdminDocuments(documentRows);
+      setSystemHealth(health);
+      setNotificationSettings(notificationConfig);
+      setSellerKycRows(kycRows);
+      setSecurityAlerts(alertRows);
+      setSecurityAppeals(appealRows);
+      setAdminSummary(dashboardSummary);
       if (!seenAdminEventsRef.current) {
         seenAdminEventsRef.current = new Set(adminEventKeys([
           ["seller", sellerRows],
@@ -744,6 +1292,138 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function uploadDocument(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const file = form.elements.document.files?.[0];
+    if (!file) return;
+    try {
+      validateDocument(file);
+      const formData = new FormData();
+      const selectedKind = form.elements["document-kind"]?.value || documentKind;
+      formData.append("kind", selectedKind);
+      if (selectedKind === "product_document") {
+        formData.append("product_id", documentProductId);
+      }
+      formData.append("document", file);
+      await api("/documents", { method: "POST", body: formData });
+      form.reset();
+      setMessage("Nyaraka imehifadhiwa kwa usalama.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function refreshSystemHealth() {
+    try {
+      setSystemHealth(await api("/admin/health/system"));
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function refreshSecurityData() {
+    try {
+      const query = new URLSearchParams(
+        Object.entries(securityFilters).filter(([, value]) => value),
+      );
+      const [alertRows, appealRows] = await Promise.all([
+        api(`/admin/security/alerts?${query.toString()}`),
+        api("/admin/security/appeals"),
+      ]);
+      setSecurityAlerts(alertRows);
+      setSecurityAppeals(appealRows);
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function runSecurityScan() {
+    try {
+      const result = await api("/admin/security/scan", { method: "POST" });
+      const ai = result.ai_analysis;
+      setMessage(`Rule scan imekamilika: alerts ${result.alerts_updated}. OpenAI: ${ai.status}, zilizochambuliwa ${ai.analyzed}, zilizoachwa ${ai.skipped}.`);
+      setError(ai.status === "FAILED"
+        ? "OpenAI haikukamilisha uchambuzi; rule alerts zimehifadhiwa na hakuna enforcement iliyofanyika."
+        : "");
+      await refreshSecurityData();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function openSecurityAlert(alertId) {
+    try {
+      setSecurityAlertDetail(await api(`/admin/security/alerts/${encodeURIComponent(alertId)}`));
+      setSecurityActionNote("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function actOnSecurityAlert(action) {
+    if (!securityAlertDetail || securityActionNote.trim().length < 2) {
+      setError("Andika sababu ya hatua kabla ya kuendelea.");
+      return;
+    }
+    try {
+      const result = await api(`/admin/security/alerts/${encodeURIComponent(securityAlertDetail.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ action, note: securityActionNote.trim() }),
+      });
+      setMessage(action === "WARN" && !result.notification_queued
+        ? "Onyo limehifadhiwa, lakini hakuna provider iliyokubali arifa. Mtumiaji bado anaweza kuona tahadhari ndani ya akaunti."
+        : action === "WARN"
+          ? `Onyo limehifadhiwa; arifa imewekwa kwenye queue: ${result.notification_channels.join(", ")}.`
+          : "Hatua ya usalama imehifadhiwa kwenye audit trail.");
+      setSecurityAlertDetail(null);
+      setSecurityActionNote("");
+      await refreshSecurityData();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function reviewSecurityAppeal(appealId, status) {
+    if (securityAppealNote.trim().length < 2) {
+      setError("Andika sababu ya uamuzi wa appeal.");
+      return;
+    }
+
+    async function submitSecurityAppeal(alertId) {
+      const messageText = (appealDrafts[alertId] || "").trim();
+      if (messageText.length < 10) {
+        setError("Andika maelezo ya appeal yenye angalau herufi 10.");
+        return;
+      }
+      try {
+        await api(`/security/alerts/${encodeURIComponent(alertId)}/appeal`, {
+          method: "POST",
+          body: JSON.stringify({ message: messageText }),
+        });
+        setMessage("Appeal imetumwa kwa ukaguzi wa admin.");
+        setAppealDrafts({ ...appealDrafts, [alertId]: "" });
+        setMySecurityAlerts(await api("/security/alerts"));
+      } catch (requestError) {
+        setError(requestError.message);
+      }
+    }
+    try {
+      await api(`/admin/security/appeals/${encodeURIComponent(appealId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, note: securityAppealNote.trim() }),
+      });
+      setMessage(status === "ACCEPTED"
+        ? "Appeal imekubaliwa na alert imerudishwa kwenye ukaguzi wa admin."
+        : "Appeal imekataliwa kwa uamuzi wa admin.");
+      setSecurityAppealNote("");
+      await refreshSecurityData();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function updateDelivery(orderId, status, trackingCode) {
     await api(`/orders/${encodeURIComponent(orderId)}/delivery`, {
       method: "PUT",
@@ -757,6 +1437,129 @@ function MarketplaceDashboard({ user, onLogout }) {
     try {
       setStockMovements(await api(`/products/${productId}/movements`));
       setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function submitKyc(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    try {
+      const result = await api("/auth/kyc", {
+        method: "POST",
+        body: JSON.stringify(kycForm),
+      });
+      setSellerKyc(result);
+      setMessage("Maombi ya KYC yametumwa kwa ukaguzi.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function deleteKyc() {
+    setError("");
+    setMessage("");
+    try {
+      await api("/auth/kyc", { method: "DELETE" });
+      setSellerKyc({ status: "NOT_VERIFIED", profile: null, documents: [], history: [] });
+      setMessage("Maombi ya KYC na nyaraka zake zimefutwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function reviewKyc(sellerId, status, reason) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/admin/kyc/${encodeURIComponent(sellerId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          status,
+          reason,
+          expires_at: "",
+        }),
+      });
+      setMessage(`Maamuzi ya KYC ya ${status} yamerekodiwa.`);
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function createBusiness(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    try {
+      const result = await api("/businesses", {
+        method: "POST",
+        body: JSON.stringify(businessForm),
+      });
+      setBusinessForm({
+        name: "",
+        business_type: "Supermarket",
+        address: "",
+        phone: "",
+        email: "",
+      });
+      setSelectedBusinessId(result.id);
+      setMessage("Biashara na tawi kuu zimeundwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function loadBusinessSummary(businessId) {
+    setSelectedBusinessId(businessId);
+    try {
+      setBusinessSummary(await api(`/businesses/${encodeURIComponent(businessId)}/summary`));
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function createBranch(event) {
+    if (!selectedBusinessId) return;
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    try {
+      await api(`/businesses/${encodeURIComponent(selectedBusinessId)}/branches`, {
+        method: "POST",
+        body: JSON.stringify({ ...branchForm, is_active: true }),
+      });
+      setBranchForm({ name: "", address: "", phone: "", email: "" });
+      setMessage("Tawi limeongezwa.");
+      await loadBusinessSummary(selectedBusinessId);
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function createStaff(event) {
+    event.preventDefault();
+    if (!selectedBusinessId) return;
+    setError("");
+    setMessage("");
+    try {
+      await api(`/businesses/${encodeURIComponent(selectedBusinessId)}/memberships`, {
+        method: "POST",
+        body: JSON.stringify({
+          email: staffForm.email,
+          role: staffForm.role,
+          branch_id: staffForm.branch_id || null,
+        }),
+      });
+      setStaffForm({ email: "", role: "STAFF", branch_id: "" });
+      setMessage("Wafanyakazi wameongezwa kwenye biashara.");
+      await refresh();
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -858,10 +1661,18 @@ function MarketplaceDashboard({ user, onLogout }) {
     ["products", "Bidhaa"],
     ["sales", "Mauzo"],
     ...(!isAdmin ? [["storefront", "Duka lako"], ["stock", "Stock"]] : []),
+    ...(!isAdmin ? [["business", "Biashara na Matawi"], ["assistant", translateKey("assistant.title", language)]] : []),
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
+    ...(isAdmin ? [["kyc", "Ukaguzi wa KYC"]] : []),
+    ...(!isAdmin ? [["kyc", "KYC ya duka"]] : []),
     ...(isAdmin ? [["categories", "Makundi"], ["cancellations", "Kughairi"], ["reviews", "Maoni"], ["support", "Msaada"]] : []),
     ...(isAdmin ? [["audit", "Audit"]] : []),
-    ["settings", "Akaunti"],
+    ...(isAdmin ? [["security", "Usalama na fraud"]] : []),
+    ...(!isAdmin ? [["security", "Tahadhari za usalama"]] : []),
+    ...(isAdmin ? [["documents", "Nyaraka"]] : []),
+    ...(isAdmin ? [["health", "Afya ya mfumo"]] : []),
+    ...(isAdmin ? [["notifications", "Arifa"]] : []),
+    ["settings", translateKey("settings.title", language)],
   ];
 
   return localize(
@@ -885,14 +1696,86 @@ function MarketplaceDashboard({ user, onLogout }) {
       {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
       {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
 
+      {tab === "assistant" && !isAdmin && <BusinessAssistant businessId={selectedBusinessId} />}
+
       {tab === "overview" && stats && (
         <section className="dashboard-content">
-          <div className="stats-grid">
-            <StatCard title="Mauzo yaliyokamilika (demo)" value={`TZS ${formatMoney(stats.gross_sales)}`} />
-            <StatCard title={isAdmin ? "Kamisheni ya admin (5%)" : "Kamisheni ya jukwaa (5%)"} value={`TZS ${formatMoney(stats.platform_fees)}`} />
-            <StatCard title={isAdmin ? "Oda zilizokamilika" : "Faida halisi (demo)"} value={isAdmin ? stats.order_count : `TZS ${formatMoney(stats.net_profit)}`} note="Ada ya gateway haijajumuishwa kwenye demo." />
-            <StatCard title="Bidhaa zilizo hai" value={stats.product_count} />
-          </div>
+          {isAdmin ? (
+            adminSummary ? (
+              <>
+                <div className="stats-grid">
+                  <StatCard title="Watumiaji wote" value={adminSummary.counts.total_users} />
+                  <StatCard title="Wanunuzi" value={adminSummary.counts.buyers} />
+                  <StatCard title="Wauzaji" value={adminSummary.counts.sellers} />
+                  <StatCard title="Wauzaji waliothibitishwa" value={adminSummary.counts.verified_sellers} />
+                  <StatCard title="KYC inayosubiri" value={adminSummary.counts.pending_kyc} note="Pending, review au resubmission." />
+                  <StatCard title="Biashara" value={adminSummary.counts.businesses} />
+                  <StatCard title="Bidhaa" value={adminSummary.counts.products} />
+                  <StatCard title="Oda zote" value={adminSummary.counts.orders} />
+                  <StatCard title="Deliveries hai" value={adminSummary.counts.active_deliveries} />
+                  <StatCard title="Tahadhari za fraud" value={adminSummary.counts.fraud_alerts} />
+                  <StatCard title="Matukio ya usalama (saa 24)" value={adminSummary.counts.security_events} />
+                  <StatCard title="Mauzo yaliyokamilika (demo)" value={`TZS ${formatMoney(stats.gross_sales)}`} />
+                </div>
+                <div className="dashboard-grid">
+                  <DashboardTrendChart title="Mauzo ya siku 7 (demo)" rows={adminSummary.sales_trend} />
+                  <DashboardStatusList title="Utendaji wa delivery" rows={adminSummary.delivery_statuses} />
+                  <DashboardActivityFeed rows={adminSummary.activity} />
+                  <section className="dashboard-panel">
+                    <h2>Mifumo na tahadhari</h2>
+                    <p>Afya ya mfumo: <strong>{systemHealth?.status || "Tazama afya ya mfumo"}</strong></p>
+                    <p>Fraud alerts na matukio ya usalama vinahitaji ukaguzi wa binadamu.</p>
+                    <div className="dashboard-panel-actions">
+                      <button type="button" className="table-action" onClick={() => setTab("security")}>Kagua usalama</button>
+                      <button type="button" className="table-action" onClick={() => setTab("kyc")}>Kagua KYC</button>
+                      <button type="button" className="table-action" onClick={() => setTab("audit")}>Fungua audit logs</button>
+                    </div>
+                  </section>
+                </div>
+              </>
+            ) : <p className="empty-state">Inapakia muhtasari wa mfumo...</p>
+          ) : (
+            <>
+              <div className="stats-grid">
+                <StatCard title="Mauzo yaliyokamilika (demo)" value={`TZS ${formatMoney(stats.gross_sales)}`} />
+                <StatCard title="Faida halisi (demo)" value={`TZS ${formatMoney(stats.net_profit)}`} />
+                <StatCard title="Oda zote" value={stats.total_orders} />
+                <StatCard title="Deliveries hai" value={stats.active_deliveries} />
+                <StatCard title="Bidhaa zilizo hai" value={stats.product_count} />
+                <StatCard title="Bidhaa zenye stock ndogo" value={stats.low_stock_count || 0} />
+                <StatCard title="Wateja" value={stats.customer_count} />
+                <StatCard title="Maoni ya bidhaa" value={stats.review_count} />
+                <StatCard title="Vipande vya stock" value={stats.inventory_units} />
+                <StatCard title="Maombi ya kughairi" value={stats.pending_cancellations} />
+                <StatCard title="Kamisheni ya jukwaa (5%)" value={`TZS ${formatMoney(stats.platform_fees)}`} />
+                <StatCard title="Hali ya KYC" value={sellerKyc?.status || user.kyc_status || "NOT_VERIFIED"} />
+              </div>
+              <div className="dashboard-grid">
+                <DashboardTrendChart title="Mauzo ya siku 7 (demo)" rows={stats.sales_trend} />
+                <section className="dashboard-panel">
+                  <h2>Arifa za duka</h2>
+                  <p>Stock chini: <strong>{lowStock.length}</strong></p>
+                  <p>Tahadhari za akaunti: <strong>{mySecurityAlerts.length}</strong></p>
+                  <p>Matawi yanayoonekana: <strong>{businessSummary?.branches?.length || 0}</strong></p>
+                  {businessSummary?.branches?.length > 0 && (
+                    <div className="dashboard-status-list">
+                      {businessSummary.branches.map((branch) => (
+                        <div className="dashboard-status-row" key={branch.branch_id}>
+                          <span>{branch.branch_name}</span>
+                          <strong>{branch.order_count} oda</strong>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {lowStock.slice(0, 4).map((product) => (
+                    <div className="dashboard-status-row" key={product.id}>
+                      <span>{product.name}</span><strong>{product.stock_quantity} zimebaki</strong>
+                    </div>
+                  ))}
+                </section>
+              </div>
+            </>
+          )}
           <div className="demo-notice dashboard-notice">
             <span className="notice-icon" aria-hidden="true">i</span>
             <p><strong>Hali ya majaribio.</strong> Rekodi za mapato/commission ni za demo; hakuna malipo yanayohamishwa. Ada halisi za mtandao hazijapimwa.</p>
@@ -1121,16 +2004,443 @@ function MarketplaceDashboard({ user, onLogout }) {
         </section>
       )}
 
+      {tab === "security" && isAdmin && (
+        <section className="dashboard-content">
+          <div className="dashboard-section-heading">
+            <h2>Security Intelligence</h2>
+            <button type="button" onClick={runSecurityScan}>Fanya scan sasa</button>
+          </div>
+          <p className="field-hint">
+            Rule-based signals hutokana na rekodi halisi. OpenAI Responses huchambua tu
+            counts zilizochujwa ikiwa OPENAI_API_KEY imewekwa; majina, barua pepe, IP na
+            hatua za akaunti hazitumwi kwa model. Alert ni kiashiria cha ukaguzi, si uthibitisho.
+          </p>
+          <div className="security-filters">
+            <label className="field-label">
+              Hali
+              <select className="text-input" value={securityFilters.status} onChange={(event) => setSecurityFilters({ ...securityFilters, status: event.target.value })}>
+                <option value="">Hali zote</option>
+                {["OPEN", "IN_REVIEW", "ACCOUNT_REVIEW", "WARNED", "SUSPENDED", "APPEAL_PENDING", "FALSE_POSITIVE", "RESOLVED"].map((status) => <option key={status} value={status}>{status}</option>)}
+              </select>
+            </label>
+            <label className="field-label">
+              Kiwango cha hatari
+              <select className="text-input" value={securityFilters.severity} onChange={(event) => setSecurityFilters({ ...securityFilters, severity: event.target.value })}>
+                <option value="">Viwango vyote</option>
+                {["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((severity) => <option key={severity} value={severity}>{severity}</option>)}
+              </select>
+            </label>
+            <label className="field-label">
+              Aina ya alert
+              <select className="text-input" value={securityFilters.category} onChange={(event) => setSecurityFilters({ ...securityFilters, category: event.target.value })}>
+                <option value="">Aina zote</option>
+                {["BRUTE_FORCE", "UNUSUAL_LOGIN_ACTIVITY", "SELLER_RISK", "REPEATED_CANCELLATIONS"].map((category) => <option key={category} value={category}>{category.replaceAll("_", " ")}</option>)}
+              </select>
+            </label>
+            <button type="button" className="table-action" onClick={refreshSecurityData}>Tumia vichujio</button>
+          </div>
+          <div className="security-alert-list">
+            {securityAlerts.map((alert) => (
+              <button
+                type="button"
+                className={`security-alert-card ${securityAlertDetail?.id === alert.id ? "selected" : ""}`}
+                key={alert.id}
+                onClick={() => openSecurityAlert(alert.id)}
+              >
+                <span className={`seller-status ${alert.severity === "CRITICAL" || alert.severity === "HIGH" ? "rejected" : "pending"}`}>{alert.severity} · rules {alert.risk_score}/100{alert.ai_used ? ` · AI ${alert.ai_risk_score}/100` : ""}</span>
+                <strong>{alert.category.replaceAll("_", " ")}</strong>
+                <small>{alert.subject_type}: {alert.subject_id} · {alert.status}</small>
+                <small>{alert.occurred_at} · {alert.detection_model}{alert.ai_used ? " · AI" : " · rules"}</small>
+              </button>
+            ))}
+            {!securityAlerts.length && <p className="empty-state">Hakuna alerts kwa vichujio hivi. Endesha scan kupata tathmini mpya.</p>}
+          </div>
+          {securityAlertDetail && (
+            <article className="security-detail">
+              <div className="dashboard-section-heading">
+                <h3>Ushahidi na historia ya alert</h3>
+                <button type="button" onClick={() => setSecurityAlertDetail(null)}>Funga</button>
+              </div>
+              <p><strong>{securityAlertDetail.subject_type}:</strong> {securityAlertDetail.subject_id} · {securityAlertDetail.category} · {securityAlertDetail.status}</p>
+              <h4>Sababu za alama</h4>
+              <ul>{securityAlertDetail.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
+              <h4>Uchambuzi wa OpenAI</h4>
+              {securityAlertDetail.ai_used ? (
+                <>
+                  <p>AI risk score: {securityAlertDetail.ai_risk_score}/100 · {securityAlertDetail.ai_model} · {securityAlertDetail.ai_analyzed_at}</p>
+                  <ul>{securityAlertDetail.ai_reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
+                </>
+              ) : <p className="field-hint">Bado hakuna uchambuzi wa AI uliothibitishwa kwa alert hii.</p>}
+              <h4>Ushahidi uliorekodiwa</h4>
+              <pre>{JSON.stringify(securityAlertDetail.evidence, null, 2)}</pre>
+              <h4>Audit trail</h4>
+              <ul className="security-history">
+                {securityAlertDetail.actions.map((action) => (
+                  <li key={action.id}>{action.action} · {action.actor_name || "Mfumo"} · {action.created_at}<small>{action.note}</small></li>
+                ))}
+              </ul>
+              <label className="field-label" htmlFor="security-action-note">Sababu ya hatua ya admin</label>
+              <textarea id="security-action-note" className="text-input security-note" value={securityActionNote} onChange={(event) => setSecurityActionNote(event.target.value)} maxLength={2000} />
+              <div className="seller-actions">
+                <button type="button" onClick={() => actOnSecurityAlert("WARN")}>Onya</button>
+                <button type="button" onClick={() => actOnSecurityAlert("ACCOUNT_REVIEW")}>Weka kwenye review</button>
+                {["ACCOUNT", "SELLER", "BUYER"].includes(securityAlertDetail.subject_type) && securityAlertDetail.status !== "SUSPENDED" && <button type="button" className="danger-action" onClick={() => actOnSecurityAlert("SUSPEND")}>Simamisha akaunti</button>}
+                {securityAlertDetail.status === "SUSPENDED" && <button type="button" onClick={() => actOnSecurityAlert("RESTORE")}>Rejesha akaunti</button>}
+                <button type="button" onClick={() => actOnSecurityAlert("FALSE_POSITIVE")}>Weka false positive</button>
+                <button type="button" onClick={() => actOnSecurityAlert("RESOLVE")}>Tatua alert</button>
+              </div>
+            </article>
+          )}
+          <div className="dashboard-section-heading"><h3>Appeals zinazosubiri</h3><span>{securityAppeals.length}</span></div>
+          <label className="field-label" htmlFor="security-appeal-note">Sababu ya uamuzi wa appeal</label>
+          <textarea id="security-appeal-note" className="text-input security-note" value={securityAppealNote} onChange={(event) => setSecurityAppealNote(event.target.value)} maxLength={2000} />
+          <div className="seller-list feature-list">
+            {securityAppeals.map((appeal) => (
+              <article className="seller-card security-appeal" key={appeal.id}>
+                <div>
+                  <strong>{appeal.appellant_name} · {appeal.appellant_email}</strong>
+                  <span>{appeal.subject_type}: {appeal.subject_id} · {appeal.category} · {appeal.severity} ({appeal.risk_score}/100)</span>
+                  <small>{appeal.message} · {appeal.created_at}</small>
+                </div>
+                <div className="seller-actions">
+                  <button type="button" onClick={() => reviewSecurityAppeal(appeal.id, "ACCEPTED")}>Kubali na fungua upya ukaguzi</button>
+                  <button type="button" className="danger-action" onClick={() => reviewSecurityAppeal(appeal.id, "REJECTED")}>Kataa appeal</button>
+                </div>
+              </article>
+            ))}
+            {!securityAppeals.length && <p className="empty-state">Hakuna appeal inayosubiri.</p>}
+          </div>
+        </section>
+      )}
+
+      {tab === "security" && !isAdmin && (
+        <section className="dashboard-content feature-list">
+          <div className="dashboard-section-heading">
+            <h2>Tahadhari za usalama kwenye akaunti yako</h2>
+            <span>{mySecurityAlerts.length} taarifa</span>
+          </div>
+          <p className="field-hint">Tahadhari ni viashiria vinavyokaguliwa na mtu; hazimaanishi moja kwa moja kuwa umefanya kosa.</p>
+          {mySecurityAlerts.map((alert) => (
+            <article className="security-detail" key={alert.id}>
+              <div className="dashboard-section-heading">
+                <h3>{alert.category.replaceAll("_", " ")}</h3>
+                <span>{alert.severity} · {alert.risk_score}/100 · {alert.status}</span>
+              </div>
+              <ul>{alert.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
+              <small>{alert.occurred_at} · {alert.detection_model}</small>
+              {alert.appeal_status === "PENDING" ? (
+                <p className="field-hint">Appeal yako inasubiri ukaguzi.</p>
+              ) : (
+                <>
+                  {alert.appeal_status && <p className="field-hint">Hali ya appeal ya awali: {alert.appeal_status}</p>}
+                  <label className="field-label" htmlFor={`appeal-${alert.id}`}>Eleza kwa nini unaomba ukaguzi upya</label>
+                  <textarea
+                    id={`appeal-${alert.id}`}
+                    className="text-input security-note"
+                    value={appealDrafts[alert.id] || ""}
+                    onChange={(event) => setAppealDrafts({ ...appealDrafts, [alert.id]: event.target.value })}
+                    maxLength={2000}
+                  />
+                  <button type="button" className="table-action" onClick={() => submitSecurityAppeal(alert.id)}>Tuma appeal</button>
+                </>
+              )}
+            </article>
+          ))}
+          {!mySecurityAlerts.length && <p className="empty-state">Hakuna tahadhari za usalama kwenye akaunti yako.</p>}
+        </section>
+      )}
+
+      {tab === "documents" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <div className="dashboard-section-heading"><h2>Nyaraka za wauzaji</h2><span>{adminDocuments.length} jumla</span></div>
+          {adminDocuments.map((item) => (
+            <article className="seller-card" key={item.id}>
+              <div><strong>{item.filename}</strong><span>{item.seller_name} · {item.shop_name || item.seller_id}</span><small>{item.kind} · {item.content_type} · {item.created_at}</small></div>
+              <a className="table-action" href={`/api/documents/${encodeURIComponent(item.id)}`} target="_blank" rel="noreferrer">Fungua salama</a>
+            </article>
+          ))}
+          {!adminDocuments.length && <p className="empty-state">Hakuna nyaraka zilizopakiwa.</p>}
+        </section>
+      )}
+
+      {tab === "notifications" && isAdmin && (
+        <section className="dashboard-content">
+          <div className="dashboard-section-heading"><h2>Mipangilio ya notification providers</h2></div>
+          {notificationSettings ? (
+            <div className="seller-list feature-list">
+              {Object.entries(notificationSettings).filter(([key]) => key !== "queue").map(([key, value]) => (
+                <article className="seller-card" key={key}>
+                  <div>
+                    <strong>{key.replaceAll("_", " ").toUpperCase()}</strong>
+                    <span>Provider: {value.provider || "Haijasajiliwa"}</span>
+                    <small>{value.configured ? "Configured — provider credentials zinapatikana" : "Haijawekwa"}</small>
+                  </div>
+                  <span className={`seller-status ${value.configured ? "active" : "pending"}`}>{value.configured ? "READY" : "NOT CONFIGURED"}</span>
+                </article>
+              ))}
+              <article className="seller-card">
+                <div><strong>NOTIFICATION QUEUE</strong><span>Provider abstraction: EMAIL/SMS/WEB_PUSH/MOBILE_PUSH/WHATSAPP</span><small>{notificationSettings.queue.service_configured ? "Service URL imewekwa" : "NOTIFICATION_SERVICE_URL haijawekwa"}</small></div>
+                <span className={`seller-status ${notificationSettings.queue.service_configured ? "active" : "pending"}`}>{notificationSettings.queue.service_configured ? "READY" : "NOT CONFIGURED"}</span>
+              </article>
+            </div>
+          ) : <p className="empty-state">Mipangilio ya arifa haijapakiwa.</p>}
+        </section>
+      )}
+
+      {tab === "health" && isAdmin && (
+        <section className="dashboard-content">
+          <div className="dashboard-section-heading"><h2>Afya na ufuatiliaji wa mfumo</h2><button type="button" onClick={refreshSystemHealth}>Sasisha</button></div>
+          {systemHealth ? (
+            <>
+              <div className="stats-grid">
+                <StatCard title="Hali ya mfumo" value={systemHealth.status} />
+                <StatCard title="Database" value={systemHealth.database} />
+                <StatCard title="Redis" value={systemHealth.redis} />
+                <StatCard title="Errors za saa moja" value={systemHealth.server_errors_last_hour} />
+                <StatCard title="Uptime (sekunde)" value={systemHealth.uptime_seconds} />
+                <StatCard title="Backups za S3" value={systemHealth.backups.configured ? "Zimesanidiwa" : "Hazijasanidiwa"} note={systemHealth.backups.last_success_at || "Backup ya kwanza bado haijafanyika."} />
+              </div>
+              {!systemHealth.backups.configured && <p className="form-error dashboard-alert" role="alert">Backups hazijawashwa. Weka mipangilio ya S3 kwenye mazingira ya server.</p>}
+              <p className="field-hint">Makosa ya seva yanaandikwa kwenye log za server; kipimo hiki huhesabu HTTP 5xx katika mchakato huu.</p>
+            </>
+          ) : <p className="empty-state">Taarifa za afya hazipatikani.</p>}
+        </section>
+      )}
+
+      {tab === "kyc" && (
+        <section className="dashboard-content">
+          {isAdmin ? (
+            <>
+              <div className="dashboard-section-heading"><h2>Ukaguzi wa KYC</h2><span>{sellerKycRows.length} maombi</span></div>
+              <div className="seller-list feature-list">
+                {sellerKycRows.map((row) => (
+                  <article className="seller-card" key={row.seller_id}>
+                    <div>
+                      <strong>{row.shop_name || row.full_name}</strong>
+                      <span>{row.full_name} · {row.email}</span>
+                      <small>{row.seller_type} · {row.status} · {row.updated_at}</small>
+                      {row.rejection_reason && <small>Sababu: {row.rejection_reason}</small>}
+                    </div>
+                    <div className="seller-actions">
+                      <button type="button" onClick={() => reviewKyc(row.seller_id, "UNDER_REVIEW", "")}>Anza ukaguzi</button>
+                      <button type="button" onClick={() => reviewKyc(row.seller_id, "VERIFIED", "")}>Approve</button>
+                      <button type="button" className="danger-action" onClick={() => reviewKyc(row.seller_id, "RESUBMISSION_REQUIRED", "Tafadhali wasilisha nyaraka sahihi au zilizokamilika.")}>Omba nyaraka nyingine</button>
+                      <button type="button" className="danger-action" onClick={() => reviewKyc(row.seller_id, "REJECTED", "Taarifa au nyaraka hazikupitisha uthibitisho.")}>Reject</button>
+                    </div>
+                  </article>
+                ))}
+                {!sellerKycRows.length && <p className="empty-state">Hakuna maombi ya KYC bado.</p>}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="dashboard-section-heading">
+                <h2>KYC ya muuzaji</h2>
+                <span>{sellerKyc?.status || "NOT_VERIFIED"}</span>
+              </div>
+              {sellerKyc?.status === "VERIFIED" ? (
+                <p className="success-message">Muuzaji ametathminishwa Verified.</p>
+              ) : (
+                <form className="form-card" onSubmit={submitKyc}>
+                  <label className="field-label" htmlFor="kyc-seller-type">Aina ya seller</label>
+                  <select id="kyc-seller-type" className="text-input" value={kycForm.seller_type} onChange={(event) => setKycForm({ ...kycForm, seller_type: event.target.value })}>
+                    <option value="INDIVIDUAL">Individual Seller</option>
+                    <option value="BUSINESS">Business Seller</option>
+                  </select>
+                  <label className="field-label" htmlFor="kyc-phone">Namba ya simu</label>
+                  <input id="kyc-phone" className="text-input" required value={kycForm.phone} onChange={(event) => setKycForm({ ...kycForm, phone: event.target.value })} />
+                  {kycForm.seller_type === "INDIVIDUAL" ? (
+                    <>
+                      <label className="field-label" htmlFor="kyc-name">Majina ya utambulisho</label>
+                      <input id="kyc-name" className="text-input" required value={kycForm.identity_name} onChange={(event) => setKycForm({ ...kycForm, identity_name: event.target.value })} />
+                      <label className="field-label" htmlFor="kyc-number">Namba ya kitambulisho</label>
+                      <input id="kyc-number" className="text-input" required value={kycForm.identity_number} onChange={(event) => setKycForm({ ...kycForm, identity_number: event.target.value })} />
+                    </>
+                  ) : (
+                    <>
+                      <label className="field-label" htmlFor="kyc-business-name">Jina la biashara</label>
+                      <input id="kyc-business-name" className="text-input" required value={kycForm.business_name} onChange={(event) => setKycForm({ ...kycForm, business_name: event.target.value })} />
+                      <label className="field-label" htmlFor="kyc-registration">Namba ya usajili</label>
+                      <input id="kyc-registration" className="text-input" value={kycForm.business_registration_number} onChange={(event) => setKycForm({ ...kycForm, business_registration_number: event.target.value })} />
+                      <label className="field-label" htmlFor="kyc-tin">TIN</label>
+                      <input id="kyc-tin" className="text-input" value={kycForm.tin_number} onChange={(event) => setKycForm({ ...kycForm, tin_number: event.target.value })} />
+                      <label className="field-label" htmlFor="kyc-license">Leseni ya biashara</label>
+                      <input id="kyc-license" className="text-input" value={kycForm.business_license_number} onChange={(event) => setKycForm({ ...kycForm, business_license_number: event.target.value })} />
+                      <label className="field-label" htmlFor="kyc-address">Anwani ya biashara</label>
+                      <input id="kyc-address" className="text-input" required value={kycForm.business_address} onChange={(event) => setKycForm({ ...kycForm, business_address: event.target.value })} />
+                    </>
+                  )}
+                  <button className="generate-button" type="submit">Tuma ombi la KYC</button>
+                </form>
+              )}
+              {sellerKyc?.status !== "VERIFIED" && (
+                <form className="form-card" onSubmit={uploadDocument}>
+                  <h2>Pakia nyaraka ya KYC</h2>
+                  <input type="hidden" name="document-kind" value="seller_verification" />
+                  <label className="field-label" htmlFor="kyc-document">PDF, JPEG, PNG au WebP; hadi MB 10</label>
+                  <input id="kyc-document" className="text-input" name="document" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" required />
+                  <button className="generate-button" type="submit">Pakia nyaraka salama</button>
+                </form>
+              )}
+              {sellerKyc?.documents?.length > 0 && (
+                <div className="feature-list">
+                  <h2>Nyaraka zilizowasilishwa</h2>
+                  {sellerKyc.documents.map((document) => (
+                    <article className="seller-card" key={document.id}>
+                      <div><strong>{document.filename}</strong><small>{document.document_role || "KYC"} · {document.created_at}</small></div>
+                      <a className="table-action" href={`/api/documents/${encodeURIComponent(document.id)}`} target="_blank" rel="noreferrer">Fungua</a>
+                    </article>
+                  ))}
+                </div>
+              )}
+              {sellerKyc?.status && !["VERIFIED"].includes(sellerKyc.status) && (
+                <button className="danger-action" type="button" onClick={deleteKyc}>Futa ombi na nyaraka za KYC</button>
+              )}
+            </>
+          )}
+        </section>
+      )}
+
+      {tab === "business" && !isAdmin && (
+        <section className="dashboard-content">
+          <div className="dashboard-section-heading"><h2>Biashara na matawi</h2></div>
+          <form className="form-card" onSubmit={createBusiness}>
+            <h2>Unda biashara mpya</h2>
+            <label className="field-label" htmlFor="business-name">Jina la biashara</label>
+            <input id="business-name" className="text-input" required value={businessForm.name} onChange={(event) => setBusinessForm({ ...businessForm, name: event.target.value })} />
+            <label className="field-label" htmlFor="business-type">Aina ya biashara</label>
+            <input id="business-type" className="text-input" required value={businessForm.business_type} onChange={(event) => setBusinessForm({ ...businessForm, business_type: event.target.value })} />
+            <label className="field-label" htmlFor="business-address">Anwani</label>
+            <input id="business-address" className="text-input" value={businessForm.address} onChange={(event) => setBusinessForm({ ...businessForm, address: event.target.value })} />
+            <label className="field-label" htmlFor="business-phone">Simu</label>
+            <input id="business-phone" className="text-input" value={businessForm.phone} onChange={(event) => setBusinessForm({ ...businessForm, phone: event.target.value })} />
+            <label className="field-label" htmlFor="business-email">Barua pepe</label>
+            <input id="business-email" className="text-input" type="email" value={businessForm.email} onChange={(event) => setBusinessForm({ ...businessForm, email: event.target.value })} />
+            <button className="generate-button" type="submit">Unda biashara</button>
+          </form>
+
+          {businesses.length > 0 && (
+            <div className="feature-columns">
+              <section className="form-card">
+                <h2>Chagua biashara</h2>
+                <select className="text-input" value={selectedBusinessId} onChange={(event) => loadBusinessSummary(event.target.value)}>
+                  {businesses.map((business) => (
+                    <option key={business.id} value={business.id}>{business.name}</option>
+                  ))}
+                </select>
+                {businessSummary && (
+                  <div className="feature-list">
+                    <h2>Ulinganisho wa matawi</h2>
+                    {businessSummary.branches.map((branch) => (
+                      <article className="seller-card" key={branch.branch_id}>
+                        <div>
+                          <strong>{branch.branch_name}</strong>
+                          <span>Oda: {branch.order_count}</span>
+                          <small>Mauzo: TZS {formatMoney(branch.gross_sales)} · Bidhaa hai: {branch.active_products} · Low stock: {branch.low_stock}</small>
+                        </div>
+                        <span className={`seller-status ${branch.is_active ? "active" : "pending"}`}>{branch.is_active ? "ACTIVE" : "INACTIVE"}</span>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
+              <form className="form-card" onSubmit={createBranch}>
+                <h2>Ongeza tawi</h2>
+                <label className="field-label" htmlFor="branch-name">Jina la tawi</label>
+                <input id="branch-name" className="text-input" required value={branchForm.name} onChange={(event) => setBranchForm({ ...branchForm, name: event.target.value })} />
+                <label className="field-label" htmlFor="branch-address">Anwani</label>
+                <input id="branch-address" className="text-input" value={branchForm.address} onChange={(event) => setBranchForm({ ...branchForm, address: event.target.value })} />
+                <label className="field-label" htmlFor="branch-phone">Simu</label>
+                <input id="branch-phone" className="text-input" value={branchForm.phone} onChange={(event) => setBranchForm({ ...branchForm, phone: event.target.value })} />
+                <button className="generate-button" type="submit">Ongeza tawi</button>
+              </form>
+              <form className="form-card" onSubmit={createStaff}>
+                <h2>Ongeza mfanyakazi au meneja</h2>
+                <label className="field-label" htmlFor="staff-email">Barua pepe ya mtumiaji</label>
+                <input id="staff-email" className="text-input" type="email" required value={staffForm.email} onChange={(event) => setStaffForm({ ...staffForm, email: event.target.value })} />
+                <label className="field-label" htmlFor="staff-role">Ruhusa ya msingi</label>
+                <select id="staff-role" className="text-input" value={staffForm.role} onChange={(event) => setStaffForm({ ...staffForm, role: event.target.value })}>
+                  <option value="STAFF">Mfanyakazi wa tawi</option>
+                  <option value="BRANCH_MANAGER">Meneja wa tawi</option>
+                </select>
+                <label className="field-label" htmlFor="staff-branch">Tawi</label>
+                <select id="staff-branch" className="text-input" value={staffForm.branch_id} onChange={(event) => setStaffForm({ ...staffForm, branch_id: event.target.value })}>
+                  <option value="">Kiteuzi cha tawi</option>
+                  {businessSummary?.branches.map((branch) => (
+                    <option key={branch.branch_id} value={branch.branch_id}>{branch.branch_name}</option>
+                  ))}
+                </select>
+                <button className="generate-button" type="submit">Ongeza mwanachama</button>
+              </form>
+            </div>
+          )}
+        </section>
+      )}
+
       {tab === "settings" && (
         <section className="dashboard-content">
+          <div className="dashboard-section-heading"><h2>{translateKey("settings.title", language)}</h2></div>
+          <section className="form-card settings-form background-settings" aria-labelledby="background-settings-title">
+            <h2 id="background-settings-title">{translateKey("settings.background.title", language)}</h2>
+            <p className="field-hint">{translateKey("settings.background.description", language)}</p>
+            <div className="background-palette" role="group" aria-label={translateKey("settings.background.title", language)}>
+              {backgroundThemes.map((theme) => {
+                const label = translateKey(theme.labelKey, language);
+                const selected = backgroundColor === theme.color;
+                return (
+                  <button
+                    className={`background-choice${selected ? " selected" : ""}`}
+                    type="button"
+                    key={theme.color}
+                    aria-label={translateKey("settings.background.select", language, { color: label })}
+                    aria-pressed={selected}
+                    onClick={() => setBackgroundColor(theme.color)}
+                  >
+                    <span className="background-swatch" style={{ backgroundColor: theme.color }} aria-hidden="true" />
+                    <span>{label}</span>
+                    {selected && <small>{translateKey("settings.background.selected", language)}</small>}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
           <form className="form-card settings-form" onSubmit={changePassword}>
-            <h2>Badilisha nenosiri</h2>
+            <h2>{translateKey("settings.password", language)}</h2>
             <label className="field-label" htmlFor="current-password">Nenosiri la sasa</label>
             <input id="current-password" className="text-input" type="password" autoComplete="current-password" required value={passwordForm.current_password} onChange={(event) => setPasswordForm({ ...passwordForm, current_password: event.target.value })} />
             <label className="field-label" htmlFor="new-password">Nenosiri jipya (angalau herufi 10)</label>
             <input id="new-password" className="text-input" type="password" autoComplete="new-password" minLength={10} required value={passwordForm.new_password} onChange={(event) => setPasswordForm({ ...passwordForm, new_password: event.target.value })} />
             <button className="generate-button" type="submit">Hifadhi nenosiri</button>
           </form>
+          <AccountSecurity />
+          {!isAdmin && (
+            <section className="form-card settings-form">
+              <h2>Pakia nyaraka</h2>
+              <form className="buyer-form" onSubmit={uploadDocument}>
+                <label className="field-label" htmlFor="document-kind">Aina ya nyaraka</label>
+                <select id="document-kind" className="text-input" value={documentKind} onChange={(event) => setDocumentKind(event.target.value)}>
+                  <option value="seller_verification">Uthibitisho wa muuzaji</option>
+                  <option value="product_document">Nyaraka za bidhaa</option>
+                </select>
+                {documentKind === "product_document" && (
+                  <>
+                    <label className="field-label" htmlFor="document-product">Bidhaa</label>
+                    <select id="document-product" className="text-input" required value={documentProductId} onChange={(event) => setDocumentProductId(event.target.value)}>
+                      <option value="">Chagua bidhaa</option>
+                      {products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+                    </select>
+                  </>
+                )}
+                <label className="field-label" htmlFor="account-document">Faili (PDF/JPEG/PNG/WebP; hadi MB 10)</label>
+                <input id="account-document" className="text-input" name="document" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" required />
+                <button className="generate-button" type="submit">Pakia nyaraka</button>
+              </form>
+              <div className="feature-list">
+                {documents.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.filename}</strong><span>{item.kind} · {item.created_at}</span></div><a className="table-action" href={`/api/documents/${encodeURIComponent(item.id)}`}>Pakua</a></article>)}
+                {!documents.length && <p className="empty-state">Bado hakuna nyaraka.</p>}
+              </div>
+            </section>
+          )}
         </section>
       )}
 
@@ -1181,7 +2491,19 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
         {sale.payment_status === "COMPLETED" && onUpdateDelivery ? (
           <div className="delivery-editor">
             <select className="text-input" aria-label="Hali ya delivery" value={deliveryStatus} onChange={(event) => setDeliveryStatus(event.target.value)}>
-              <option value="UNFULFILLED">Haijaanza</option><option value="PROCESSING">Inaandaliwa</option><option value="SHIPPED">Imesafirishwa</option><option value="DELIVERED">Imefikishwa</option>
+              <option value="UNFULFILLED">Haijaanza</option>
+              <option value="PROCESSING">Inachakatwa</option>
+              <option value="ORDER_CONFIRMED">Oda imehakikiwa</option>
+              <option value="SELLER_PREPARING">Muuzaji anaandaa</option>
+              <option value="READY_FOR_PICKUP">Tayari kuchukuliwa</option>
+              <option value="AGENT_ASSIGNED">Agent amepangiwa</option>
+              <option value="PICKED_UP">Imechukuliwa</option>
+              <option value="IN_TRANSIT">Safarini</option>
+              <option value="NEAR_DESTINATION">Karibu na lengwa</option>
+              <option value="OUT_FOR_DELIVERY">Imeondoka kwa delivery</option>
+              <option value="DELIVERED">Imefikishwa</option>
+              <option value="DELIVERY_FAILED">Delivery imeshindikana</option>
+              <option value="RETURNED">Imerejeshwa</option>
             </select>
             <input className="text-input" aria-label="Namba ya ufuatiliaji" maxLength={100} placeholder="Tracking code" value={trackingCode} onChange={(event) => setTrackingCode(event.target.value)} />
             <button type="button" className="table-action" disabled={busy || deliveryStatus === "UNFULFILLED"} onClick={saveDelivery}>{busy ? "..." : "Hifadhi"}</button>
@@ -1296,6 +2618,292 @@ function PublicMarketplace({ onLogin }) {
   );
 }
 
+function PublicTrackingPage({ trackingNumber }) {
+  const [tracking, setTracking] = useState(null);
+  const [error, setError] = useFeedbackState("error");
+  const qrRef = useRef(null);
+  const barcodeRef = useRef(null);
+
+  useEffect(() => {
+    api(`/tracking/${encodeURIComponent(trackingNumber)}`)
+      .then(setTracking)
+      .catch((requestError) => setError(requestError.message));
+  }, [trackingNumber]);
+
+  useEffect(() => {
+    if (!tracking || !qrRef.current) return;
+    const value = `${window.location.origin}/track/${encodeURIComponent(tracking.tracking_number)}`;
+    QRCode.toCanvas(qrRef.current, value, { width: 140, margin: 1 }).catch(() => {});
+    if (barcodeRef.current) {
+      try {
+        JsBarcode(barcodeRef.current, tracking.tracking_number, {
+          format: "CODE128",
+          width: 2,
+          height: 70,
+          displayValue: true,
+          margin: 8,
+        });
+      } catch {
+        // Some browsers can reject an invalid barcode value; tracking text remains visible.
+      }
+    }
+  }, [tracking]);
+
+  return (
+    <main className="page-shell">
+      <Header label="Ufuatiliaji wa oda" />
+      {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
+      {!tracking && !error && <p className="buyer-intro">Inatafuta mzigo...</p>}
+      {tracking && (
+        <section className="dashboard-content">
+          <div className="dashboard-welcome">
+            <div>
+              <div className="eyebrow"><span /> LIVE DELIVERY TRACKING</div>
+              <h1>{tracking.tracking_number}</h1>
+              <p>{tracking.product.name} — {tracking.seller.shop_name}</p>
+            </div>
+            <div className="tracking-codes">
+              <canvas ref={qrRef} aria-label="QR ya tracking" />
+              <svg ref={barcodeRef} aria-label="Barcode ya tracking" />
+            </div>
+          </div>
+          <div className="success-message">
+            Hali: <strong>{tracking.order_status}</strong>
+          </div>
+          {tracking.live_location ? (
+            <div className="tracking-map">
+              <iframe
+                title="Ramani ya eneo la mwisho la delivery"
+                src={`https://www.openstreetmap.org/export/embed.html?bbox=${tracking.live_location.longitude - 0.02}%2C${tracking.live_location.latitude - 0.02}%2C${tracking.live_location.longitude + 0.02}%2C${tracking.live_location.latitude + 0.02}&marker=${tracking.live_location.latitude}%2C${tracking.live_location.longitude}`}
+                loading="lazy"
+              />
+              <p className="field-hint">
+                Ilisasishwa {tracking.live_location.created_at}
+                {tracking.live_location.accuracy_m ? `, usahihi takribani m ${Math.round(tracking.live_location.accuracy_m)}` : ""}
+              </p>
+            </div>
+          ) : (
+            <p className="empty-state">Eneo la live halipo au GPS imesitishwa kwa delivery hii.</p>
+          )}
+          {tracking.carrier.name && (
+            <div className="demo-notice">
+              <p><strong>{tracking.carrier.name}</strong>: {tracking.carrier.tracking_number || "Tracking namba ya carrier haipo"} — {tracking.carrier.status || "Hali haijasasishwa"}</p>
+            </div>
+          )}
+          <ol className="tracking-timeline">
+            {tracking.timeline.map((event) => (
+              <li key={`${event.status}-${event.created_at}`}>
+                <strong>{event.status}</strong>
+                <p>{event.description}</p>
+                <small>{event.created_at}</small>
+              </li>
+            ))}
+          </ol>
+          {tracking.proof_of_delivery && (
+            <div className="workspace">
+              <h2>Uthibitisho wa kupokea</h2>
+              <p>Aliyepokea: {tracking.proof_of_delivery.recipient_name}</p>
+              <p>Tarehe: {tracking.proof_of_delivery.received_at}</p>
+              {tracking.proof_of_delivery.image_url && <img src={tracking.proof_of_delivery.image_url} alt="Picha ya uthibitisho" />}
+            </div>
+          )}
+        </section>
+      )}
+      <BrandFooter><a className="retry-link" href="/">Rudi marketplace</a></BrandFooter>
+    </main>
+  );
+}
+
+
+function DeliveryAgentDashboard({ user, onLogout }) {
+  const [deliveries, setDeliveries] = useState([]);
+  const [availableDeliveries, setAvailableDeliveries] = useState([]);
+  const [sharing, setSharing] = useState(false);
+  const [activeOrderId, setActiveOrderId] = useState("");
+  const [lastPosition, setLastPosition] = useState(null);
+  const [lastGpsAt, setLastGpsAt] = useState("");
+  const [error, setError] = useFeedbackState("error");
+  const [message, setMessage] = useFeedbackState("success");
+  const watchRef = useRef(null);
+
+  async function refresh() {
+    const [assignedRows, availableRows] = await Promise.all([
+      api("/deliveries"),
+      api("/deliveries/available"),
+    ]);
+    setDeliveries(assignedRows);
+    setAvailableDeliveries(availableRows);
+  }
+
+  useEffect(() => {
+    refresh().catch((requestError) => setError(requestError.message));
+  }, []);
+
+  function stopSharing() {
+    if (watchRef.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null;
+    }
+    setSharing(false);
+    setActiveOrderId("");
+  }
+
+  function startSharing(orderId) {
+    if (!navigator.geolocation) {
+      setError("GPS haipatikani kwenye kifaa hiki.");
+      return;
+    }
+    if (watchRef.current !== null) stopSharing();
+    setSharing(true);
+    setActiveOrderId(orderId);
+    watchRef.current = navigator.geolocation.watchPosition(
+      (position) => {
+        setLastPosition({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+        setLastGpsAt(new Date().toLocaleTimeString());
+        api(`/orders/${encodeURIComponent(orderId)}/location`, {
+          method: "POST",
+          body: JSON.stringify({
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            accuracy_m: position.coords.accuracy,
+            sharing_consent: true,
+          }),
+        }).catch((requestError) => setError(requestError.message));
+      },
+      (positionError) => setError(positionError.message || "GPS imeshindikana kusasisha eneo."),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
+    );
+  }
+
+  async function updateStatus(orderId, status) {
+    try {
+      await api(`/orders/${encodeURIComponent(orderId)}/delivery`, {
+        method: "PUT",
+        body: JSON.stringify({ delivery_status: status, tracking_code: "", description: "Status updated by delivery agent" }),
+      });
+      setMessage("Hali ya delivery imesasishwa.");
+      if (["DELIVERED", "DELIVERY_FAILED", "RETURNED"].includes(status)) stopSharing();
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function acceptDelivery(orderId) {
+    try {
+      await api(`/deliveries/${encodeURIComponent(orderId)}/accept`, { method: "POST" });
+      setMessage("Delivery imekubaliwa na sasa imepangiwa akaunti yako.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  useEffect(() => () => stopSharing(), []);
+
+  const activeStatuses = ["AGENT_ASSIGNED", "PICKED_UP", "IN_TRANSIT", "NEAR_DESTINATION", "OUT_FOR_DELIVERY"];
+  const activeDeliveries = deliveries.filter((delivery) => activeStatuses.includes(delivery.delivery_status));
+  const completedDeliveries = deliveries.filter((delivery) => ["DELIVERED", "DELIVERY_FAILED", "RETURNED"].includes(delivery.delivery_status));
+
+  return (
+    <main className="page-shell">
+      <Header label="Delivery Agent" user={user} onLogout={onLogout} />
+      <section className="dashboard-welcome">
+        <div><div className="eyebrow"><span /> DELIVERY OPERATIONS</div><h1>Habari, <span>{user.full_name}</span></h1><p>Oda ulizopangiwa, deliveries zinazopatikana na GPS ya safari inayoendelea.</p></div>
+      </section>
+      {error && <p className="form-error dashboard-alert">{error}</p>}
+      {message && <p className="success-message dashboard-alert">{message}</p>}
+      <section className="dashboard-content">
+        <div className="stats-grid">
+          <StatCard title="Deliveries ulizopangiwa" value={deliveries.length} />
+          <StatCard title="Safari zinazoendelea" value={activeDeliveries.length} />
+          <StatCard title="Zinazopatikana" value={availableDeliveries.length} />
+          <StatCard title="Zilizokamilika" value={completedDeliveries.filter((item) => item.delivery_status === "DELIVERED").length} />
+          <StatCard title="Zilizoshindikana" value={completedDeliveries.filter((item) => item.delivery_status === "DELIVERY_FAILED").length} />
+          <StatCard title="GPS" value={sharing ? "Inashare" : "Imesimama"} note={lastGpsAt ? `Ilisasishwa ${lastGpsAt}` : "GPS huanza baada ya kubonyeza Anzisha."} />
+        </div>
+        {sharing && lastPosition && (
+          <section className="dashboard-panel delivery-live-map">
+            <h2>Ramani ya eneo la agent</h2>
+            <p>Ramani inaonyesha eneo la kifaa chako tu. Anwani za pickup na destination hazina coordinates zilizothibitishwa, hivyo route/ETA haijaonyeshwa.</p>
+            <iframe
+              title="Ramani ya eneo la delivery agent"
+              src={`https://www.openstreetmap.org/export/embed.html?bbox=${lastPosition.longitude - 0.006}%2C${lastPosition.latitude - 0.006}%2C${lastPosition.longitude + 0.006}%2C${lastPosition.latitude + 0.006}&layer=mapnik&marker=${lastPosition.latitude}%2C${lastPosition.longitude}`}
+              loading="lazy"
+              referrerPolicy="no-referrer"
+            />
+            <small>Location imesasishwa {lastGpsAt || "..."}</small>
+          </section>
+        )}
+        <div className="dashboard-grid">
+          <section className="dashboard-panel">
+            <h2>Deliveries ulizopangiwa</h2>
+            <div className="seller-list feature-list">
+              {deliveries.map((delivery) => (
+                <article className="seller-card" key={delivery.order_id}>
+                  <div>
+                    <strong>{delivery.product_name}</strong>
+                    <span>{delivery.order_id} · {delivery.delivery_status}</span>
+                    {delivery.tracking_code && <small><a href={`/track/${encodeURIComponent(delivery.tracking_code)}`}>{delivery.tracking_code}</a></small>}
+                    <small>{delivery.delivery_address || "Anuani ya destination haijapewa"}</small>
+                  </div>
+                  <div className="seller-actions">
+                    {activeStatuses.includes(delivery.delivery_status) && (
+                      <>
+                        <button type="button" onClick={() => startSharing(delivery.order_id)}>Anzisha GPS live</button>
+                        {sharing && activeOrderId === delivery.order_id && <button type="button" onClick={stopSharing}>Acha kushare GPS</button>}
+                        {delivery.delivery_status === "AGENT_ASSIGNED" && <button type="button" onClick={() => updateStatus(delivery.order_id, "PICKED_UP")}>Thibitisha pickup</button>}
+                        {["PICKED_UP", "AGENT_ASSIGNED"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "IN_TRANSIT")}>In transit</button>}
+                        {["IN_TRANSIT", "NEAR_DESTINATION"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "OUT_FOR_DELIVERY")}>Out for delivery</button>}
+                        {["PICKED_UP", "IN_TRANSIT", "NEAR_DESTINATION", "OUT_FOR_DELIVERY"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "DELIVERY_FAILED")}>Delivery failed</button>}
+                      </>
+                    )}
+                    {delivery.delivery_status === "DELIVERY_FAILED" && <small>Imeshindikana · angalia historia/maelezo ya oda.</small>}
+                  </div>
+                </article>
+              ))}
+              {!deliveries.length && <p className="empty-state">Hakuna delivery uliyopewa kwa sasa.</p>}
+            </div>
+          </section>
+          <section className="dashboard-panel">
+            <h2>Deliveries zinazopatikana</h2>
+            <p>Oda zilizoandaliwa na muuzaji na bado hazijapangiwa agent.</p>
+            <div className="seller-list feature-list">
+              {availableDeliveries.map((delivery) => (
+                <article className="seller-card" key={delivery.order_id}>
+                  <div>
+                    <strong>{delivery.product_name}</strong>
+                    <span>{delivery.shop_name || "Duka"} · {delivery.order_id}</span>
+                    <small>{delivery.delivery_address || "Anuani ya destination haijapewa"}</small>
+                  </div>
+                  <button type="button" onClick={() => acceptDelivery(delivery.order_id)}>Kubali delivery</button>
+                </article>
+              ))}
+              {!availableDeliveries.length && <p className="empty-state">Hakuna oda tayari kwa pickup kwa sasa.</p>}
+            </div>
+          </section>
+        </div>
+        <section className="dashboard-panel">
+          <h2>Historia ya delivery</h2>
+          <div className="dashboard-status-list">
+            {completedDeliveries.map((delivery) => (
+              <div className="dashboard-status-row" key={delivery.order_id}>
+                <span>{delivery.product_name} · {delivery.order_id}</span>
+                <strong>{delivery.delivery_status}</strong>
+              </div>
+            ))}
+            {!completedDeliveries.length && <p className="empty-state">Bado hakuna delivery iliyokamilika au kushindikana.</p>}
+          </div>
+        </section>
+      </section>
+    </main>
+  );
+}
+
+
 function StorefrontPage({ storeSlug }) {
   const localize = useLocalize();
   const [storefront, setStorefront] = useState(null);
@@ -1337,12 +2945,15 @@ function StorefrontPage({ storeSlug }) {
 function BuyerDashboard({ user, onLogout }) {
   const localize = useLocalize();
   const { notify } = useNotification();
-  const [tab, setTab] = useState("browse");
+  const [tab, setTab] = useState("overview");
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   const [wishlist, setWishlist] = useState([]);
   const [orders, setOrders] = useState([]);
   const [tickets, setTickets] = useState([]);
+  const [notificationHistory, setNotificationHistory] = useState([]);
+  const [securityAlerts, setSecurityAlerts] = useState([]);
+  const [cartCount, setCartCount] = useState(() => loadCart().reduce((sum, item) => sum + item.quantity, 0));
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("");
   const [ticket, setTicket] = useState({ subject: "", message: "" });
@@ -1364,18 +2975,23 @@ function BuyerDashboard({ user, onLogout }) {
   }
 
   async function refresh() {
-    const [productRows, categoryRows, wishlistRows, orderRows, ticketRows] = await Promise.all([
+    const [productRows, categoryRows, wishlistRows, orderRows, ticketRows, notificationRows, securityRows] = await Promise.all([
       api("/products"),
       api("/categories"),
       api("/wishlist"),
       api("/orders/history"),
       api("/support-tickets"),
+      api("/notifications/history"),
+      api("/security/alerts"),
     ]);
     setProducts(productRows);
     setCategories(categoryRows);
     setWishlist(wishlistRows);
     setOrders(orderRows);
     setTickets(ticketRows);
+    setNotificationHistory(notificationRows);
+    setSecurityAlerts(securityRows);
+    setCartCount(loadCart().reduce((sum, item) => sum + item.quantity, 0));
     if (!previousOrdersRef.current) previousOrdersRef.current = orderStatusMap(orderRows);
     if (!previousTicketsRef.current) previousTicketsRef.current = ticketResponseMap(ticketRows);
   }
@@ -1460,7 +3076,14 @@ function BuyerDashboard({ user, onLogout }) {
     (!category || product.category === category)
     && (!query || `${product.name} ${product.shop_name || ""}`.toLowerCase().includes(query.toLowerCase()))
   );
-  const tabs = [["browse", "Bidhaa"], ["wishlist", "Vipendwa"], ["orders", "Oda zangu"], ["support", "Msaada"]];
+  const activeOrders = orders.filter((order) => order.payment_status === "COMPLETED"
+    && !["DELIVERED", "DELIVERY_FAILED", "RETURNED", "CANCELLED"].includes(order.delivery_status));
+  const wishlistCategories = new Set(wishlist.map((product) => product.category).filter(Boolean));
+  const recommendedProducts = products
+    .filter((product) => wishlistCategories.has(product.category)
+      && !wishlist.some((saved) => saved.id === product.id))
+    .slice(0, 4);
+  const tabs = [["overview", "Muhtasari"], ["browse", "Bidhaa"], ["wishlist", "Vipendwa"], ["orders", "Oda zangu"], ["support", "Msaada"], ["account", "Akaunti"]];
 
   return localize(
     <main className="page-shell">
@@ -1471,6 +3094,53 @@ function BuyerDashboard({ user, onLogout }) {
       </nav>
       {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
       {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
+      {tab === "overview" && (
+        <section className="dashboard-content">
+          <div className="stats-grid">
+            <StatCard title="Oda zote" value={orders.length} />
+            <StatCard title="Oda zinazosafirishwa" value={activeOrders.length} />
+            <StatCard title="Bidhaa ulizohifadhi" value={wishlist.length} />
+            <StatCard title="Bidhaa kwenye kikapu" value={cartCount} />
+            <StatCard title="Maombi ya msaada" value={tickets.length} />
+            <StatCard title="Arifa zilizopokelewa" value={notificationHistory.length} />
+            <StatCard title="Tahadhari za usalama" value={securityAlerts.length} />
+          </div>
+          <div className="dashboard-grid">
+            <section className="dashboard-panel">
+              <h2>Oda za karibuni</h2>
+              {orders.slice(0, 5).map((order) => (
+                <article className="dashboard-order-row" key={order.order_id}>
+                  <div>
+                    <strong>{order.product_name}</strong>
+                    <span>{order.order_id} · {order.delivery_status || order.payment_status}</span>
+                  </div>
+                  {order.tracking_code
+                    ? <a className="table-action" href={`/track/${encodeURIComponent(order.tracking_code)}`}>Fuatilia</a>
+                    : <span>TZS {formatMoney(order.amount)}</span>}
+                </article>
+              ))}
+              {!orders.length && <p className="empty-state">Bado huna oda zinazohusishwa na akaunti hii.</p>}
+              <button type="button" className="table-action" onClick={() => setTab("orders")}>Oda zangu zote</button>
+            </section>
+            <section className="dashboard-panel">
+              <h2>Bidhaa zinazoweza kukuvutia</h2>
+              <p>Mapendekezo haya yanatokana na makundi ya bidhaa ulizohifadhi.</p>
+              {recommendedProducts.map((product) => (
+                <article className="dashboard-order-row" key={product.id}>
+                  <div><strong>{product.name}</strong><span>{product.category} · TZS {formatMoney(product.amount)}</span></div>
+                  <a className="table-action" href={`/pay/${product.id}`}>Nunua</a>
+                </article>
+              ))}
+              {!recommendedProducts.length && <p className="empty-state">Hifadhi bidhaa ili tuweze kupendekeza bidhaa za makundi yanayokuvutia.</p>}
+              <div className="dashboard-panel-actions">
+                <button type="button" className="table-action" onClick={() => setTab("wishlist")}>Vipendwa</button>
+                <a className="table-action" href="/cart">Kikapu ({cartCount})</a>
+                <button type="button" className="table-action" onClick={() => setTab("account")}>Usalama wa akaunti</button>
+              </div>
+            </section>
+          </div>
+        </section>
+      )}
       {tab === "browse" && (
         <section className="dashboard-content">
           <form className="product-search feature-search" onSubmit={(event) => event.preventDefault()}>
@@ -1528,6 +3198,7 @@ function BuyerDashboard({ user, onLogout }) {
           <div className="feature-list"><h2>Ombi zako</h2>{tickets.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.subject}</strong><span>{item.status} · {item.created_at}</span><small>{item.admin_response || item.message}</small></div></article>)}{!tickets.length && <p className="empty-state">Hakuna ombi la msaada bado.</p>}</div>
         </section>
       )}
+      {tab === "account" && <AccountSecurity />}
       <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="payments">Malipo ya majaribio pekee</span></BrandFooter>
     </main>
   );
@@ -1538,16 +3209,34 @@ function BuyerOrderRow({ order, onAction }) {
   const [reason, setReason] = useState("");
   const [rating, setRating] = useState("5");
   const [comment, setComment] = useState("");
+  const [deliveryOtp, setDeliveryOtp] = useState("");
+  const [recipientName, setRecipientName] = useState("");
   const canCancel = ["PENDING", "COMPLETED"].includes(order.payment_status);
   return localize(
     <tr>
       <td><strong>{order.order_id}</strong><small>{order.created_at}</small></td>
       <td>{order.product_name}<small>{order.shop_name || "Muuzaji"}</small></td>
       <td>{order.payment_status}</td>
-      <td>{order.delivery_status}{order.tracking_code && <small>{order.tracking_code}</small>}{order.delivery_address && <small>{order.delivery_address}</small>}</td>
+      <td>{order.delivery_status}{order.tracking_code && <small><a href={`/track/${encodeURIComponent(order.tracking_code)}`}>{order.tracking_code}</a></small>}{order.delivery_address && <small>{order.delivery_address}</small>}</td>
       <td>TZS {formatMoney(order.amount)}</td>
       <td>
         <a className="table-action" href={`/pay/${order.product_id}?order_id=${encodeURIComponent(order.order_id)}`}>Fungua</a>
+        {order.payment_status === "COMPLETED" && order.delivery_status !== "DELIVERED" && (
+          <form className="inline-feature-form" onSubmit={(event) => {
+            event.preventDefault();
+            onAction(
+              () => api(`/orders/${order.order_id}/confirm-delivery`, {
+                method: "POST",
+                body: JSON.stringify({ otp: deliveryOtp, recipient_name: recipientName }),
+              }),
+              "Delivery imeidhinishwa na umepokea mzigo.",
+            );
+          }}>
+            <input aria-label="OTP ya delivery" className="text-input" minLength={4} maxLength={10} placeholder="OTP ya kupokea" required value={deliveryOtp} onChange={(event) => setDeliveryOtp(event.target.value)} />
+            <input aria-label="Jina la aliyepokea" className="text-input" minLength={2} maxLength={100} placeholder="Jina la aliyepokea" required value={recipientName} onChange={(event) => setRecipientName(event.target.value)} />
+            <button className="table-action" type="submit">Thibitisha nimepokea</button>
+          </form>
+        )}
         {canCancel && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/cancellation`, { method: "POST", body: JSON.stringify({ reason }) }), "Ombi la kughairi limetumwa."); }}><input aria-label="Sababu ya kughairi" className="text-input" minLength={5} placeholder="Sababu ya kughairi" required value={reason} onChange={(event) => setReason(event.target.value)} /><button className="table-action" type="submit">Omba kughairi</button></form>}
         {order.payment_status === "COMPLETED" && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/products/${order.product_id}/review`, { method: "POST", body: JSON.stringify({ rating: Number(rating), comment }) }), "Maoni yametumwa kwa ukaguzi."); }}><select aria-label="Alama" className="text-input" value={rating} onChange={(event) => setRating(event.target.value)}>{[5, 4, 3, 2, 1].map((value) => <option key={value} value={value}>{value} / 5</option>)}</select><input aria-label="Maoni kuhusu bidhaa" className="text-input" maxLength={1000} placeholder="Maoni (hiari)" value={comment} onChange={(event) => setComment(event.target.value)} /><button className="table-action" type="submit">Tuma maoni</button></form>}
       </td>
@@ -1783,8 +3472,9 @@ function CheckoutPage({ productId }) {
       window.history.replaceState(
         {},
         "",
-        `/pay/${productId}?order_id=${encodeURIComponent(result.order_id)}${result.demo ? "&demo=1" : ""}`,
+        `/pay/${productId}?order_id=${encodeURIComponent(result.order_id)}${result.sandbox ? "&sandbox=1" : result.demo ? "&demo=1" : ""}`,
       );
+      if (result.payment_url) window.location.assign(result.payment_url);
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -1830,6 +3520,7 @@ function CheckoutPage({ productId }) {
       sellerPayout: Number(order.seller_payout) || 0,
       commissionPercent: order.commission_percent,
       completedAt: order.completed_at,
+      sandbox: order.sandbox,
       splits: [{
         shopName: product?.shop_name || "Muuzaji",
         amount,
@@ -1842,6 +3533,9 @@ function CheckoutPage({ productId }) {
 
   const isCompleted = order?.payment_status === "COMPLETED";
   const isLivePayment = paymentConfig?.live_payments_enabled === true;
+  const isPesapalSandbox = paymentConfig?.pesapal_sandbox_enabled === true;
+  const pesapalSandboxUnavailable =
+    paymentConfig?.pesapal_sandbox_requested === true && !isPesapalSandbox;
   const selectedMethod = networks.find((method) => method.value === form.payment_method);
   return localize(
     <main className="page-shell checkout-shell">
@@ -1866,6 +3560,10 @@ function CheckoutPage({ productId }) {
               <input id="buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
               {isLivePayment ? (
                 <p className="field-hint">ClickPesa itatuma ombi la USSD kwenye namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha malipo kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</p>
+              ) : isPesapalSandbox ? (
+                <p className="field-hint">Malipo yatafunguliwa kwenye PesaPal Sandbox. Hii ni ya majaribio tu; hakuna pesa halisi itakayokatwa.</p>
+              ) : pesapalSandboxUnavailable ? (
+                <p className="form-error" role="alert">Mipangilio ya PesaPal Sandbox haijakamilika. Wasiliana na msimamizi wa mfumo.</p>
               ) : (
                 <fieldset className="payment-fieldset">
                   <legend>Chagua mtandao wa malipo</legend>
@@ -1878,7 +3576,7 @@ function CheckoutPage({ productId }) {
                   </div>
                 </fieldset>
               )}
-              {!isLivePayment && form.payment_method.endsWith("Branch") && (
+              {!isLivePayment && !isPesapalSandbox && form.payment_method.endsWith("Branch") && (
                 <>
                   <label className="field-label" htmlFor="bank-branch">Tawi la benki</label>
                   <select id="bank-branch" className="text-input" required value={form.bank_branch} onChange={(event) => setForm({ ...form, bank_branch: event.target.value })}>
@@ -1894,7 +3592,7 @@ function CheckoutPage({ productId }) {
                 </>
               )}
               {error && <p className="form-error" role="alert">{error}</p>}
-              <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
+              <button className="generate-button" type="submit" disabled={busy || pesapalSandboxUnavailable}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
             </form>
             <button className="cart-secondary-button" type="button" onClick={addToCart}>Ongeza bidhaa nyingine kwenye kikapu</button>
             {cartCount > 0 && <a className="cart-link" href="/cart">Nenda kikapu ({cartCount})</a>}
@@ -1903,12 +3601,14 @@ function CheckoutPage({ productId }) {
         )}
         {orderId && order && !isCompleted && order.payment_status !== "FAILED" && (
           <section className="checkout-card">
-            <div className="eyebrow"><span /> {order.demo ? "MALIPO YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+            <div className="eyebrow"><span /> {order.sandbox ? "PESAPAL SANDBOX" : order.demo ? "MALIPO YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
             <h1>{order.demo ? "Thibitisha oda yako" : "Subiri ombi la malipo"}</h1>
             <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
             <div className="payment-result pending">
               <strong>Haijalipwa bado</strong>
-              {order.demo ? (
+              {order.sandbox ? (
+                <span>Malipo ya PesaPal Sandbox yanathibitishwa. Hakuna pesa halisi inayohamishwa.</span>
+              ) : order.demo ? (
                 <span>Bonyeza kitufe chini kuthibitisha demo. Hakuna pesa halisi itakayohamishwa.</span>
               ) : (
                 <span>Ombi la malipo limetumwa kwa namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
@@ -1916,6 +3616,7 @@ function CheckoutPage({ productId }) {
               <span>Njia ya malipo: {order.payment_method || selectedMethod?.label}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
             </div>
             {error && <p className="form-error" role="alert">{error}</p>}
+            {order.sandbox && order.payment_url && <a className="generate-button" href={order.payment_url}>Endelea na malipo ya sandbox</a>}
             {order.demo && <button className="generate-button" type="button" disabled={busy} onClick={completeDemo}>{busy ? "Inathibitisha..." : "Thibitisha malipo ya majaribio"}</button>}
           </section>
         )}
@@ -1931,20 +3632,20 @@ function CheckoutPage({ productId }) {
           <section className="checkout-card receipt-card">
             <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />
             <div className="receipt-success" aria-hidden="true">✓</div>
-            <p className="receipt-kicker">{order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
+            <p className="receipt-kicker">{order.sandbox ? "RISITI YA PESAPAL SANDBOX" : order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
             <h1>Oda imekamilika</h1>
             <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
             <dl className="receipt-details">
               <div><dt>Namba ya oda</dt><dd>{order.order_id}</dd></div>
               <div><dt>Mnunuzi</dt><dd>{order.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
               <div><dt>Njia ya malipo</dt><dd>{order.payment_method}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
-              <div><dt>Hali</dt><dd>{order.demo ? "Imekamilika (demo)" : "Malipo yamepokelewa"}</dd></div>
+              <div><dt>Hali</dt><dd>{order.sandbox ? "Imehakikiwa kwenye sandbox" : order.demo ? "Imekamilika (demo)" : "Malipo yamepokelewa"}</dd></div>
               <div><dt>Jumla ya malipo</dt><dd>TZS {formatMoney(order.amount)}</dd></div>
               <div><dt>Kamisheni ya jukwaa ({order.commission_percent}%)</dt><dd>TZS {formatMoney(order.platform_fee)}</dd></div>
               <div><dt>Mgao wa muuzaji baada ya kamisheni</dt><dd>TZS {formatMoney(order.seller_payout)}</dd></div>
               <div><dt>Tarehe</dt><dd>{order.completed_at || "—"}</dd></div>
             </dl>
-            {order.demo && <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>}
+            {(order.demo || order.sandbox) && <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>}
             <button type="button" className="document-button" onClick={() => window.print()}>Chapisha / hifadhi kama PDF</button>
             <button type="button" className="document-button" onClick={() => downloadOrderReceipt().catch((downloadError) => setError(`Imeshindikana kutengeneza PDF: ${downloadError.message}`))}>Pakua risiti PDF</button>
             <a className="retry-link" href="/">Rudi mwanzo</a>
@@ -2054,6 +3755,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
       });
       setCheckoutId(result.checkout_id);
       window.history.replaceState({}, "", `/cart/${result.checkout_id}`);
+      if (result.payment_url) window.location.assign(result.payment_url);
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -2098,6 +3800,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
       sellerPayout: checkout.splits.reduce((sum, split) => sum + Number(split.seller_payout || 0), 0),
       commissionPercent: checkout.commission_percent,
       completedAt: checkout.completed_at,
+      sandbox: checkout.sandbox,
       splits: checkout.splits.map((split) => ({
         shopName: split.shop_name,
         amount: split.amount,
@@ -2110,6 +3813,9 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
 
   const total = products.reduce((sum, product) => sum + product.amount * (items.find((item) => item.product_id === product.id)?.quantity || 0), 0);
   const isLivePayment = paymentConfig?.live_payments_enabled === true;
+  const isPesapalSandbox = paymentConfig?.pesapal_sandbox_enabled === true;
+  const pesapalSandboxUnavailable =
+    paymentConfig?.pesapal_sandbox_requested === true && !isPesapalSandbox;
 
   return localize(
     <main className="page-shell checkout-shell">
@@ -2140,6 +3846,10 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <input id="cart-buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
                   {isLivePayment ? (
                     <p className="field-hint">ClickPesa itatuma ombi moja la USSD kwa jumla ya kikapu. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
+                  ) : isPesapalSandbox ? (
+                    <p className="field-hint">Malipo yatafunguliwa kwenye PesaPal Sandbox. Hii ni ya majaribio tu; hakuna pesa halisi itakayokatwa.</p>
+                  ) : pesapalSandboxUnavailable ? (
+                    <p className="form-error" role="alert">Mipangilio ya PesaPal Sandbox haijakamilika. Wasiliana na msimamizi wa mfumo.</p>
                   ) : (
                     <fieldset className="payment-fieldset">
                       <legend>Chagua mtandao wa malipo</legend>
@@ -2153,7 +3863,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                     </fieldset>
                   )}
                   {error && <p className="form-error" role="alert">{error}</p>}
-                  <button className="generate-button" type="submit" disabled={busy}>{busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}</button>
+                  <button className="generate-button" type="submit" disabled={busy || pesapalSandboxUnavailable}>{busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}</button>
                 </form>
               )}
               <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : "Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa."}</p>
@@ -2161,9 +3871,9 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           )}
           {checkoutId && checkout && (
             <>
-              <div className="eyebrow"><span /> {checkout.demo ? "ODA YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
-              {checkout.payment_status === "COMPLETED" && <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />}
+              <div className="eyebrow"><span /> {checkout.sandbox ? "PESAPAL SANDBOX" : checkout.demo ? "ODA YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
               <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : checkout.demo ? "Gawanya kwa wauzaji" : "Subiri ombi la malipo"}</h1>
+              {checkout.payment_status === "COMPLETED" && <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />}
               {checkout.splits.map((split) => (
                 <div className="cart-split" key={split.order_id}>
                   <strong>{split.shop_name}</strong>
@@ -2175,11 +3885,13 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               ))}
               <div className="checkout-amount">Jumla ya mteja: TZS {formatMoney(checkout.total_amount)}</div>
               <p className="field-hint">Kamisheni inakatwa kwenye mgao wa kila muuzaji; haiongezwi kwenye bili ya mnunuzi.</p>
-              {checkout.payment_status === "PENDING" && !checkout.demo && <p className="payment-result pending">Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti.</p>}
+              {checkout.payment_status === "PENDING" && checkout.sandbox && <p className="payment-result pending">Malipo ya PesaPal Sandbox yanathibitishwa. Hakuna pesa halisi inayohamishwa.</p>}
+              {checkout.payment_status === "PENDING" && !checkout.demo && !checkout.sandbox && <p className="payment-result pending">Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti.</p>}
+              {checkout.payment_status === "PENDING" && checkout.sandbox && checkout.payment_url && <a className="generate-button" href={checkout.payment_url}>Endelea na malipo ya sandbox</a>}
               {checkout.payment_status === "PENDING" && checkout.demo && (
                 <button className="generate-button" type="button" disabled={busy} onClick={completeCart}>{busy ? "Inathibitisha..." : "Thibitisha demo kwa wauzaji wote"}</button>
               )}
-              {checkout.payment_status === "COMPLETED" && <p className="success-message">{checkout.demo ? "Oda zote za wauzaji zimekamilika kama majaribio." : "Malipo yamepokelewa. Mgao wa wauzaji utalipwa kwa mikono."}</p>}
+              {checkout.payment_status === "COMPLETED" && <p className="success-message">{checkout.sandbox ? "Oda imethibitishwa kwenye PesaPal Sandbox; hakuna pesa halisi iliyohamishwa." : checkout.demo ? "Oda zote za wauzaji zimekamilika kama majaribio." : "Malipo yamepokelewa. Mgao wa wauzaji utalipwa kwa mikono."}</p>}
               {checkout.payment_status === "FAILED" && (
                 <div className="payment-result pending">
                   <strong>Malipo hayakupokelewa</strong>
@@ -2198,7 +3910,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                     <div><dt>Mgao wa wauzaji baada ya kamisheni</dt><dd>TZS {formatMoney(checkout.splits.reduce((sum, split) => sum + Number(split.seller_payout || 0), 0))}</dd></div>
                     <div><dt>Tarehe</dt><dd>{checkout.completed_at || "—"}</dd></div>
                   </dl>
-                  {checkout.demo && <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>}
+                  {(checkout.demo || checkout.sandbox) && <p className="demo-receipt-note">Risiti hii inathibitisha oda ya majaribio pekee; si uthibitisho wa muamala wa pesa halisi.</p>}
                   <button type="button" className="document-button" onClick={() => window.print()}>Chapisha / hifadhi risiti kama PDF</button>
                   <button type="button" className="document-button" onClick={() => downloadCartReceipt().catch((downloadError) => setError(`Imeshindikana kutengeneza PDF: ${downloadError.message}`))}>Pakua risiti PDF</button>
                 </>
@@ -2213,11 +3925,81 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   );
 }
 
+function SuspendedAccountDashboard({ user, onLogout }) {
+  const localize = useLocalize();
+  const [alerts, setAlerts] = useState([]);
+  const [drafts, setDrafts] = useState({});
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    api("/security/alerts")
+      .then(setAlerts)
+      .catch((requestError) => setError(requestError.message));
+  }, []);
+
+  async function submitAppeal(alertId) {
+    const appealMessage = (drafts[alertId] || "").trim();
+    if (appealMessage.length < 10) {
+      setError("Andika maelezo ya appeal yenye angalau herufi 10.");
+      return;
+    }
+    try {
+      await api(`/security/alerts/${encodeURIComponent(alertId)}/appeal`, {
+        method: "POST",
+        body: JSON.stringify({ message: appealMessage }),
+      });
+      setMessage("Appeal imetumwa kwa ukaguzi wa admin.");
+      setError("");
+      setDrafts({ ...drafts, [alertId]: "" });
+      setAlerts(await api("/security/alerts"));
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  return localize(
+    <main className="page-shell">
+      <Header label="Akaunti ina vikwazo" user={user} onLogout={onLogout} />
+      <section className="dashboard-content feature-list">
+        <h1>Akaunti imesimamishwa kwa muda</h1>
+        <p>Ufikiaji wa huduma umezuiliwa. Unaweza kukagua tahadhari na kuwasilisha appeal kwa timu ya LipaRahisi.</p>
+        {message && <p className="form-success" role="status">{message}</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {alerts.map((alert) => (
+          <article className="security-detail" key={alert.id}>
+            <h2>{alert.category.replaceAll("_", " ")} · {alert.severity}</h2>
+            <ul>{alert.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
+            {alert.appeal_status === "PENDING" ? (
+              <p className="field-hint">Appeal yako inasubiri ukaguzi.</p>
+            ) : (
+              <>
+                <label className="field-label" htmlFor={`suspended-appeal-${alert.id}`}>Sababu ya kuomba ukaguzi upya</label>
+                <textarea
+                  id={`suspended-appeal-${alert.id}`}
+                  className="text-input security-note"
+                  value={drafts[alert.id] || ""}
+                  onChange={(event) => setDrafts({ ...drafts, [alert.id]: event.target.value })}
+                  maxLength={2000}
+                />
+                <button type="button" className="table-action" onClick={() => submitAppeal(alert.id)}>Tuma appeal</button>
+              </>
+            )}
+          </article>
+        ))}
+        {!alerts.length && <p className="empty-state">Hakuna tahadhari iliyopatikana. Wasiliana na huduma kwa wateja kwa msaada.</p>}
+      </section>
+    </main>,
+  );
+}
+
 export default function App() {
   const localize = useLocalize();
+  const { setLanguage } = useLanguage();
   const checkoutMatch = window.location.pathname.match(/^\/(?:pay|p)\/([a-f0-9]{32})\/?$/i);
   const cartMatch = window.location.pathname.match(/^\/cart(?:\/([A-Z0-9]+))?\/?$/i);
   const storefrontMatch = window.location.pathname.match(/^\/store\/([^/]+)\/?$/);
+  const trackingMatch = window.location.pathname.match(/^\/track\/([^/]+)\/?$/);
   const forgotMatch = window.location.pathname === "/forgot-password";
   const resetMatch = window.location.pathname === "/reset-password";
   const verifyMatch = window.location.pathname === "/verify-email";
@@ -2225,6 +4007,11 @@ export default function App() {
   const [authState, setAuthState] = useState(null);
   const [authError, setAuthError] = useFeedbackState("error");
   const [showAuth, setShowAuth] = useState(false);
+
+  useEffect(() => {
+    const preferredLanguage = auth?.preferred_language || authState?.user?.preferred_language;
+    if (preferredLanguage) setLanguage(preferredLanguage);
+  }, [auth?.preferred_language, authState?.user?.preferred_language, setLanguage]);
 
   useEffect(() => {
     if (checkoutMatch || cartMatch || storefrontMatch || forgotMatch || resetMatch || verifyMatch) return;
@@ -2246,6 +4033,7 @@ export default function App() {
   if (checkoutMatch) return <CheckoutPage productId={checkoutMatch[1]} />;
   if (cartMatch) return <CartPage checkoutId={cartMatch[1] || ""} />;
   if (storefrontMatch) return <StorefrontPage storeSlug={decodeURIComponent(storefrontMatch[1])} />;
+  if (trackingMatch) return <PublicTrackingPage trackingNumber={decodeURIComponent(trackingMatch[1])} />;
   if (forgotMatch) return <ForgotPasswordPage />;
   if (resetMatch) return <ResetPasswordPage />;
   if (verifyMatch) return <VerifyEmailPage />;
@@ -2253,12 +4041,18 @@ export default function App() {
     return localize(<main className="page-shell auth-shell"><Header label="Marketplace" /><p className="form-error">{authError}</p></main>);
   }
   if (!authState) return localize(<main className="page-shell auth-shell"><Header label="Marketplace" /><p className="buyer-intro">Inapakia mfumo...</p></main>);
-  if (auth) return auth.role === "BUYER"
-    ? <BuyerDashboard user={auth} onLogout={logout} />
-    : <MarketplaceDashboard user={auth} onLogout={logout} />;
-  if (authState.user) return authState.user.role === "BUYER"
-    ? <BuyerDashboard user={authState.user} onLogout={logout} />
-    : <MarketplaceDashboard user={authState.user} onLogout={logout} />;
+  if (auth?.status === "SUSPENDED") return <SuspendedAccountDashboard user={auth} onLogout={logout} />;
+  if (authState.user?.status === "SUSPENDED") return <SuspendedAccountDashboard user={authState.user} onLogout={logout} />;
+  if (auth) {
+    if (auth.role === "BUYER") return <BuyerDashboard user={auth} onLogout={logout} />;
+    if (auth.role === "DELIVERY_AGENT") return <DeliveryAgentDashboard user={auth} onLogout={logout} />;
+    return <MarketplaceDashboard user={auth} onLogout={logout} />;
+  }
+  if (authState.user) {
+    if (authState.user.role === "BUYER") return <BuyerDashboard user={authState.user} onLogout={logout} />;
+    if (authState.user.role === "DELIVERY_AGENT") return <DeliveryAgentDashboard user={authState.user} onLogout={logout} />;
+    return <MarketplaceDashboard user={authState.user} onLogout={logout} />;
+  }
   if (!authState.setup_required && !showAuth) return <PublicMarketplace onLogin={() => setShowAuth(true)} />;
   return <AuthScreen
     setupRequired={authState.setup_required}

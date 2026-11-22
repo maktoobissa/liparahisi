@@ -37,6 +37,68 @@ issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
 checkout, but neither is connected to a live payment provider. Coupons are not
 included in this feature set.
 
+## Security and operations
+
+- Account owners can enable optional TOTP two-factor authentication in account
+  settings. Ten one-time recovery codes are shown once when enabling 2FA.
+  Configure `MFA_ENCRYPTION_KEY` before enabling it; generate a Fernet key with
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+  and keep it in the server's secret manager. Back up this key securely: losing
+  it makes stored authenticator secrets unreadable.
+- API requests are rate limited by client IP and route group, in addition to
+  account-based login lockouts. Important sign-ins, security changes,
+  moderation, seller changes, uploads, and sales actions are recorded in the
+  administrator Audit view.
+- Sellers can only access their own seller data, documents, and product
+  uploads. Product images accept JPEG/PNG/WebP (5 MiB); private seller and
+  product documents accept PDF/JPEG/PNG/WebP (10 MiB) and are checked by file
+  signature as well as declared MIME type.
+- Account settings list active sessions and can revoke all other devices.
+- Security Intelligence currently uses explainable `LOCAL_RULES_V1` signals from
+  accounts with five or more failed logins/current lockouts, repeated failed
+  logins from one IP in the last 24 hours, seller paid orders left unfulfilled
+  for over 48 hours, and cancellation requests in the last 90 days. These are
+  review indicators,
+  not proof of fraud; incomplete listings, low ratings, and KYC status are not
+  treated as fraud evidence. An administrator must review and explicitly choose
+  warnings, review, suspension, restoration, false-positive, or resolution
+  actions. Suspended users can sign in only to view their alerts and submit an
+  appeal. Admin routes are `/api/admin/security/scan`,
+  `/api/admin/security/alerts`, and `/api/admin/security/appeals`; users access
+  `/api/security/alerts` and submit appeals through
+  `/api/security/alerts/{alert_id}/appeal`.
+- Optional AI enrichment uses OpenAI's Responses API (`OPENAI_API_KEY`;
+  `OPENAI_FRAUD_MODEL` defaults to `gpt-4o-mini`). When configured, each manual
+  scan sends at most 20 alerts' categories, rule scores, and allowlisted
+  aggregated counts; account IDs, names, email addresses, IP addresses, and
+  user-written text are excluded. Requests set `store=false`. The AI score and
+  validated evidence-linked reason codes are displayed separately from the
+  rule score; the model cannot warn, suspend, or otherwise act on an account.
+  Without the key, the rules still run and alerts report AI as disabled.
+- Fake-review coordination, account-takeover signals, and unusual API activity
+  are not inferred until suitable event data and validated rules/models exist.
+- The seller business assistant answers supported questions from tenant- and
+  branch-scoped records. Revenue and profit include only completed payments
+  with a provider reference; demo and sandbox orders are excluded. Optional
+  recommendation enrichment uses `BUSINESS_AI_PROVIDER=openai` and
+  `OPENAI_BUSINESS_MODEL` (default `gpt-4o-mini`); only aggregate counts and
+  allowlisted recommendation codes are sent to the provider. Without a key,
+  verified metrics remain available and AI-generated recommendations are
+  clearly marked as unconfigured. Users can save English, Kiswahili, or French
+  as an account language; notification templates use that preference.
+- The admin dashboard includes database/cache health and in-process 5xx
+  counters. Server exceptions are also logged to the application logs.
+- When S3 settings are present, the API uploads a database snapshot on startup
+  and then every 24 hours, with server-side AES-256 encryption requested.
+  Configure a private S3-compatible bucket, a scoped access key, lifecycle
+  retention, and (for PostgreSQL) a working `pg_dump`. The worker runs in the
+  API process; for a production deployment that can scale to multiple
+  instances or sleep, schedule `python -m backend.backup` in a dedicated
+  always-on scheduler instead. The backup page shows whether storage is
+  configured and the latest successful upload in the current process.
+- API regression tests run with `python -m unittest discover`; focused
+  frontend API and upload-validation tests run with `npm run test:frontend`.
+
 ## Payments
 
 The app supports ClickPesa Mobile Money USSD Push for a single product or a
@@ -75,6 +137,36 @@ addition to mobile-network fees; the exact fee should be confirmed in the
 ClickPesa payment flow. Fees and terms can change; confirm them with ClickPesa
 before accepting live payments.
 
+### PesaPal Sandbox
+
+PesaPal API 3 is integrated in **sandbox mode only**. It uses the official
+sandbox endpoint and cannot collect real money. Live PesaPal payments are not
+implemented or enabled. Sandbox checkouts are visibly labelled, do not reduce
+product stock, send payment emails, or count as seller/admin sales.
+
+To try it on Render:
+
+1. Keep `DEMO_MODE=true` and `PESAPAL_SANDBOX_ENABLED=false` until setup is
+   complete. Obtain the public test credentials from PesaPal's
+   [official API 3 demo keys](https://developer.pesapal.com/api3-demo-keys.txt);
+   choose the Tanzania merchant credentials. Do not use production credentials.
+2. Register `https://liparahisi.onrender.com/api/webhooks/pesapal` as an IPN
+   using `GET` in PesaPal's
+   [sandbox registration form](https://cybqa.pesapal.com/PesapalIframe/PesapalIframe3/IpnRegistration).
+   Copy the returned IPN ID.
+3. In Render's Environment page, set `PESAPAL_CONSUMER_KEY`,
+   `PESAPAL_CONSUMER_SECRET`, and `PESAPAL_NOTIFICATION_ID` to the sandbox
+   values. Then set `PESAPAL_SANDBOX_ENABLED=true`. Keep all ClickPesa live
+   flags false.
+
+The app redirects buyers to PesaPal's hosted sandbox page. Both the IPN and
+browser callback are verified server-to-server with `GetTransactionStatus`;
+the browser's return alone never marks an order paid. If the callback is not
+reachable, confirm that the public Render URL matches the registered IPN and
+that the sandbox variables are set. Never put credentials in source control,
+the browser, or chat. Verify fees, merchant onboarding, and production
+credentials with PesaPal before requesting a separate live integration.
+
 The current Selcom helper remains unused; setting Selcom credentials does not
 enable live payments.
 
@@ -109,6 +201,10 @@ Open the Vite URL and create the main administrator using the setup token.
 After that, sellers can register and the administrator can approve their
 accounts. By default, local records are stored in `backend/data.sqlite3`.
 Setting `DATABASE_URL` selects PostgreSQL instead.
+To test 2FA, add a Fernet key as `MFA_ENCRYPTION_KEY`. S3 backups are enabled
+only when `BACKUP_S3_BUCKET`, `AWS_ACCESS_KEY_ID`, and
+`AWS_SECRET_ACCESS_KEY` are configured; set `BACKUP_S3_ENDPOINT_URL` for an
+S3-compatible provider.
 
 ## Local Compose stack
 

@@ -22,6 +22,8 @@ from backend.main import (
     order_history,
     moderate_review,
     process_clickpesa_webhook,
+    process_pesapal_callback,
+    process_pesapal_webhook,
     read_cart_checkout,
     request_cancellation,
     resolve_cancellation,
@@ -72,6 +74,16 @@ app.add_api_route(
     "/webhooks/clickpesa",
     process_clickpesa_webhook,
     methods=["POST"],
+)
+app.add_api_route(
+    "/webhooks/pesapal",
+    process_pesapal_webhook,
+    methods=["GET", "POST"],
+)
+app.add_api_route(
+    "/callbacks/pesapal",
+    process_pesapal_callback,
+    methods=["GET"],
 )
 app.add_api_route(
     "/checkouts/{checkout_id}",
