@@ -16,26 +16,60 @@ sales.
   remain available by their order link but are not attached to an account.
 - Seller storefront profiles, stock thresholds and movement history, product
   CSV import/export, and date/status-filtered sales.
-- Order delivery status and tracking codes, buyer cancellation requests, and
-  verified-order reviews subject to administrator moderation.
+- Product variants with separate stock counts; each variant uses its product's
+  base price and can be selected in single-item or cart checkout.
+- Seller-uploaded MP4/WebM product videos during product creation or from its
+  product card (up to 20 MiB each, three per product), with playback,
+  add-to-cart, and direct checkout from the buyer feed.
+- Seller-managed delivery status, carrier, tracking code, and a separately
+  collected delivery fee shown to buyers (not included in the product payment).
+- Buyer cancellation requests before shipment and return requests within seven
+  days after delivery, with administrator resolution. Return approval records
+  a decision only; no payment is refunded by the system.
+- Seller payout ledger that reconciles completed-order earnings against
+  admin-recorded partial payments; entries document external transfers and
+  never initiate one.
+- Admin-only system alerts for failed payment and email delivery attempts.
+- Admin-only, unpublished drafts for terms, privacy, and cancellation/return
+  policies; these require business details and legal review before publication.
+- Optional abandoned-checkout recovery: buyers can opt in to one reminder email
+  after 24 hours, with an unsubscribe link. Only unpaid, expired checkouts are
+  eligible; the email starts a new checkout because the old one has expired.
+- Verified-order reviews subject to administrator moderation.
 - Buyer support tickets with administrator responses.
+- Admin-managed marketplace-wide percentage or fixed-value coupons, limited to
+  demo checkout and one completed redemption per buyer.
 - Downloadable receipt PDFs with item subtotals, total charged, commission per
   seller, and seller payouts.
-  - Swahili, English, and French interface language selection, plus in-app
-    pop-up notifications with optional sound and browser notifications.
-  - Installable PWA with an offline-cached application shell. Marketplace data
-    and checkout still require the API to be online.
+- Swahili, English, and French interface language selection, plus in-app
+  pop-up notifications with an unread counter, optional sound, and browser
+  notifications.
+- Installable PWA with a branded loading screen and offline-cached application
+  shell. Marketplace data and checkout still require the API to be online.
 
-Uploaded product images are stored with marketplace data and served through the
-public catalog image endpoint; storefront images still use HTTP/HTTPS URLs.
+Uploaded product images and videos are stored in the marketplace database and
+served through public catalog endpoints; storefront images still use HTTP/HTTPS
+URLs. Videos are stored as PostgreSQL `BYTEA` (or SQLite `BLOB` locally), so
+their combined size counts against database storage; keep the configured
+database capacity and backups in mind when sellers upload videos.
+The interface supports all three languages; text without a translation entry
+falls back to its source language. Seller-entered product/store names and
+descriptions remain in the language provided by the seller and are not
+automatically translated.
 Seller sales/dashboard data refreshes automatically while the page is visible,
 and pending order/checkout status is rechecked periodically. Browser
 notifications require the visitor's permission; sound can be muted in the app.
-Push delivery while the app is closed is not configured. Approved
-cancellation of a completed order restores stock only in demo mode; it does not
-issue a real payment refund. M-Pesa and Halo Pesa can be selected in demo
-checkout, but neither is connected to a live payment provider. Coupons are not
-included in this feature set.
+The in-app notification list and unread counter are available while the page is
+open. Push delivery while the app is closed is not configured. Approved
+cancellation is allowed only before shipment and restores stock only in demo
+mode; it does not issue a real payment refund. Return requests are accepted
+within seven days of delivery, but approval does not initiate a refund.
+M-Pesa and Halo Pesa can be selected in demo checkout, but neither is connected
+to a live payment provider. Coupons are rejected when live payments are
+enabled. Abandoned-checkout reminders require buyer opt-in and an available
+email provider; Render Free service sleep or email-provider outages can delay
+delivery beyond 24 hours. Payment/email failures are recorded in the admin
+alerts panel, and an email alert is attempted for active administrators.
 
 ## Security and operations
 
@@ -107,8 +141,13 @@ account. The app records the 5% platform commission and each seller's payout
 in its ledger, but does **not** transfer money to sellers; the platform must
 pay them manually and reconcile those payouts.
 
+Abliner is the selected provider for a future automatic seller-payout workflow,
+but automatic transfers are not implemented or enabled. The current ledger is
+manual; do not treat a recorded payout as proof of a provider transfer.
+
 Demo mode remains the default (`DEMO_MODE=true`), and the Render Blueprint
-keeps live payments disabled. A successful demo checkout transfers no money.
+keeps ClickPesa and Abliner live payments disabled. A successful demo checkout
+transfers no money.
 Never ask buyers for their wallet PIN or OTP.
 
 ClickPesa requires merchant KYC and API access. Its public docs state that API
@@ -166,6 +205,31 @@ reachable, confirm that the public Render URL matches the registered IPN and
 that the sandbox variables are set. Never put credentials in source control,
 the browser, or chat. Verify fees, merchant onboarding, and production
 credentials with PesaPal before requesting a separate live integration.
+
+### Abliner Mobile Money
+The app also supports Abliner Mobile Money deposits for product and cart
+checkout. Abliner's [official API documentation](https://abliner.net/docs)
+specifies a production-only API (no sandbox), signed deposit requests, and
+signed webhooks. Automated tests mock the API and never start real charges.
+The checkout sends the HTTPS callback URL
+`https://<your-app-domain>/api/webhooks/abliner` and uses an idempotency key
+per checkout. Abliner's published deposit range for TZS is TZS 500 to
+TZS 3,000,000 per transaction.
+
+To prepare Abliner without exposing credentials:
+
+1. Complete Abliner's business verification and generate both an API key and a
+   separate webhook signing secret in its dashboard. An API key alone is not
+   enough for deposits.
+2. Set `ABLINER_API_KEY` and `ABLINER_WEBHOOK_SECRET` as secrets in Render.
+   Never place either value in source control, frontend code, or chat.
+3. Keep `ABLINER_LIVE_ENABLED=false` until the account and callback are ready,
+   seller payouts are understood, and the app has a durable production
+   database with backups. The current Free Render database in this Blueprint
+   is for testing and must not be used for live financial records.
+4. Only after those requirements are met, set `ABLINER_LIVE_ENABLED=true`.
+   Abliner then sends a real mobile-money prompt; the API does not provide a
+   sandbox. `DEMO_MODE` can remain enabled for other payment methods.
 
 The current Selcom helper remains unused; setting Selcom credentials does not
 enable live payments.
@@ -329,6 +393,14 @@ Configure each Render web service in **Environment**:
    a future split deployment; email links use `FRONTEND_URL`.
 4. Save the environment and redeploy. Check
    `GET /api/config/integrations`; `email_configured` should be `true`.
+
+`email_configured` confirms only that the required settings are present; it
+does not verify the sender domain or prove that a recipient will accept mail.
+`EMAIL_FROM` is the sender address. Account verification/reset messages go to
+that account's registered address, buyer receipts go to the buyer's registered
+address when signed in (or the checkout address for guests), and sale notices
+go to the seller's registered address. Verify the sender domain in Resend to
+deliver to other recipients; do not send private order details to every account.
 
 The second Render service, if used, must use its own public origin for both
 URL variables. `PUBLIC_APP_URL` remains as a backward-compatible fallback for

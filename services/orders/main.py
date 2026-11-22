@@ -7,25 +7,31 @@ from backend.main import (
     CancellationInput,
     CancellationResolutionInput,
     DeliveryUpdateInput,
+    PayoutEntryInput,
+    ReturnRequestInput,
     ReviewInput,
     archive_sale,
     complete_cart_checkout,
     create_cart_checkout,
     create_checkout,
+    create_manual_payout,
     create_review,
     dashboard,
     demo_complete,
     list_cancellations,
+    list_payout_ledger,
     list_sales,
     list_reviews,
     order_status,
     order_history,
     moderate_review,
+    process_abliner_webhook,
     process_clickpesa_webhook,
     process_pesapal_callback,
     process_pesapal_webhook,
     read_cart_checkout,
     request_cancellation,
+    request_return,
     resolve_cancellation,
     update_delivery,
     connect_db,
@@ -86,6 +92,11 @@ app.add_api_route(
     methods=["GET"],
 )
 app.add_api_route(
+    "/webhooks/abliner",
+    process_abliner_webhook,
+    methods=["POST"],
+)
+app.add_api_route(
     "/checkouts/{checkout_id}",
     read_cart_checkout,
     methods=["GET"],
@@ -118,6 +129,24 @@ app.add_api_route(
 app.add_api_route(
     "/orders/{order_id}/cancellation",
     request_cancellation,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/orders/{order_id}/return",
+    request_return,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/payouts",
+    list_payout_ledger,
+    methods=["GET"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/payouts",
+    create_manual_payout,
     methods=["POST"],
     dependencies=[Depends(verify_gateway_token)],
 )

@@ -39,6 +39,12 @@ services:
         sync: false
       - key: PESAPAL_NOTIFICATION_ID
         sync: false
+      - key: ABLINER_LIVE_ENABLED
+        value: "false"
+      - key: ABLINER_API_KEY
+        sync: false
+      - key: ABLINER_WEBHOOK_SECRET
+        sync: false
       - key: EMAIL_PROVIDER
         value: resend
       - key: RESEND_API_KEY

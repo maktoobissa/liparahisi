@@ -629,6 +629,877 @@ class MarketplaceFlowTests(unittest.TestCase):
         self.assertIn("APPEAL_ACCEPTED", [row["action"] for row in actions])
         buyer_client.close()
 
+    def test_admin_system_alerts_record_email_failures_and_are_private(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+
+        with patch.object(
+            main,
+            "send_smtp_email",
+            side_effect=main.HTTPException(status_code=502, detail="Resend rejected"),
+        ):
+            self.assertFalse(
+                main.send_notification_email(
+                    "payment_receipt",
+                    "buyer@example.com",
+                    main.EmailContent(
+                        subject="Receipt",
+                        text="Receipt text",
+                        html="<p>Receipt</p>",
+                    ),
+                )
+            )
+
+        alerts = self.client.get("/api/admin/system-alerts")
+        self.assertEqual(alerts.status_code, 200, alerts.text)
+        email_alert = next(
+            item for item in alerts.json()
+            if item["alert_type"] == "EMAIL_DELIVERY_FAILED"
+        )
+        self.assertEqual(email_alert["message"], "Barua pepe ya mfumo imeshindwa kutumwa.")
+        acknowledged = self.client.patch(
+            f"/api/admin/system-alerts/{email_alert['id']}"
+        )
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+        self.assertTrue(acknowledged.json()["acknowledged"])
+
+        buyer_registration = self.client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Buyer One",
+                "email": "buyer@example.com",
+                "password": "buyer-password-long",
+            },
+        )
+        self.assertEqual(buyer_registration.status_code, 201)
+        buyer_client = TestClient(main.app)
+        with buyer_client:
+            login = buyer_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "buyer@example.com",
+                    "password": "buyer-password-long",
+                },
+            )
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(
+                buyer_client.get("/api/admin/system-alerts").status_code,
+                403,
+            )
+
+    def test_abandoned_checkout_reminders_require_consent_and_can_unsubscribe(self):
+        with main.db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO users
+                    (id, full_name, email, password_hash, role, status, shop_name)
+                VALUES ('reminder-seller', 'Reminder Seller', 'reminder-seller@example.com',
+                        'unused', 'SELLER', 'ACTIVE', 'Reminder Shop')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO products (id, name, amount, seller_id, stock_quantity)
+                VALUES ('reminder-product', 'Sample Product', 5000,
+                        'reminder-seller', 10)
+                """
+            )
+
+        payload = {
+            "buyer_name": "Reminder Buyer",
+            "buyer_email": "buyer@example.com",
+            "buyer_phone": "0712345678",
+            "payment_method": "M-Pesa",
+        }
+        no_consent = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={**payload, "request_key": "n" * 32},
+        )
+        self.assertEqual(no_consent.status_code, 200, no_consent.text)
+        with main.db_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM abandoned_checkout_reminders"
+                ).fetchone()["count"],
+                0,
+            )
+
+        consented = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={
+                **payload,
+                "request_key": "a" * 32,
+                "abandoned_checkout_consent": True,
+            },
+        )
+        self.assertEqual(consented.status_code, 200, consented.text)
+        pending = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={
+                **payload,
+                "request_key": "b" * 32,
+                "abandoned_checkout_consent": True,
+            },
+        )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        completed = self.client.post(
+            "/api/products/reminder-product/checkout",
+            json={
+                **payload,
+                "request_key": "d" * 32,
+                "abandoned_checkout_consent": True,
+            },
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        completed_order = self.client.post(
+            f"/api/orders/{completed.json()['order_id']}/demo-complete"
+        )
+        self.assertEqual(completed_order.status_code, 200, completed_order.text)
+        self.email_sender.reset_mock()
+        cart = self.client.post(
+            "/api/cart/checkout",
+            json={
+                **payload,
+                "request_key": "c" * 32,
+                "abandoned_checkout_consent": True,
+                "items": [{"product_id": "reminder-product", "quantity": 1}],
+            },
+        )
+        self.assertEqual(cart.status_code, 200, cart.text)
+
+        with main.db_connection() as connection:
+            reminders = connection.execute(
+                """
+                SELECT checkout_type, checkout_key, status, send_at
+                FROM abandoned_checkout_reminders
+                ORDER BY checkout_type, checkout_key
+                """
+            ).fetchall()
+            self.assertEqual(len(reminders), 4)
+            self.assertEqual(
+                sum(row["checkout_type"] == "CART" for row in reminders),
+                1,
+            )
+            consented_reminder = connection.execute(
+                """
+                SELECT send_at FROM abandoned_checkout_reminders
+                WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                """,
+                (consented.json()["order_id"],),
+            ).fetchone()
+            self.assertAlmostEqual(
+                consented_reminder["send_at"] - time.time(),
+                main.ORDER_TTL_SECONDS,
+                delta=10,
+            )
+            completed_reminder = connection.execute(
+                """
+                SELECT status FROM abandoned_checkout_reminders
+                WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                """,
+                (completed.json()["order_id"],),
+            ).fetchone()
+            self.assertEqual(completed_reminder["status"], "CANCELLED")
+            connection.execute(
+                """
+                UPDATE orders SET expires_at = 0
+                WHERE order_id = ?
+                """,
+                (consented.json()["order_id"],),
+            )
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET send_at = 0, next_attempt_at = 0
+                WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                """,
+                (consented.json()["order_id"],),
+            )
+
+        with patch.dict(
+            os.environ,
+            {"PUBLIC_APP_URL": "https://liparahisi.example"},
+        ):
+            self.assertEqual(main.process_due_abandoned_checkout_reminders(), 1)
+        self.assertEqual(self.email_sender.call_count, 1)
+        reminder_text = self.email_sender.call_args.args[2]
+        token_match = re.search(
+            r"/api/email/reminders/unsubscribe\?token=([A-Za-z0-9_-]+)",
+            reminder_text,
+        )
+        self.assertIsNotNone(token_match)
+        token = token_match.group(1)
+        confirmation = self.client.get(
+            "/api/email/reminders/unsubscribe",
+            params={"token": token},
+        )
+        self.assertEqual(confirmation.status_code, 200)
+        with main.db_connection() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT opted_out_at FROM email_reminder_preferences
+                    WHERE email = ?
+                    """,
+                    ("buyer@example.com",),
+                ).fetchone()["opted_out_at"]
+            )
+
+        unsubscribe = self.client.post(
+            "/api/email/reminders/unsubscribe",
+            params={"token": token},
+        )
+        self.assertEqual(unsubscribe.status_code, 200)
+        with main.db_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT status FROM abandoned_checkout_reminders
+                    WHERE checkout_type = 'ORDER' AND checkout_key = ?
+                    """,
+                    (pending.json()["order_id"],),
+                ).fetchone()["status"],
+                "UNSUBSCRIBED",
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT status FROM abandoned_checkout_reminders
+                    WHERE checkout_type = 'CART' AND checkout_key = ?
+                    """,
+                    (cart.json()["checkout_id"],),
+                ).fetchone()["status"],
+                "UNSUBSCRIBED",
+            )
+        self.assertEqual(main.process_due_abandoned_checkout_reminders(), 0)
+        self.assertEqual(self.email_sender.call_count, 1)
+
+    def test_product_variants_track_checkout_and_cancellation_stock(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Variant Seller",
+                "email": "variant-seller@example.com",
+                "password": "seller-password-long",
+                "shop_name": "Duka la Variant",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        seller = self.client.get("/api/admin/sellers").json()[0]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+
+        seller_client = TestClient(main.app)
+        with seller_client:
+            self.assertEqual(
+                seller_client.post(
+                    "/api/auth/login",
+                    json={
+                        "email": "variant-seller@example.com",
+                        "password": "seller-password-long",
+                    },
+                ).status_code,
+                200,
+            )
+            created = seller_client.post(
+                "/api/products",
+                json={
+                    "name": "Shati",
+                    "amount": 1000,
+                    "stock_quantity": 0,
+                    "variants": [
+                        {"label": "Nyekundu / M", "stock_quantity": 2},
+                        {"label": "Bluu / L", "stock_quantity": 2},
+                    ],
+                },
+            )
+            self.assertEqual(created.status_code, 201, created.text)
+            product_id = created.json()["id"]
+            variants_by_label = {
+                variant["label"]: variant
+                for variant in created.json()["variants"]
+            }
+            red_variant = variants_by_label["Nyekundu / M"]
+            blue_variant = variants_by_label["Bluu / L"]
+            self.assertEqual(created.json()["stock_quantity"], 4)
+
+            green_variant = seller_client.post(
+                f"/api/products/{product_id}/variants",
+                json={"label": "Kijani / M", "stock_quantity": 1},
+            )
+            self.assertEqual(green_variant.status_code, 201, green_variant.text)
+            duplicate_variant = seller_client.post(
+                f"/api/products/{product_id}/variants",
+                json={"label": "kijani / m", "stock_quantity": 1},
+            )
+            self.assertEqual(duplicate_variant.status_code, 409)
+            updated_variant = seller_client.patch(
+                f"/api/products/{product_id}/variants/{green_variant.json()['id']}",
+                json={"stock_quantity": 3},
+            )
+            self.assertEqual(updated_variant.status_code, 200, updated_variant.text)
+            product = seller_client.get(f"/api/products/{product_id}").json()
+            self.assertEqual(product["stock_quantity"], 7)
+            self.assertEqual(
+                seller_client.put(
+                    f"/api/products/{product_id}",
+                    json={"stock_quantity": 5},
+                ).status_code,
+                422,
+            )
+
+        buyer_registration = self.client.post(
+            "/api/auth/customer/register",
+            json={
+                "full_name": "Variant Buyer",
+                "email": "variant-buyer@example.com",
+                "password": "buyer-password-long",
+            },
+        )
+        self.assertEqual(buyer_registration.status_code, 201)
+        buyer_client = TestClient(main.app)
+        with buyer_client:
+            self.assertEqual(
+                buyer_client.post(
+                    "/api/auth/login",
+                    json={
+                        "email": "variant-buyer@example.com",
+                        "password": "buyer-password-long",
+                    },
+                ).status_code,
+                200,
+            )
+            checkout_payload = {
+                "buyer_name": "Variant Buyer",
+                "buyer_email": "variant-buyer@example.com",
+                "buyer_phone": "0712345678",
+                "payment_method": "M-Pesa",
+            }
+            missing_variant = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={**checkout_payload, "request_key": "u" * 32},
+            )
+            self.assertEqual(missing_variant.status_code, 422)
+            single_checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    **checkout_payload,
+                    "request_key": "v" * 32,
+                    "variant_id": red_variant["id"],
+                },
+            )
+            self.assertEqual(single_checkout.status_code, 200, single_checkout.text)
+            order_id = single_checkout.json()["order_id"]
+            completed = buyer_client.post(f"/api/orders/{order_id}/demo-complete")
+            self.assertEqual(completed.status_code, 200, completed.text)
+            order_status = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(order_status["variant_label"], "Nyekundu / M")
+            product = buyer_client.get(f"/api/products/{product_id}").json()
+            stock_by_label = {variant["label"]: variant["stock_quantity"] for variant in product["variants"]}
+            self.assertEqual(stock_by_label["Nyekundu / M"], 1)
+            self.assertEqual(product["stock_quantity"], 6)
+
+            out_of_stock_variant = buyer_client.post(
+                "/api/cart/checkout",
+                json={
+                    **checkout_payload,
+                    "request_key": "x" * 32,
+                    "items": [{
+                        "product_id": product_id,
+                        "quantity": 3,
+                        "variant_id": blue_variant["id"],
+                    }],
+                },
+            )
+            self.assertEqual(out_of_stock_variant.status_code, 409)
+
+            cart_checkout = buyer_client.post(
+                "/api/cart/checkout",
+                json={
+                    **checkout_payload,
+                    "request_key": "w" * 32,
+                    "items": [{
+                        "product_id": product_id,
+                        "quantity": 2,
+                        "variant_id": blue_variant["id"],
+                    }],
+                },
+            )
+            self.assertEqual(cart_checkout.status_code, 200, cart_checkout.text)
+            cart_id = cart_checkout.json()["checkout_id"]
+            cart_complete = buyer_client.post(
+                f"/api/checkouts/{cart_id}/demo-complete"
+            )
+            self.assertEqual(cart_complete.status_code, 200, cart_complete.text)
+            split = cart_complete.json()["splits"][0]
+            self.assertEqual(split["items"][0]["variant_label"], "Bluu / L")
+            self.assertEqual(split["items"][0]["quantity"], 2)
+
+            cancellation = buyer_client.post(
+                f"/api/orders/{split['order_id']}/cancellation",
+                json={"reason": "Nimebadilisha uamuzi kuhusu oda."},
+            )
+            self.assertEqual(cancellation.status_code, 200, cancellation.text)
+            admin_cancellation = next(
+                row
+                for row in self.client.get("/api/admin/cancellations").json()
+                if row["id"] == cancellation.json()["id"]
+            )
+            resolution = self.client.patch(
+                f"/api/admin/cancellations/{admin_cancellation['id']}",
+                json={"status": "APPROVED", "admin_note": "Imeidhinishwa demo."},
+            )
+            self.assertEqual(resolution.status_code, 200, resolution.text)
+            restored_product = buyer_client.get(f"/api/products/{product_id}").json()
+            restored_stock = {
+                variant["label"]: variant["stock_quantity"]
+                for variant in restored_product["variants"]
+            }
+            self.assertEqual(restored_stock["Bluu / L"], 2)
+            self.assertEqual(restored_product["stock_quantity"], 6)
+
+    def test_product_media_upload_validation_and_seller_ownership(self):
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Seller One",
+                "email": "seller@example.com",
+                "password": "seller-password-long",
+                "shop_name": "Duka la Kwanza",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        seller = self.client.get("/api/admin/sellers").json()[0]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+
+        seller_client = TestClient(main.app)
+        with seller_client:
+            self.assertEqual(
+                seller_client.post(
+                    "/api/auth/login",
+                    json={"email": "seller@example.com", "password": "seller-password-long"},
+                ).status_code,
+                200,
+            )
+            product = seller_client.post(
+                "/api/products",
+                json={"name": "Bidhaa yenye picha", "amount": 1000, "stock_quantity": 1},
+            )
+            self.assertEqual(product.status_code, 201)
+            product_id = product.json()["id"]
+            image_data = bytes.fromhex(
+                "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+                "0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082"
+            )
+            video_data = b"\x00\x00\x00\x18ftypisom" + b"x" * 32
+
+            upload = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("product.png", image_data, "image/png")},
+            )
+            self.assertEqual(upload.status_code, 200)
+            self.assertEqual(
+                seller_client.get(f"/api/products/{product_id}").json()["image_url"],
+                f"/api/products/{product_id}/image",
+            )
+
+            public_client = TestClient(main.app)
+            public_image = public_client.get(f"/api/products/{product_id}/image")
+            self.assertEqual(public_image.status_code, 200)
+            self.assertEqual(public_image.headers["content-type"], "image/png")
+            self.assertEqual(public_image.content, image_data)
+
+            uploaded_videos = []
+            for index in range(main.MAX_PRODUCT_VIDEOS):
+                upload_video = seller_client.post(
+                    f"/api/products/{product_id}/videos",
+                    files={
+                        "video": (
+                            f"product-{index}.mp4",
+                            video_data,
+                            "video/mp4",
+                        )
+                    },
+                )
+                self.assertEqual(upload_video.status_code, 200, upload_video.text)
+                uploaded_videos.append(upload_video.json()["video"])
+            video_limit = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("extra.mp4", video_data, "video/mp4")},
+            )
+            self.assertEqual(video_limit.status_code, 409)
+
+            public_product = public_client.get(
+                f"/api/products/{product_id}"
+            ).json()
+            self.assertEqual(len(public_product["videos"]), main.MAX_PRODUCT_VIDEOS)
+            public_products = public_client.get("/api/products").json()
+            listed_product = next(
+                item for item in public_products if item["id"] == product_id
+            )
+            self.assertEqual(len(listed_product["videos"]), main.MAX_PRODUCT_VIDEOS)
+            public_video = public_client.get(
+                uploaded_videos[0]["url"],
+                headers={"Range": "bytes=4-11"},
+            )
+            self.assertEqual(public_video.status_code, 206)
+            self.assertEqual(public_video.content, video_data[4:12])
+            self.assertEqual(public_video.headers["content-range"], f"bytes 4-11/{len(video_data)}")
+            self.assertEqual(public_video.headers["accept-ranges"], "bytes")
+            invalid_range = public_client.get(
+                uploaded_videos[0]["url"],
+                headers={"Range": f"bytes={'9' * 101}-"},
+            )
+            self.assertEqual(invalid_range.status_code, 416)
+            self.assertEqual(
+                invalid_range.headers["content-range"],
+                f"bytes */{len(video_data)}",
+            )
+
+            invalid_video_signature = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("invalid.mp4", b"not an mp4", "video/mp4")},
+            )
+            self.assertEqual(invalid_video_signature.status_code, 422)
+            invalid_video_type = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("invalid.txt", b"file", "text/plain")},
+            )
+            self.assertEqual(invalid_video_type.status_code, 415)
+            oversized_video = seller_client.post(
+                f"/api/products/{product_id}/videos",
+                files={
+                    "video": (
+                        "large.mp4",
+                        b"\x00\x00\x00\x18ftypisom"
+                        + b"x" * main.MAX_PRODUCT_VIDEO_BYTES,
+                        "video/mp4",
+                    )
+                },
+            )
+            self.assertEqual(oversized_video.status_code, 413)
+
+            deleted_video = seller_client.delete(
+                f"/api/products/{product_id}/videos/{uploaded_videos[0]['id']}"
+            )
+            self.assertEqual(deleted_video.status_code, 200)
+            remaining_videos = public_client.get(
+                f"/api/products/{product_id}"
+            ).json()["videos"]
+            self.assertEqual(len(remaining_videos), main.MAX_PRODUCT_VIDEOS - 1)
+
+            invalid_signature = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("invalid.png", b"not a png", "image/png")},
+            )
+            self.assertEqual(invalid_signature.status_code, 422)
+            invalid_type = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("invalid.txt", b"file", "text/plain")},
+            )
+            self.assertEqual(invalid_type.status_code, 415)
+            oversized = seller_client.post(
+                f"/api/products/{product_id}/image",
+                files={
+                    "image": (
+                        "large.png",
+                        b"\x89PNG\r\n\x1a\n" + b"x" * main.MAX_PRODUCT_IMAGE_BYTES,
+                        "image/png",
+                    )
+                },
+            )
+            self.assertEqual(oversized.status_code, 413)
+
+        second_registration = self.client.post(
+            "/api/auth/register",
+            json={
+                "full_name": "Seller Two",
+                "email": "seller2@example.com",
+                "password": "seller2-password-long",
+                "shop_name": "Duka la Pili",
+            },
+        )
+        self.assertEqual(second_registration.status_code, 201)
+        second_seller = next(
+            item
+            for item in self.client.get("/api/admin/sellers").json()
+            if item["email"] == "seller2@example.com"
+        )
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/sellers/{second_seller['id']}",
+                json={"status": "ACTIVE"},
+            ).status_code,
+            200,
+        )
+        other_client = TestClient(main.app)
+        with other_client:
+            self.assertEqual(
+                other_client.post(
+                    "/api/auth/login",
+                    json={"email": "seller2@example.com", "password": "seller2-password-long"},
+                ).status_code,
+                200,
+            )
+            denied_upload = other_client.post(
+                f"/api/products/{product_id}/image",
+                files={"image": ("product.png", image_data, "image/png")},
+            )
+            self.assertEqual(denied_upload.status_code, 404)
+            denied_delete = other_client.delete(f"/api/products/{product_id}/image")
+            self.assertEqual(denied_delete.status_code, 404)
+            denied_video_upload = other_client.post(
+                f"/api/products/{product_id}/videos",
+                files={"video": ("product.mp4", video_data, "video/mp4")},
+            )
+            self.assertEqual(denied_video_upload.status_code, 404)
+            denied_video_delete = other_client.delete(
+                f"/api/products/{product_id}/videos/{uploaded_videos[1]['id']}"
+            )
+            self.assertEqual(denied_video_delete.status_code, 404)
+
+    def test_abliner_checkout_and_signed_webhook_are_idempotent(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ABLINER_LIVE_ENABLED": "false",
+                "ABLINER_API_KEY": "",
+                "ABLINER_WEBHOOK_SECRET": "",
+            },
+        ):
+            status = self.client.get("/api/config/integrations").json()
+        self.assertFalse(status["abliner_live_enabled"])
+
+        setup = self.client.post(
+            "/api/auth/setup",
+            json={
+                "setup_token": "test-admin-setup-token-long-enough",
+                "full_name": "Main Admin",
+                "email": "admin@example.com",
+                "password": "admin-password-long",
+            },
+        )
+        self.assertEqual(setup.status_code, 200)
+        coupon = self.client.post(
+            "/api/admin/coupons",
+            json={
+                "code": "ABLINER10",
+                "discount_type": "PERCENT",
+                "discount_value": 10,
+            },
+        )
+        self.assertEqual(coupon.status_code, 201, coupon.text)
+
+        seller_client = TestClient(main.app)
+        with seller_client:
+            registration = seller_client.post(
+                "/api/auth/register",
+                json={
+                    "full_name": "Seller Abliner",
+                    "email": "abliner-seller@example.com",
+                    "password": "seller-password-long",
+                    "shop_name": "Duka Abliner",
+                    "phone": "0712345678",
+                },
+            )
+            self.assertEqual(registration.status_code, 201)
+            seller = self.client.get("/api/admin/sellers").json()[0]
+            approval = self.client.patch(
+                f"/api/admin/sellers/{seller['id']}",
+                json={"status": "ACTIVE"},
+            )
+            self.assertEqual(approval.status_code, 200)
+            login = seller_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "abliner-seller@example.com",
+                    "password": "seller-password-long",
+                },
+            )
+            self.assertEqual(login.status_code, 200)
+            product = seller_client.post(
+                "/api/products",
+                json={
+                    "name": "Bidhaa ya Abliner",
+                    "amount": 5000,
+                    "cost_amount": 2500,
+                    "stock_quantity": 5,
+                },
+            )
+            self.assertEqual(product.status_code, 201, product.text)
+            product_id = product.json()["id"]
+
+        class FakeAblinerClient:
+            def __init__(self):
+                self.request = None
+
+            async def create_mobile_deposit(self, **kwargs):
+                self.request = kwargs
+                return {
+                    "id": "abliner-tx-1",
+                    "type": "deposit",
+                    "status": "pending",
+                    "amount": kwargs["amount"],
+                    "currency": "TZS",
+                    "customer_reference": kwargs["reference"],
+                }
+
+        fake_client = FakeAblinerClient()
+        buyer_client = TestClient(main.app)
+        with buyer_client, patch.dict(
+            os.environ,
+            {
+                "DEMO_MODE": "true",
+                "ABLINER_LIVE_ENABLED": "true",
+                "ABLINER_API_KEY": "test-api-key",
+                "ABLINER_WEBHOOK_SECRET": "test-webhook-secret",
+                "PUBLIC_APP_URL": "https://liparahisi.onrender.com",
+            },
+        ), patch("backend.main.get_abliner_client", return_value=fake_client):
+            live_coupon_checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    "request_key": "f" * 32,
+                    "buyer_name": "Buyer Abliner",
+                    "buyer_email": "buyer-abliner@example.com",
+                    "buyer_phone": "0712345678",
+                    "payment_method": "Abliner Mobile Money",
+                    "coupon_code": "ABLINER10",
+                },
+            )
+            self.assertEqual(live_coupon_checkout.status_code, 422)
+            self.assertIsNone(fake_client.request)
+            checkout = buyer_client.post(
+                f"/api/products/{product_id}/checkout",
+                json={
+                    "request_key": "f" * 32,
+                    "buyer_name": "Buyer Abliner",
+                    "buyer_email": "buyer-abliner@example.com",
+                    "buyer_phone": "0712345678",
+                    "payment_method": "Abliner Mobile Money",
+                },
+            )
+            self.assertEqual(checkout.status_code, 200, checkout.text)
+            self.assertFalse(checkout.json()["demo"])
+            self.assertEqual(checkout.json()["payment_status"], "PENDING")
+            order_id = checkout.json()["order_id"]
+            order = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(order["payment_method"], "Abliner Mobile Money")
+            self.assertEqual(order["payment_status"], "PENDING")
+            self.assertEqual(fake_client.request["phone"], "255712345678")
+            self.assertEqual(
+                fake_client.request["callback_url"],
+                "https://liparahisi.onrender.com/api/webhooks/abliner",
+            )
+
+            with main.db_connection() as connection:
+                provider_reference = connection.execute(
+                    "SELECT provider_reference FROM orders WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()["provider_reference"]
+                stock_before = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()["stock_quantity"]
+
+            payload = {
+                "id": "evt_abliner_1",
+                "event": "transaction.completed",
+                "data": {
+                    "id": "abliner-tx-1",
+                    "type": "deposit",
+                    "amount": 5000,
+                    "currency": "TZS",
+                    "status": "completed",
+                    "customer_reference": provider_reference,
+                },
+            }
+            raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            timestamp = str(int(time.time()))
+            signature = hmac.new(
+                b"test-webhook-secret",
+                timestamp.encode("ascii") + b"." + raw_body,
+                hashlib.sha256,
+            ).hexdigest()
+            headers = {
+                "content-type": "application/json",
+                "x-webhook-timestamp": timestamp,
+                "x-webhook-signature": signature,
+            }
+            invalid_callback = buyer_client.post(
+                "/api/webhooks/abliner",
+                content=raw_body,
+                headers={**headers, "x-webhook-signature": "0" * 64},
+            )
+            self.assertEqual(invalid_callback.status_code, 401)
+
+            with patch("backend.main.send_payment_notification") as payment_notification:
+                callback = buyer_client.post(
+                    "/api/webhooks/abliner",
+                    content=raw_body,
+                    headers=headers,
+                )
+                self.assertEqual(callback.status_code, 200, callback.text)
+                repeated_callback = buyer_client.post(
+                    "/api/webhooks/abliner",
+                    content=raw_body,
+                    headers=headers,
+                )
+                self.assertEqual(repeated_callback.status_code, 200, repeated_callback.text)
+                self.assertEqual(payment_notification.call_count, 1)
+
+            completed = buyer_client.get(f"/api/orders/{order_id}").json()
+            self.assertEqual(completed["payment_status"], "COMPLETED")
+            with main.db_connection() as connection:
+                stock_after = connection.execute(
+                    "SELECT stock_quantity FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()["stock_quantity"]
+            self.assertEqual(stock_after, stock_before - 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
     def test_frontend_public_files_are_served(self):
         for path in ("manifest.webmanifest", "sw.js"):
             expected = (main.FRONTEND_DIST / path).read_bytes()

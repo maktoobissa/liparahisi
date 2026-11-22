@@ -16,7 +16,7 @@ import csv
 import io
 import unicodedata
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
@@ -28,6 +28,7 @@ import psycopg
 from redis import Redis
 from redis.exceptions import RedisError
 from psycopg_pool import ConnectionPool
+from backend.abliner import AblinerClient, AblinerError, verify_webhook_signature
 from backend.clickpesa import ClickPesaClient, ClickPesaError, verify_webhook_checksum
 from backend.pesapal import PesapalClient, PesapalError
 from backend.fraud_ai import MAX_ALERTS_PER_SCAN, analyze_security_alerts
@@ -44,7 +45,50 @@ from backend.email_delivery import (
     email_is_configured,
     email_provider,
 )
+
+
+def record_system_alert(alert_type, message):
+    alert_id = secrets.token_hex(16)
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO system_alerts (id, alert_type, message)
+            VALUES (?, ?, ?)
+            """,
+            (alert_id, alert_type, message),
+        )
+    return alert_id
+
+
+def send_system_alert_email(subject, message):
+    with db_connection() as connection:
+        admins = connection.execute(
+            """
+            SELECT email FROM users
+            WHERE role = 'ADMIN' AND status = 'ACTIVE' AND email <> ''
+            """
+        ).fetchall()
+    content = EmailContent(
+        subject=subject,
+        text=message,
+        html=f"<p>{message}</p>",
+    )
+    for admin in admins:
+        try:
+            send_smtp_email(
+                admin["email"],
+                content.subject,
+                content.text,
+                content.html,
+            )
+        except HTTPException as error:
+            logger.warning(
+                "Admin system-alert email failed (HTTP %s).",
+                error.status_code,
+            )
 from backend.email_templates import (
+    EmailContent,
+    abandoned_checkout_email,
     password_changed_email,
     password_reset_email,
     payment_email,
@@ -54,8 +98,8 @@ from backend.email_templates import (
 )
 from backend.notification_templates import notification_template
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, validator
@@ -82,8 +126,14 @@ DATABASE_POOL_MIN_SIZE = 1
 DATABASE_POOL_MAX_SIZE = 5
 DATABASE_POOL_TIMEOUT_SECONDS = 10
 PRODUCT_LIST_CACHE_TTL_SECONDS = 15
+PUBLIC_PRODUCT_CACHE_PREFIX = "liparahisi:public-products:v3:"
 COMMISSION_PERCENT = 5
 ORDER_TTL_SECONDS = 60 * 60 * 24
+ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS = ORDER_TTL_SECONDS
+ABANDONED_CHECKOUT_REMINDER_POLL_SECONDS = 60
+ABANDONED_CHECKOUT_REMINDER_MAX_ATTEMPTS = 5
+ABANDONED_CHECKOUT_REMINDER_LEASE_SECONDS = 15 * 60
+RETURN_REQUEST_WINDOW_SECONDS = 7 * 24 * 60 * 60
 RESET_TOKEN_TTL_SECONDS = 60 * 60
 PASSWORD_RESET_COOLDOWN_SECONDS = 15 * 60
 MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024
@@ -91,6 +141,10 @@ MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 _started_at = time.time()
 _server_error_times = collections.deque(maxlen=10000)
 _server_error_lock = threading.Lock()
+MAX_PRODUCT_GALLERY_IMAGES = 8
+MAX_PRODUCT_VIDEO_BYTES = 20 * 1024 * 1024
+MAX_PRODUCT_VIDEOS = 3
+ABLINER_PAYMENT_METHOD = "Abliner Mobile Money"
 PAYMENT_METHODS = {
     "M-Pesa",
     "Halo Pesa",
@@ -101,6 +155,7 @@ PAYMENT_METHODS = {
     "NBC",
     "NMB Branch",
     "CRDB Branch",
+    ABLINER_PAYMENT_METHOD,
 }
 
 
@@ -267,6 +322,26 @@ def cache_product_list(cache_key, products):
         )
     except RedisError as error:
         logger.warning("Redis cache write failed (%s)", type(error).__name__)
+
+
+def invalidate_public_product_lists():
+    client = get_redis_client()
+    if client is None:
+        return
+    try:
+        keys = []
+        for key in client.scan_iter(
+            match=f"{PUBLIC_PRODUCT_CACHE_PREFIX}*",
+            count=100,
+        ):
+            keys.append(key)
+            if len(keys) == 100:
+                client.delete(*keys)
+                keys.clear()
+        if keys:
+            client.delete(*keys)
+    except RedisError as error:
+        logger.warning("Redis product cache invalidation failed (%s)", type(error).__name__)
 
 
 def connect_db():
@@ -441,6 +516,35 @@ def initialize_db():
                 image_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
                 updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS product_gallery_images (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                sort_order INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                image_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS product_gallery_by_product
+                ON product_gallery_images(product_id, sort_order, id);
+            CREATE TABLE IF NOT EXISTS product_videos (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL,
+                video_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS product_videos_by_product
+                ON product_videos(product_id, created_at, id);
+            CREATE TABLE IF NOT EXISTS product_variants (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                stock_quantity INTEGER NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (product_id, label)
+            );
+            CREATE INDEX IF NOT EXISTS product_variants_by_product
+                ON product_variants(product_id, label, id);
             CREATE TABLE IF NOT EXISTS categories (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -593,6 +697,15 @@ def initialize_db():
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS system_alerts (
+                id TEXT PRIMARY KEY,
+                alert_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                acknowledged_at {timestamp_type}
+            );
+            CREATE INDEX IF NOT EXISTS system_alerts_by_created
+                ON system_alerts(created_at DESC);
             CREATE TABLE IF NOT EXISTS login_attempts (
                 email TEXT PRIMARY KEY,
                 failed_count INTEGER NOT NULL DEFAULT 0,
@@ -612,7 +725,9 @@ def initialize_db():
                 bank_branch TEXT NOT NULL DEFAULT '',
                 delivery_address TEXT NOT NULL DEFAULT '',
                 delivery_status TEXT NOT NULL DEFAULT 'UNFULFILLED',
+                delivery_carrier TEXT NOT NULL DEFAULT '',
                 tracking_code TEXT NOT NULL DEFAULT '',
+                delivery_fee INTEGER NOT NULL DEFAULT 0 CHECK (delivery_fee >= 0),
                 delivered_at {timestamp_type},
                 cancelled_at {timestamp_type},
                 payment_status TEXT NOT NULL DEFAULT 'PENDING',
@@ -637,6 +752,8 @@ def initialize_db():
                 quantity INTEGER NOT NULL CHECK (quantity > 0),
                 unit_amount INTEGER NOT NULL CHECK (unit_amount > 0),
                 unit_cost INTEGER NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+                variant_id TEXT NOT NULL DEFAULT '',
+                variant_label TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (order_id, product_id)
             );
             CREATE TABLE IF NOT EXISTS merchant_settings (
@@ -724,6 +841,55 @@ def initialize_db():
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 resolved_at {timestamp_type}
             );
+            CREATE TABLE IF NOT EXISTS return_requests (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL UNIQUE REFERENCES orders(order_id) ON DELETE CASCADE,
+                requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                admin_note TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                resolved_at {timestamp_type}
+            );
+            CREATE TABLE IF NOT EXISTS seller_payouts (
+                id TEXT PRIMARY KEY,
+                seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                amount INTEGER NOT NULL CHECK (amount > 0),
+                payment_method TEXT NOT NULL,
+                payment_reference TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                recorded_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (seller_id, payment_reference)
+            );
+            CREATE TABLE IF NOT EXISTS email_reminder_preferences (
+                email TEXT PRIMARY KEY,
+                opted_out_at {timestamp_type},
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS abandoned_checkout_reminders (
+                id TEXT PRIMARY KEY,
+                checkout_type TEXT NOT NULL,
+                checkout_key TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                buyer_name TEXT NOT NULL DEFAULT '',
+                product_id TEXT NOT NULL DEFAULT '',
+                amount INTEGER NOT NULL DEFAULT 0,
+                send_at DOUBLE PRECISION NOT NULL,
+                next_attempt_at DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at {timestamp_type},
+                UNIQUE (checkout_type, checkout_key)
+            );
+            CREATE TABLE IF NOT EXISTS email_unsubscribe_tokens (
+                token_hash TEXT PRIMARY KEY,
+                email TEXT NOT NULL REFERENCES email_reminder_preferences(email) ON DELETE CASCADE,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS support_tickets (
                 id TEXT PRIMARY KEY,
                 user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -769,6 +935,25 @@ def initialize_db():
                 link TEXT NOT NULL DEFAULT '',
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 delivered_at {timestamp_type}
+            );
+            CREATE TABLE IF NOT EXISTS coupons (
+                id TEXT PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                discount_type TEXT NOT NULL CHECK (discount_type IN ('PERCENT', 'FIXED')),
+                discount_value INTEGER NOT NULL CHECK (discount_value > 0),
+                max_redemptions INTEGER,
+                redemption_count INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS coupon_redemptions (
+                coupon_id TEXT NOT NULL REFERENCES coupons(id) ON DELETE CASCADE,
+                redemption_key TEXT NOT NULL,
+                buyer_key TEXT NOT NULL,
+                created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (coupon_id, redemption_key),
+                UNIQUE (coupon_id, buyer_key)
             );
             """
         )
@@ -832,7 +1017,9 @@ def initialize_db():
             "bank_branch": "TEXT NOT NULL DEFAULT ''",
             "delivery_address": "TEXT NOT NULL DEFAULT ''",
             "delivery_status": "TEXT NOT NULL DEFAULT 'UNFULFILLED'",
+            "delivery_carrier": "TEXT NOT NULL DEFAULT ''",
             "tracking_code": "TEXT NOT NULL DEFAULT ''",
+            "delivery_fee": "INTEGER NOT NULL DEFAULT 0",
             "delivered_at": timestamp_type,
             "cancelled_at": timestamp_type,
             "product_cost": "INTEGER NOT NULL DEFAULT 0",
@@ -845,6 +1032,8 @@ def initialize_db():
             "expires_at": "DOUBLE PRECISION",
             "completed_at": timestamp_type,
             "archived_at": timestamp_type,
+            "coupon_code": "TEXT NOT NULL DEFAULT ''",
+            "coupon_discount": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, declaration in product_columns.items():
             ensure_column(connection, "products", column, declaration)
@@ -986,6 +1175,8 @@ def initialize_db():
                 "UPDATE orders SET tracking_code = ? WHERE order_id = ?",
                 (tracking_code, order_row["order_id"]),
             )
+        ensure_column(connection, "order_items", "variant_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "order_items", "variant_label", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS products_seller_idx ON products(seller_id)"
         )
@@ -1037,6 +1228,12 @@ def initialize_db():
         )
         connection.execute(
             """
+            CREATE INDEX IF NOT EXISTS abandoned_checkout_reminders_due_idx
+            ON abandoned_checkout_reminders(status, next_attempt_at)
+            """
+        )
+        connection.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS orders_provider_reference_idx
             ON orders(provider_reference) WHERE provider_reference <> ''
             """
@@ -1070,6 +1267,7 @@ def initialize_db():
 @asynccontextmanager
 async def lifespan(_app):
     backup_task = None
+    reminder_worker = None
     try:
         database_url = os.getenv("DATABASE_URL", "").strip()
         if database_url:
@@ -1080,12 +1278,19 @@ async def lifespan(_app):
         from backend.backup import run_backup_scheduler
 
         backup_task = asyncio.create_task(run_backup_scheduler())
+        reminder_worker = asyncio.create_task(abandoned_checkout_reminder_worker())
         yield
     finally:
         if backup_task is not None:
             backup_task.cancel()
             try:
                 await backup_task
+            except asyncio.CancelledError:
+                pass
+        if reminder_worker is not None:
+            reminder_worker.cancel()
+            try:
+                await reminder_worker
             except asyncio.CancelledError:
                 pass
         close_database_pool()
@@ -1239,6 +1444,18 @@ class CategoryInput(BaseModel):
     name: str = Field(min_length=2, max_length=60)
 
 
+class ProductVariantInput(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    stock_quantity: int = Field(ge=0, le=999999999)
+
+    @validator("label")
+    def strip_variant_label(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Jina la variant linahitajika.")
+        return value
+
+
 class ProductInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=2000)
@@ -1251,6 +1468,7 @@ class ProductInput(BaseModel):
     cost_amount: int = Field(default=0, ge=0, le=999999999)
     stock_quantity: int = Field(default=0, ge=0, le=999999999)
     low_stock_threshold: int = Field(default=5, ge=0, le=999999999)
+    variants: list[ProductVariantInput] = Field(default_factory=list, max_items=100)
 
     @validator("name")
     def strip_product_name(cls, value):
@@ -1262,6 +1480,15 @@ class ProductInput(BaseModel):
     @validator("category")
     def normalize_category(cls, value):
         return value.strip()
+
+    @validator("variants")
+    def validate_variants(cls, variants):
+        labels = [variant.label.casefold() for variant in variants]
+        if len(labels) != len(set(labels)):
+            raise ValueError("Majina ya variant yanapaswa kuwa tofauti.")
+        if sum(variant.stock_quantity for variant in variants) > 999999999:
+            raise ValueError("Jumla ya stock ya variant imezidi kikomo.")
+        return variants
 
     @validator("image_url")
     def validate_image_url(cls, value):
@@ -1308,6 +1535,10 @@ class ProductUpdateInput(BaseModel):
     @validator("category")
     def normalize_category(cls, value):
         return value.strip() if value is not None else None
+
+
+class ProductVariantStockInput(BaseModel):
+    stock_quantity: int = Field(ge=0, le=999999999)
 
 
 class ProductCsvInput(BaseModel):
@@ -1373,6 +1604,8 @@ class DeliveryUpdateInput(BaseModel):
         "DELIVERY_FAILED", "RETURNED", "SHIPPED",
     ]
     tracking_code: str = Field(default="", max_length=100)
+    delivery_carrier: str = Field(default="", max_length=100)
+    delivery_fee: int = Field(default=0, ge=0, le=999999999)
     description: str = Field(default="", max_length=1000)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
@@ -1433,6 +1666,37 @@ class CancellationInput(BaseModel):
 class CancellationResolutionInput(BaseModel):
     status: Literal["APPROVED", "REJECTED"]
     admin_note: str = Field(default="", max_length=1000)
+
+
+class ReturnRequestInput(BaseModel):
+    reason: str = Field(min_length=5, max_length=1000)
+
+    @validator("reason")
+    def normalize_reason(cls, value):
+        normalized = value.strip()
+        if len(normalized) < 5:
+            raise ValueError("Sababu lazima iwe na angalau herufi 5.")
+        return normalized
+
+
+class ReturnResolutionInput(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+    admin_note: str = Field(default="", max_length=1000)
+
+
+class PayoutEntryInput(BaseModel):
+    seller_id: str = Field(min_length=1, max_length=64)
+    amount: int = Field(gt=0, le=999999999)
+    payment_method: Literal["MOBILE_MONEY", "BANK_TRANSFER", "CASH", "OTHER"]
+    payment_reference: str = Field(min_length=3, max_length=100)
+    note: str = Field(default="", max_length=500)
+
+    @validator("payment_reference")
+    def normalize_payment_reference(cls, value):
+        normalized = value.strip()
+        if len(normalized) < 3:
+            raise ValueError("Rejea ya malipo lazima iwe na angalau herufi 3.")
+        return normalized
 
 
 class ReviewInput(BaseModel):
@@ -1522,6 +1786,30 @@ class SecurityAppealReviewInput(BaseModel):
     note: str = Field(min_length=2, max_length=2000)
 
 
+class CouponInput(BaseModel):
+    code: str = Field(min_length=3, max_length=32)
+    discount_type: Literal["PERCENT", "FIXED"]
+    discount_value: int = Field(gt=0, le=999999999)
+    max_redemptions: int | None = Field(default=None, ge=1, le=999999999)
+
+    @validator("code")
+    def normalize_coupon_code(cls, value):
+        code = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{2,31}", code):
+            raise ValueError("Msimbo wa kuponi utumie herufi, namba, - au _ pekee.")
+        return code
+
+    @validator("discount_value")
+    def validate_coupon_discount(cls, value, values):
+        if values.get("discount_type") == "PERCENT" and value > 100:
+            raise ValueError("Punguzo la asilimia haliwezi kuzidi 100.")
+        return value
+
+
+class CouponStatusInput(BaseModel):
+    is_active: bool
+
+
 class CheckoutInput(BaseModel):
     request_key: str = Field(min_length=32, max_length=64)
     buyer_name: str = Field(min_length=2, max_length=100)
@@ -1530,6 +1818,9 @@ class CheckoutInput(BaseModel):
     payment_method: str
     bank_branch: str | None = Field(default=None, max_length=100)
     delivery_address: str = Field(default="", max_length=500)
+    coupon_code: str = Field(default="", max_length=32)
+    variant_id: str | None = Field(default=None, max_length=64)
+    abandoned_checkout_consent: bool = False
 
     @validator("buyer_name")
     def strip_buyer_name(cls, value):
@@ -1560,10 +1851,19 @@ class CheckoutInput(BaseModel):
             raise ValueError("Chagua mtandao au huduma ya benki iliyopo.")
         return value
 
+    @validator("coupon_code")
+    def normalize_checkout_coupon_code(cls, value):
+        return value.strip().upper()
+
+    @validator("variant_id")
+    def normalize_variant_id(cls, value):
+        return value.strip() if value else None
+
 
 class CartItemInput(BaseModel):
     product_id: str = Field(min_length=1, max_length=64)
     quantity: int = Field(gt=0, le=99)
+    variant_id: str | None = Field(default=None, max_length=64)
 
 
 class CartCheckoutInput(CheckoutInput):
@@ -1674,6 +1974,9 @@ def send_notification_email(event, to_email, content):
             event,
             error.status_code,
         )
+        message = "Barua pepe ya mfumo imeshindwa kutumwa."
+        record_system_alert("EMAIL_DELIVERY_FAILED", message)
+        send_system_alert_email("LipaRahisi: email imeshindwa", message)
         return False
     logger.info("Email notification queued for delivery: %s", event)
     return True
@@ -1830,6 +2133,441 @@ def queue_user_notification(
     return queued
 
 
+def schedule_abandoned_checkout_reminder(
+    connection,
+    checkout_type,
+    checkout_key,
+    recipient,
+    buyer_name,
+    amount,
+    product_id="",
+    consent=False,
+):
+    if not consent:
+        return
+    email = recipient.strip().lower()
+    now = time.time()
+    connection.execute(
+        """
+        INSERT INTO email_reminder_preferences (email)
+        VALUES (?)
+        ON CONFLICT(email) DO UPDATE SET
+            opted_out_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (email,),
+    )
+    connection.execute(
+        """
+        INSERT INTO abandoned_checkout_reminders
+            (id, checkout_type, checkout_key, recipient, buyer_name, product_id,
+             amount, send_at, next_attempt_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            secrets.token_hex(16),
+            checkout_type,
+            checkout_key,
+            email,
+            buyer_name.strip(),
+            product_id,
+            amount,
+            now + ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS,
+            now + ABANDONED_CHECKOUT_REMINDER_DELAY_SECONDS,
+        ),
+    )
+
+
+def cancel_checkout_reminders_for_order(connection, order):
+    connection.execute(
+        """
+        UPDATE abandoned_checkout_reminders
+        SET status = 'CANCELLED'
+        WHERE status IN ('PENDING', 'SENDING')
+          AND (
+              (checkout_type = 'ORDER' AND checkout_key = ?)
+              OR (
+                  ? <> ''
+                  AND checkout_type = 'CART'
+                  AND checkout_key = ?
+              )
+          )
+        """,
+        (
+            order["order_id"],
+            order.get("checkout_id") or "",
+            order.get("checkout_id") or "",
+        ),
+    )
+
+
+def claim_abandoned_checkout_reminder(now=None):
+    current_time = time.time() if now is None else now
+    with db_connection() as connection:
+        reminder = connection.execute(
+            """
+            SELECT id FROM abandoned_checkout_reminders
+            WHERE status IN ('PENDING', 'SENDING') AND next_attempt_at <= ?
+            ORDER BY next_attempt_at, created_at
+            LIMIT 1
+            """,
+            (current_time,),
+        ).fetchone()
+        if reminder is None:
+            return None
+        claimed = connection.execute(
+            """
+            UPDATE abandoned_checkout_reminders
+            SET status = 'SENDING',
+                attempts = CASE WHEN status = 'PENDING' THEN attempts + 1 ELSE attempts END,
+                next_attempt_at = ?
+            WHERE id = ? AND status IN ('PENDING', 'SENDING') AND next_attempt_at <= ?
+            """,
+            (
+                current_time + ABANDONED_CHECKOUT_REMINDER_LEASE_SECONDS,
+                reminder["id"],
+                current_time,
+            ),
+        )
+        if claimed.rowcount != 1:
+            return None
+        row = connection.execute(
+            "SELECT * FROM abandoned_checkout_reminders WHERE id = ?",
+            (reminder["id"],),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+
+def finish_abandoned_checkout_reminder(reminder_id, sent, now=None):
+    current_time = time.time() if now is None else now
+    with db_connection() as connection:
+        reminder = connection.execute(
+            """
+            SELECT attempts FROM abandoned_checkout_reminders
+            WHERE id = ? AND status = 'SENDING'
+            """,
+            (reminder_id,),
+        ).fetchone()
+        if reminder is None:
+            return
+        if sent:
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, last_error = ''
+                WHERE id = ? AND status = 'SENDING'
+                """,
+                (reminder_id,),
+            )
+        elif reminder["attempts"] >= ABANDONED_CHECKOUT_REMINDER_MAX_ATTEMPTS:
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET status = 'FAILED', last_error = 'Email delivery failed'
+                WHERE id = ? AND status = 'SENDING'
+                """,
+                (reminder_id,),
+            )
+        else:
+            retry_delay = min(60 * (2 ** reminder["attempts"]), 60 * 60)
+            connection.execute(
+                """
+                UPDATE abandoned_checkout_reminders
+                SET status = 'PENDING', next_attempt_at = ?,
+                    last_error = 'Email delivery failed'
+                WHERE id = ? AND status = 'SENDING'
+                """,
+                (current_time + retry_delay, reminder_id),
+            )
+
+
+def process_due_abandoned_checkout_reminders(now=None, limit=20):
+    current_time = time.time() if now is None else now
+    expire_pending_orders()
+    processed = 0
+    while processed < limit:
+        reminder = claim_abandoned_checkout_reminder(current_time)
+        if reminder is None:
+            break
+        processed += 1
+
+        with db_connection() as connection:
+            preference = connection.execute(
+                """
+                SELECT opted_out_at FROM email_reminder_preferences
+                WHERE email = ?
+                """,
+                (reminder["recipient"],),
+            ).fetchone()
+            if preference is None or preference["opted_out_at"] is not None:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders
+                    SET status = 'UNSUBSCRIBED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+            if reminder["checkout_type"] == "ORDER":
+                orders = connection.execute(
+                    """
+                    SELECT order_id, payment_status, expires_at
+                    FROM orders WHERE order_id = ?
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+            else:
+                orders = connection.execute(
+                    """
+                    SELECT order_id, payment_status, expires_at
+                    FROM orders WHERE checkout_id = ?
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+
+            if not orders:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders SET status = 'CANCELLED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+            has_open_cancellation = any(
+                connection.execute(
+                    """
+                    SELECT 1 FROM cancellation_requests
+                    WHERE order_id = ? AND status IN ('PENDING', 'APPROVED')
+                    LIMIT 1
+                    """,
+                    (order["order_id"],),
+                ).fetchone()
+                for order in orders
+            )
+            if has_open_cancellation:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders SET status = 'CANCELLED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+            if any(order["payment_status"] != "EXPIRED" for order in orders):
+                if all(
+                    order["payment_status"] == "PENDING"
+                    and order["expires_at"] is not None
+                    and order["expires_at"] > current_time
+                    for order in orders
+                ):
+                    next_attempt_at = max(
+                        order["expires_at"] for order in orders
+                    ) + 1
+                    connection.execute(
+                        """
+                        UPDATE abandoned_checkout_reminders
+                        SET status = 'PENDING', next_attempt_at = ?,
+                            attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
+                        WHERE id = ? AND status = 'SENDING'
+                        """,
+                        (next_attempt_at, reminder["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE abandoned_checkout_reminders SET status = 'CANCELLED'
+                        WHERE id = ? AND status = 'SENDING'
+                        """,
+                        (reminder["id"],),
+                    )
+                continue
+
+            if reminder["checkout_type"] == "ORDER":
+                product_id = reminder["product_id"]
+                resume_url_path = f"/pay/{quote(product_id)}"
+                items = connection.execute(
+                    """
+                    SELECT p.name, oi.quantity
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.order_id
+                    LEFT JOIN products p ON p.id = oi.product_id
+                    WHERE o.order_id = ?
+                    ORDER BY o.created_at, p.name
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+            else:
+                resume_url_path = "/"
+                items = connection.execute(
+                    """
+                    SELECT p.name, oi.quantity
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.order_id
+                    LEFT JOIN products p ON p.id = oi.product_id
+                    WHERE o.checkout_id = ?
+                    ORDER BY o.created_at, p.name
+                    """,
+                    (reminder["checkout_key"],),
+                ).fetchall()
+
+            current_reminder = connection.execute(
+                "SELECT status FROM abandoned_checkout_reminders WHERE id = ?",
+                (reminder["id"],),
+            ).fetchone()
+            current_preference = connection.execute(
+                """
+                SELECT opted_out_at FROM email_reminder_preferences
+                WHERE email = ?
+                """,
+                (reminder["recipient"],),
+            ).fetchone()
+            if current_reminder is None or current_reminder["status"] != "SENDING":
+                continue
+            if current_preference is None or current_preference["opted_out_at"] is not None:
+                connection.execute(
+                    """
+                    UPDATE abandoned_checkout_reminders
+                    SET status = 'UNSUBSCRIBED'
+                    WHERE id = ? AND status = 'SENDING'
+                    """,
+                    (reminder["id"],),
+                )
+                continue
+
+        product_names = ", ".join(
+            dict.fromkeys(
+                f"{item['name'] or 'Bidhaa'} x{item['quantity']}" for item in items
+            )
+        ) or "Bidhaa ulizochagua"
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO email_unsubscribe_tokens (token_hash, email)
+                VALUES (?, ?)
+                """,
+                (token_hash, reminder["recipient"]),
+            )
+
+        sent = send_app_email(
+            "abandoned_checkout_reminder",
+            reminder["recipient"],
+            lambda app_url: abandoned_checkout_email(
+                reminder["buyer_name"] or "Mteja",
+                product_names,
+                reminder["amount"],
+                f"{app_url.rstrip('/')}{resume_url_path}",
+                f"{app_url.rstrip('/')}/api/email/reminders/unsubscribe?token={quote(token)}",
+                app_url,
+            ),
+        )
+        finish_abandoned_checkout_reminder(reminder["id"], sent, current_time)
+    return processed
+
+
+async def abandoned_checkout_reminder_worker():
+    while True:
+        batch = asyncio.create_task(
+            asyncio.to_thread(process_due_abandoned_checkout_reminders)
+        )
+        try:
+            await asyncio.shield(batch)
+        except asyncio.CancelledError:
+            try:
+                await batch
+            except Exception:
+                logger.exception("Abandoned-checkout reminder batch failed during shutdown.")
+            raise
+        except Exception:
+            logger.exception("Abandoned-checkout reminder worker failed.")
+        await asyncio.sleep(ABANDONED_CHECKOUT_REMINDER_POLL_SECONDS)
+
+
+def unsubscribe_reminder_email(token):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db_connection() as connection:
+        token_row = connection.execute(
+            "SELECT email FROM email_unsubscribe_tokens WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        if token_row is None:
+            return None
+        email = token_row["email"]
+        connection.execute(
+            """
+            UPDATE email_reminder_preferences
+            SET opted_out_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE email = ?
+            """,
+            (email,),
+        )
+        connection.execute(
+            """
+            UPDATE abandoned_checkout_reminders
+            SET status = 'UNSUBSCRIBED'
+            WHERE recipient = ? AND status IN ('PENDING', 'SENDING')
+            """,
+            (email,),
+        )
+        return email
+
+
+@app.get("/api/email/reminders/unsubscribe", response_class=HTMLResponse)
+def confirm_reminder_unsubscribe(token: str):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db_connection() as connection:
+        token_row = connection.execute(
+            "SELECT 1 FROM email_unsubscribe_tokens WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+    if token_row is None:
+        return HTMLResponse(
+            "<html><body><p>Link si sahihi au muda wake umeisha.</p></body></html>",
+            status_code=404,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+    action_url = f"/api/email/reminders/unsubscribe?token={quote(token)}"
+    return HTMLResponse(
+        "<!doctype html><html lang='sw'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Simamisha vikumbusho | LipaRahisi</title>"
+        "<body style='font-family:Arial,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172554'>"
+        "<h1>Simamisha vikumbusho vya checkout</h1>"
+        "<p>Thibitisha kama hutaki tena kupokea vikumbusho vya checkout kupitia barua pepe.</p>"
+        f"<form method='post' action='{action_url}'>"
+        "<button type='submit' style='padding:12px 18px;background:#174DAA;color:white;border:0;border-radius:8px;cursor:pointer'>"
+        "Jiondoe kwenye vikumbusho</button></form></body></html>",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.post("/api/email/reminders/unsubscribe", response_class=HTMLResponse)
+def unsubscribe_reminder(token: str):
+    email = unsubscribe_reminder_email(token)
+    if email is None:
+        return HTMLResponse(
+            "<html><body><p>Link si sahihi au muda wake umeisha.</p></body></html>",
+            status_code=404,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+    return HTMLResponse(
+        "<!doctype html><html lang='sw'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Vikumbusho vimesimamishwa | LipaRahisi</title>"
+        "<body style='font-family:Arial,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172554'>"
+        "<h1>Vikumbusho vimesimamishwa</h1>"
+        "<p>Hatutatuma tena vikumbusho vya checkout kwenye barua pepe hii.</p>"
+        "</body></html>",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
 def verify_password(password, encoded):
     try:
         algorithm, iterations, salt_text, digest_text = encoded.split(":", 3)
@@ -1901,6 +2639,12 @@ def optional_current_user(request):
         if error.status_code == 401:
             return None
         raise
+
+
+def checkout_buyer_email(payload, buyer):
+    if buyer and buyer["role"] == "BUYER":
+        return buyer["email"].strip().lower()
+    return payload.buyer_email.strip().lower()
 
 
 def require_admin(request):
@@ -3545,6 +4289,142 @@ def get_product(product_id):
     return dict(product)
 
 
+def attach_product_gallery(products):
+    results = [dict(product) for product in products]
+    product_ids = list(dict.fromkeys(product["id"] for product in results))
+    gallery_by_product = {}
+    with db_connection() as connection:
+        for offset in range(0, len(product_ids), 400):
+            batch = product_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, product_id FROM product_gallery_images
+                WHERE product_id IN ({placeholders})
+                ORDER BY product_id, sort_order, id
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                gallery_by_product.setdefault(row["product_id"], []).append(row["id"])
+
+    for product in results:
+        product_id = product["id"]
+        primary_url = product.get("image_url") or ""
+        images = []
+        if primary_url:
+            primary_id = next(
+                (
+                    image_id
+                    for image_id in gallery_by_product.get(product_id, [])
+                    if primary_url == f"/api/products/{product_id}/gallery/{image_id}"
+                ),
+                None,
+            )
+            images.append({"id": primary_id, "url": primary_url, "primary": True})
+        for image_id in gallery_by_product.get(product_id, []):
+            image_url = f"/api/products/{product_id}/gallery/{image_id}"
+            if image_url != primary_url:
+                images.append({"id": image_id, "url": image_url, "primary": False})
+        product["gallery_images"] = images
+    return results
+
+
+def attach_product_videos(products):
+    results = [dict(product) for product in products]
+    product_ids = list(dict.fromkeys(product["id"] for product in results))
+    videos_by_product = {}
+    with db_connection() as connection:
+        for offset in range(0, len(product_ids), 400):
+            batch = product_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, product_id, content_type, created_at
+                FROM product_videos
+                WHERE product_id IN ({placeholders})
+                ORDER BY product_id, created_at, id
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                videos_by_product.setdefault(row["product_id"], []).append(
+                    {
+                        "id": row["id"],
+                        "url": f"/api/products/{row['product_id']}/videos/{row['id']}",
+                        "content_type": row["content_type"],
+                        "created_at": row["created_at"],
+                    }
+                )
+    for product in results:
+        product["videos"] = videos_by_product.get(product["id"], [])
+    return results
+
+
+def product_variants_for(connection, product_id):
+    rows = connection.execute(
+        """
+        SELECT id, label, stock_quantity
+        FROM product_variants
+        WHERE product_id = ?
+        ORDER BY LOWER(label), id
+        """,
+        (product_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def attach_product_variants(products):
+    results = [dict(product) for product in products]
+    product_ids = list(dict.fromkeys(product["id"] for product in results))
+    variants_by_product = {}
+    with db_connection() as connection:
+        for offset in range(0, len(product_ids), 400):
+            batch = product_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, product_id, label, stock_quantity
+                FROM product_variants
+                WHERE product_id IN ({placeholders})
+                ORDER BY product_id, LOWER(label), id
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                variants_by_product.setdefault(row["product_id"], []).append(
+                    {
+                        "id": row["id"],
+                        "label": row["label"],
+                        "stock_quantity": row["stock_quantity"],
+                    }
+                )
+    for product in results:
+        product["variants"] = variants_by_product.get(product["id"], [])
+    return results
+
+
+def validate_variant_selection(connection, product, variant_id, quantity):
+    variants = product_variants_for(connection, product["id"])
+    if not variants:
+        if variant_id:
+            raise HTTPException(status_code=404, detail="Aina ya bidhaa haikupatikana.")
+        if product["stock_quantity"] < quantity:
+            raise HTTPException(status_code=409, detail="Stock ya bidhaa haitoshi.")
+        return {"variant_id": "", "variant_label": ""}
+    if not variant_id:
+        raise HTTPException(status_code=422, detail="Chagua aina ya bidhaa.")
+    variant = next((row for row in variants if row["id"] == variant_id), None)
+    if variant is None:
+        raise HTTPException(status_code=404, detail="Aina ya bidhaa haikupatikana.")
+    if variant["stock_quantity"] < quantity:
+        raise HTTPException(status_code=409, detail="Stock ya aina hii ya bidhaa haitoshi.")
+    return {
+        "variant_id": variant["id"],
+        "variant_label": variant["label"],
+    }
+
+
 def get_order(order_id):
     expire_pending_orders()
     with db_connection() as connection:
@@ -3565,6 +4445,8 @@ _clickpesa_client = None
 _clickpesa_client_credentials = None
 _pesapal_client = None
 _pesapal_client_credentials = None
+_abliner_client = None
+_abliner_client_credentials = None
 
 
 def clickpesa_is_configured():
@@ -3591,6 +4473,15 @@ def clickpesa_live_enabled():
 
 def pesapal_sandbox_requested():
     return os.getenv("PESAPAL_SANDBOX_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def abliner_live_requested():
+    return os.getenv("ABLINER_LIVE_ENABLED", "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -3670,6 +4561,30 @@ def get_pesapal_client():
     return _pesapal_client
 
 
+def abliner_credentials_configured():
+    return all(
+        os.getenv(key, "").strip()
+        for key in ("ABLINER_API_KEY", "ABLINER_WEBHOOK_SECRET")
+    )
+
+
+def abliner_live_enabled():
+    return abliner_live_requested() and abliner_credentials_configured()
+
+
+def require_abliner_live():
+    if not abliner_live_requested():
+        raise HTTPException(
+            status_code=503,
+            detail="Malipo ya Abliner hayajawashwa kwenye Render.",
+        )
+    if not abliner_credentials_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Abliner inahitaji API key na webhook signing secret kwenye Render.",
+        )
+
+
 def get_clickpesa_client():
     global _clickpesa_client, _clickpesa_client_credentials
     credentials = (
@@ -3683,6 +4598,20 @@ def get_clickpesa_client():
         _clickpesa_client = ClickPesaClient(*credentials)
         _clickpesa_client_credentials = credentials
     return _clickpesa_client
+
+
+def get_abliner_client():
+    global _abliner_client, _abliner_client_credentials
+    credentials = (
+        os.getenv("ABLINER_API_KEY", "").strip(),
+        os.getenv("ABLINER_WEBHOOK_SECRET", "").strip(),
+    )
+    if not all(credentials):
+        raise AblinerError("Abliner credentials hazijawekwa.")
+    if credentials != _abliner_client_credentials:
+        _abliner_client = AblinerClient(*credentials)
+        _abliner_client_credentials = credentials
+    return _abliner_client
 
 
 def public_app_url(request_base_url=None):
@@ -3778,6 +4707,10 @@ def send_payment_notification(order_ids, failed=False, demo=False):
                 orders.append(dict(row))
     if not orders:
         return False
+    if failed:
+        message = "Malipo ya checkout yameshindwa."
+        record_system_alert("PAYMENT_FAILED", message)
+        send_system_alert_email("LipaRahisi: malipo yameshindwa", message)
     recipients = {
         (order.get("buyer_email") or "").strip().lower()
         for order in orders
@@ -3827,7 +4760,7 @@ def send_payment_notification(order_ids, failed=False, demo=False):
     return buyer_email_sent
 
 
-def complete_order_group(order_ids, provider_verified=False):
+def complete_order_group(order_ids, provider_verified=False, background_tasks=None):
     expire_pending_orders()
     newly_completed_ids = []
     with db_connection() as connection:
@@ -3850,6 +4783,7 @@ def complete_order_group(order_ids, provider_verified=False):
                     )
             orders.append(order)
 
+        record_coupon_redemption(connection, orders)
         for order in orders:
             if order["payment_status"] == "COMPLETED":
                 continue
@@ -3893,6 +4827,7 @@ def complete_order_group(order_ids, provider_verified=False):
             )
             if claimed.rowcount == 0:
                 continue
+            cancel_checkout_reminders_for_order(connection, order)
             newly_completed_ids.append(order["order_id"])
             connection.execute(
                 """
@@ -3903,11 +4838,33 @@ def complete_order_group(order_ids, provider_verified=False):
                 (secrets.token_hex(16), order["order_id"]),
             )
             items = connection.execute(
-                "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                """
+                SELECT product_id, quantity, variant_id
+                FROM order_items WHERE order_id = ?
+                """,
                 (order["order_id"],),
             ).fetchall()
             if items:
                 for item in items:
+                    if item["variant_id"]:
+                        variant_update = connection.execute(
+                            """
+                            UPDATE product_variants
+                            SET stock_quantity = stock_quantity - ?
+                            WHERE id = ? AND product_id = ? AND stock_quantity >= ?
+                            """,
+                            (
+                                item["quantity"],
+                                item["variant_id"],
+                                item["product_id"],
+                                item["quantity"],
+                            ),
+                        )
+                        if variant_update.rowcount == 0:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Stock ya aina hii ya bidhaa imeisha.",
+                            )
                     result = connection.execute(
                         """
                         UPDATE products
@@ -3967,10 +4924,17 @@ def complete_order_group(order_ids, provider_verified=False):
                     email=completed_order["buyer_email"],
                     phone=completed_order["buyer_phone"],
                 )
-        send_payment_notification(
-            newly_completed_ids,
-            demo=not provider_verified,
-        )
+        if background_tasks is not None:
+            background_tasks.add_task(
+                send_payment_notification,
+                newly_completed_ids,
+                demo=not provider_verified,
+            )
+        else:
+            send_payment_notification(
+                newly_completed_ids,
+                demo=not provider_verified,
+            )
     return completed_orders
 
 
@@ -3979,7 +4943,7 @@ def complete_demo_order(order_id):
     return orders[0]
 
 
-def clickpesa_orders_for_reference(order_reference):
+def orders_for_provider_reference(order_reference):
     with db_connection() as connection:
         anchor = connection.execute(
             "SELECT order_id, checkout_id FROM orders WHERE provider_reference = ?",
@@ -3998,6 +4962,10 @@ def clickpesa_orders_for_reference(order_reference):
                 (anchor["order_id"],),
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def clickpesa_orders_for_reference(order_reference):
+    return orders_for_provider_reference(order_reference)
 
 
 def update_clickpesa_reference_status(order_reference, status, payment_id=""):
@@ -4112,6 +5080,60 @@ def update_pesapal_reference_status(order_reference, status, payment_id=""):
                 """,
                 (status, payment_id, payment_id, order["order_id"]),
             )
+
+
+def validate_abliner_transaction(order_reference, amount, currency):
+    if currency != "TZS":
+        raise HTTPException(status_code=422, detail="Sarafu ya malipo ya Abliner si sahihi.")
+    orders = orders_for_provider_reference(order_reference)
+    if any(order["payment_method"] != ABLINER_PAYMENT_METHOD for order in orders):
+        raise HTTPException(status_code=422, detail="Rejea si ya oda ya Abliner.")
+    try:
+        collected_amount = Decimal(str(amount))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo ya Abliner si sahihi.")
+    expected_amount = sum(order["amount"] for order in orders)
+    if (
+        not collected_amount.is_finite()
+        or collected_amount != collected_amount.to_integral_value()
+        or collected_amount != expected_amount
+    ):
+        raise HTTPException(status_code=422, detail="Kiasi cha malipo hakilingani na oda.")
+    return orders
+
+
+def update_abliner_reference_status(
+    order_reference,
+    status,
+    payment_id="",
+    background_tasks=None,
+):
+    orders = orders_for_provider_reference(order_reference)
+    if any(order["payment_method"] != ABLINER_PAYMENT_METHOD for order in orders):
+        raise HTTPException(status_code=422, detail="Rejea si ya oda ya Abliner.")
+    newly_failed_ids = []
+    with db_connection() as connection:
+        for order in orders:
+            updated = connection.execute(
+                """
+                UPDATE orders
+                SET payment_status = ?,
+                    provider_payment_id = CASE WHEN ? <> '' THEN ? ELSE provider_payment_id END
+                WHERE order_id = ? AND payment_status = 'PENDING'
+                """,
+                (status, payment_id, payment_id, order["order_id"]),
+            )
+            if status == "FAILED" and updated.rowcount:
+                newly_failed_ids.append(order["order_id"])
+    if newly_failed_ids:
+        if background_tasks is not None:
+            background_tasks.add_task(
+                send_payment_notification,
+                newly_failed_ids,
+                failed=True,
+            )
+        else:
+            send_payment_notification(newly_failed_ids, failed=True)
 
 
 async def begin_pesapal_payment(
@@ -4295,6 +5317,124 @@ async def process_pesapal_callback(request: Request):
         f"{app_url}/pay/{quote(order['product_id'])}"
         f"?order_id={quote(order['order_id'])}&sandbox=1"
     )
+
+async def begin_abliner_payment(order_reference, phone_number, amount, callback_url):
+    try:
+        result = await get_abliner_client().create_mobile_deposit(
+            amount=amount,
+            phone=phone_number,
+            reference=order_reference,
+            callback_url=callback_url,
+        )
+    except AblinerError as error:
+        logger.warning(
+            "Abliner deposit failed for reference %s (uncertain=%s).",
+            order_reference,
+            error.uncertain,
+        )
+        if not error.uncertain:
+            update_abliner_reference_status(order_reference, "FAILED")
+            return "FAILED"
+        return "PENDING"
+
+    orders = orders_for_provider_reference(order_reference)
+    with db_connection() as connection:
+        for order in orders:
+            connection.execute(
+                "UPDATE orders SET provider_payment_id = ? WHERE order_id = ?",
+                (result["id"], order["order_id"]),
+            )
+    return "PENDING"
+
+
+def complete_abliner_payment(
+    order_reference,
+    amount,
+    currency,
+    payment_id="",
+    background_tasks=None,
+):
+    orders = validate_abliner_transaction(order_reference, amount, currency)
+    if any(
+        order["payment_status"] not in {"PENDING", "COMPLETED", "EXPIRED"}
+        for order in orders
+    ):
+        raise HTTPException(status_code=409, detail="Oda hii haiwezi kukamilishwa tena.")
+    completed = complete_order_group(
+        [order["order_id"] for order in orders],
+        provider_verified=True,
+        background_tasks=background_tasks,
+    )
+    if payment_id:
+        with db_connection() as connection:
+            for order in orders:
+                connection.execute(
+                    "UPDATE orders SET provider_payment_id = ? WHERE order_id = ?",
+                    (payment_id, order["order_id"]),
+                )
+    return completed
+
+
+async def process_abliner_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    webhook_secret = os.getenv("ABLINER_WEBHOOK_SECRET", "").strip()
+    if not webhook_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Abliner webhook signing secret haijawekwa.",
+        )
+    raw_body = await request.body()
+    if len(raw_body) > 65536:
+        raise HTTPException(status_code=413, detail="Ombi la webhook ya Abliner ni kubwa mno.")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    signature = request.headers.get("x-webhook-signature", "")
+    if not verify_webhook_signature(raw_body, timestamp, signature, webhook_secret):
+        raise HTTPException(status_code=401, detail="Saini ya webhook ya Abliner si sahihi.")
+    try:
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Taarifa za webhook ya Abliner si sahihi.") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Taarifa za webhook ya Abliner si sahihi.")
+
+    event = payload.get("event")
+    if event not in {"transaction.completed", "transaction.failed"}:
+        return {"received": True, "ignored": True}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Taarifa za malipo ya Abliner si sahihi.")
+    if data.get("type") != "deposit":
+        return {"received": True, "ignored": True}
+    order_reference = data.get("customer_reference")
+    if not isinstance(order_reference, str) or not order_reference:
+        raise HTTPException(status_code=400, detail="Webhook ya Abliner haina rejea ya oda.")
+    if event == "transaction.failed":
+        if data.get("status") != "failed":
+            raise HTTPException(status_code=400, detail="Hali ya webhook ya Abliner si sahihi.")
+        validate_abliner_transaction(
+            order_reference,
+            data.get("amount"),
+            data.get("currency"),
+        )
+        update_abliner_reference_status(
+            order_reference,
+            "FAILED",
+            data.get("id", ""),
+            background_tasks,
+        )
+        return {"received": True}
+    if data.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Hali ya webhook ya Abliner si sahihi.")
+    complete_abliner_payment(
+        order_reference,
+        data.get("amount"),
+        data.get("currency"),
+        data.get("id", ""),
+        background_tasks,
+    )
+    return {"received": True}
 
 
 def process_clickpesa_webhook(payload: dict):
@@ -4623,6 +5763,9 @@ def integration_status():
         "pesapal_sandbox_requested": pesapal_sandbox_requested(),
         "pesapal_sandbox_enabled": pesapal_sandbox_enabled(),
         "pesapal_live_enabled": False,
+        "abliner_live_requested": abliner_live_requested(),
+        "abliner_credentials_configured": abliner_credentials_configured(),
+        "abliner_live_enabled": abliner_live_enabled(),
         "selcom_configured": selcom_configured,
         "smtp_configured": smtp_configured,
         "email_configured": email_configured,
@@ -4923,6 +6066,111 @@ async def catalog_product_image_gateway(product_id: str, request: Request):
     )
 
 
+@app.api_route("/api/products/{product_id}/gallery", methods=["POST"])
+async def catalog_product_gallery_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/gallery",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route("/api/products/{product_id}/videos", methods=["POST"])
+async def catalog_product_videos_gateway(product_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/videos",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/videos/{video_id}",
+    methods=["GET", "DELETE"],
+)
+async def catalog_product_video_gateway(
+    product_id: str,
+    video_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/videos/{video_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/gallery/{image_id}",
+    methods=["GET", "DELETE"],
+)
+async def catalog_product_gallery_image_gateway(
+    product_id: str,
+    image_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/gallery/{image_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/variants",
+    methods=["POST"],
+)
+async def catalog_product_variants_gateway(
+    product_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/variants",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
+@app.api_route(
+    "/api/products/{product_id}/variants/{variant_id}",
+    methods=["PATCH"],
+)
+async def catalog_product_variant_gateway(
+    product_id: str,
+    variant_id: str,
+    request: Request,
+):
+    return await proxy_internal_api(
+        request,
+        f"products/{product_id}/variants/{variant_id}",
+        "Catalog",
+        "CATALOG_SERVICE_URL",
+        "CATALOG_SERVICE_TOKEN",
+        "X-Catalog-Service-Token",
+        create_catalog_service_client,
+    )
+
+
 @app.api_route(
     "/api/products/{product_id}",
     methods=["GET", "PUT", "DELETE"],
@@ -5023,6 +6271,24 @@ async def pesapal_callback_gateway(request: Request):
     )
 
 
+@app.api_route("/api/webhooks/abliner", methods=["POST"])
+async def abliner_webhook_gateway(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    if not os.getenv("ORDERS_SERVICE_URL", "").strip():
+        return await process_abliner_webhook(request, background_tasks)
+    return await proxy_internal_api(
+        request,
+        "webhooks/abliner",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
 @app.api_route(
     "/api/checkouts/{checkout_id}",
     methods=["GET"],
@@ -5110,6 +6376,19 @@ async def order_cancellation_gateway(order_id: str, request: Request):
     )
 
 
+@app.api_route("/api/orders/{order_id}/return", methods=["POST"])
+async def order_return_gateway(order_id: str, request: Request):
+    return await proxy_internal_api(
+        request,
+        f"orders/{order_id}/return",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
 @app.api_route(
     "/api/orders/{order_id}/products/{product_id}/review",
     methods=["POST"],
@@ -5147,6 +6426,32 @@ async def order_dashboard_gateway(request: Request):
     return await proxy_internal_api(
         request,
         "dashboard",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/payouts", methods=["GET"])
+async def order_payout_ledger_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "payouts",
+        "Orders",
+        "ORDERS_SERVICE_URL",
+        "ORDERS_SERVICE_TOKEN",
+        "X-Orders-Service-Token",
+        create_orders_service_client,
+    )
+
+
+@app.api_route("/api/payouts", methods=["POST"])
+async def order_manual_payout_gateway(request: Request):
+    return await proxy_internal_api(
+        request,
+        "payouts",
         "Orders",
         "ORDERS_SERVICE_URL",
         "ORDERS_SERVICE_TOKEN",
@@ -5872,7 +7177,12 @@ def read_storefront(store_slug: str):
             """,
             (seller["id"],),
         ).fetchall()
-    return {"store": dict(seller), "products": [dict(row) for row in products]}
+    return {
+        "store": dict(seller),
+        "products": attach_product_variants(
+            attach_product_videos(attach_product_gallery(products))
+        ),
+    }
 
 
 def list_products(
@@ -5905,7 +7215,7 @@ def list_products(
             separators=(",", ":"),
         )
         cache_key = (
-            "liparahisi:public-products:v1:"
+            PUBLIC_PRODUCT_CACHE_PREFIX
             + hashlib.sha256(key_data.encode("utf-8")).hexdigest()
         )
         cached = cached_product_list(cache_key)
@@ -5977,6 +7287,9 @@ def list_products(
         }
         for row in rows
     ]
+    products = attach_product_variants(
+        attach_product_videos(attach_product_gallery(products))
+    )
     if cache_key is not None:
         cache_product_list(cache_key, products)
     return products
@@ -6035,6 +7348,246 @@ def create_category(payload: CategoryInput, request: Request):
         raise
     record_audit("CATEGORY_CREATED", "category", category_id, name, actor=actor, request=request)
     return {"id": category_id, "name": name}
+
+
+def list_coupons(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, code, discount_type, discount_value, max_redemptions,
+                   redemption_count, is_active, created_at
+            FROM coupons ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [{**dict(row), "is_active": bool(row["is_active"])} for row in rows]
+
+
+def create_coupon(payload: CouponInput, request: Request):
+    actor = require_admin(request)
+    if payload.discount_type == "PERCENT" and payload.discount_value > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Punguzo la asilimia haliwezi kuzidi 100.",
+        )
+    coupon_id = secrets.token_hex(16)
+    try:
+        with db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO coupons
+                    (id, code, discount_type, discount_value, max_redemptions, created_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    coupon_id,
+                    payload.code,
+                    payload.discount_type,
+                    payload.discount_value,
+                    payload.max_redemptions,
+                    actor["id"],
+                ),
+            )
+    except Exception as error:
+        if is_integrity_error(error):
+            raise HTTPException(
+                status_code=409,
+                detail="Msimbo huu wa kuponi tayari upo.",
+            ) from error
+        raise
+    record_audit(
+        "COUPON_CREATED",
+        "coupon",
+        coupon_id,
+        payload.code,
+        actor=actor,
+        request=request,
+    )
+    with db_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, code, discount_type, discount_value, max_redemptions,
+                   redemption_count, is_active, created_at
+            FROM coupons WHERE id = ?
+            """,
+            (coupon_id,),
+        ).fetchone()
+    return {**dict(row), "is_active": bool(row["is_active"])}
+
+
+def set_coupon_status(coupon_id: str, payload: CouponStatusInput, request: Request):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            "UPDATE coupons SET is_active = ? WHERE id = ?",
+            (int(payload.is_active), coupon_id),
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kuponi haikupatikana.")
+    record_audit(
+        "COUPON_STATUS_UPDATED",
+        "coupon",
+        coupon_id,
+        "ACTIVE" if payload.is_active else "INACTIVE",
+        actor=actor,
+        request=request,
+    )
+    return {"id": coupon_id, "is_active": payload.is_active}
+
+
+def coupon_buyer_key(buyer_id, buyer_email):
+    if buyer_id:
+        return f"account:{buyer_id}"
+    return f"email:{buyer_email.strip().lower()}"
+
+
+def coupon_discount_for_checkout(
+    connection,
+    coupon_code,
+    subtotal,
+    buyer_id,
+    buyer_email,
+    minimum_total=1,
+    demo_checkout=False,
+):
+    code = (coupon_code or "").strip().upper()
+    if not code:
+        return "", 0
+    if not demo_checkout or not is_demo_mode():
+        raise HTTPException(
+            status_code=422,
+            detail="Kuponi zinapatikana kwenye majaribio pekee.",
+        )
+    coupon = connection.execute(
+        "SELECT * FROM coupons WHERE code = ?",
+        (code,),
+    ).fetchone()
+    if coupon is None or not coupon["is_active"]:
+        raise HTTPException(status_code=404, detail="Kuponi haipo au haijawashwa.")
+    if (
+        coupon["max_redemptions"] is not None
+        and coupon["redemption_count"] >= coupon["max_redemptions"]
+    ):
+        raise HTTPException(status_code=409, detail="Matumizi ya kuponi yamefika kikomo.")
+    buyer_key = coupon_buyer_key(buyer_id, buyer_email)
+    redeemed = connection.execute(
+        """
+        SELECT 1 FROM coupon_redemptions
+        WHERE coupon_id = ? AND buyer_key = ?
+        """,
+        (coupon["id"], buyer_key),
+    ).fetchone()
+    if redeemed is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Tayari umetumia kuponi hii.",
+        )
+    discount = (
+        subtotal * coupon["discount_value"] // 100
+        if coupon["discount_type"] == "PERCENT"
+        else coupon["discount_value"]
+    )
+    discount = min(discount, max(0, subtotal - minimum_total))
+    if discount <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Kuponi hii haiwezi kupunguza kiasi cha oda hii.",
+        )
+    return code, discount
+
+
+def allocate_coupon_discount(discount, seller_subtotals):
+    total_subtotal = sum(amount for _seller_id, amount in seller_subtotals)
+    remaining = discount
+    allocations = {}
+    for seller_id, subtotal in seller_subtotals:
+        share = min(discount * subtotal // total_subtotal, subtotal - 1, remaining)
+        allocations[seller_id] = share
+        remaining -= share
+    for seller_id, subtotal in seller_subtotals:
+        if remaining <= 0:
+            break
+        extra = min(subtotal - 1 - allocations[seller_id], remaining)
+        allocations[seller_id] += extra
+        remaining -= extra
+    if remaining:
+        raise HTTPException(
+            status_code=422,
+            detail="Kuponi hii haiwezi kupunguza kiasi cha oda hii.",
+        )
+    return allocations
+
+
+def record_coupon_redemption(connection, orders):
+    coupon_codes = {order.get("coupon_code") or "" for order in orders}
+    coupon_codes.discard("")
+    if not coupon_codes:
+        return
+    if (
+        len(coupon_codes) != 1
+        or not is_demo_mode()
+        or any(
+            order.get("provider_reference")
+            or order.get("payment_method") == ABLINER_PAYMENT_METHOD
+            for order in orders
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Kuponi hii haiwezi kutumika kwenye malipo halisi.",
+        )
+    coupon_code = next(iter(coupon_codes))
+    first_order = orders[0]
+    redemption_key = first_order.get("checkout_id") or first_order["order_id"]
+    coupon = connection.execute(
+        "SELECT id, max_redemptions, redemption_count FROM coupons WHERE code = ?",
+        (coupon_code,),
+    ).fetchone()
+    if coupon is None:
+        raise HTTPException(status_code=409, detail="Kuponi haipo tena.")
+    existing = connection.execute(
+        """
+        SELECT 1 FROM coupon_redemptions
+        WHERE coupon_id = ? AND redemption_key = ?
+        """,
+        (coupon["id"], redemption_key),
+    ).fetchone()
+    if existing is not None:
+        return
+    buyer_key = coupon_buyer_key(
+        first_order.get("buyer_id"),
+        first_order.get("buyer_email") or "",
+    )
+    updated = connection.execute(
+        """
+        UPDATE coupons
+        SET redemption_count = redemption_count + 1
+        WHERE id = ?
+          AND (? IS NULL OR redemption_count < ?)
+        """,
+        (
+            coupon["id"],
+            coupon["max_redemptions"],
+            coupon["max_redemptions"],
+        ),
+    )
+    if updated.rowcount == 0:
+        raise HTTPException(status_code=409, detail="Matumizi ya kuponi yamefika kikomo.")
+    try:
+        connection.execute(
+            """
+            INSERT INTO coupon_redemptions (coupon_id, redemption_key, buyer_key)
+            VALUES (?, ?, ?)
+            """,
+            (coupon["id"], redemption_key, buyer_key),
+        )
+    except Exception as error:
+        if is_integrity_error(error):
+            raise HTTPException(
+                status_code=409,
+                detail="Tayari umetumia kuponi hii.",
+            ) from error
+        raise
 
 
 def low_stock_products(request: Request):
@@ -6125,7 +7678,7 @@ def list_wishlist(request: Request):
             """,
             (user["id"],),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return attach_product_videos(attach_product_gallery(rows))
 
 
 def export_products(request: Request):
@@ -6239,6 +7792,11 @@ def create_product(payload: ProductInput, request: Request):
     if user["role"] != "SELLER":
         raise HTTPException(status_code=403, detail="Ni akaunti ya muuzaji pekee inayoweza kuunda bidhaa.")
     product_id = secrets.token_hex(16)
+    stock_quantity = (
+        sum(variant.stock_quantity for variant in payload.variants)
+        if payload.variants
+        else payload.stock_quantity
+    )
     with db_connection() as connection:
         connection.execute(
             """
@@ -6259,17 +7817,30 @@ def create_product(payload: ProductInput, request: Request):
                 payload.amount,
                 user["id"],
                 payload.cost_amount,
-                payload.stock_quantity,
+                stock_quantity,
                 payload.low_stock_threshold,
             ),
         )
-        if payload.stock_quantity:
+        for variant in payload.variants:
+            connection.execute(
+                """
+                INSERT INTO product_variants (id, product_id, label, stock_quantity)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    secrets.token_hex(16),
+                    product_id,
+                    variant.label,
+                    variant.stock_quantity,
+                ),
+            )
+        if stock_quantity:
             record_inventory_movement(
                 connection,
                 product_id,
                 user["id"],
                 user["id"],
-                payload.stock_quantity,
+                stock_quantity,
                 "INITIAL_STOCK",
             )
     record_audit("PRODUCT_CREATED", "product", product_id, payload.name, actor=user, request=request)
@@ -6285,9 +7856,135 @@ def create_product(payload: ProductInput, request: Request):
         "video_url": payload.video_url.strip(),
         "amount": payload.amount,
         "cost_amount": payload.cost_amount,
-        "stock_quantity": payload.stock_quantity,
+        "stock_quantity": stock_quantity,
         "low_stock_threshold": payload.low_stock_threshold,
+        "variants": attach_product_variants([{"id": product_id}])[0]["variants"],
         "qr_url": f"{app_url}/p/{product_id}",
+    }
+
+
+def update_product_variant_stock(
+    product_id: str,
+    variant_id: str,
+    payload: ProductVariantStockInput,
+    request: Request,
+):
+    seller = require_seller(request)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE products SET stock_quantity = stock_quantity WHERE id = ? AND seller_id = ?",
+            (product_id, seller["id"]),
+        )
+        variant = connection.execute(
+            """
+            SELECT v.label, v.stock_quantity, p.seller_id, p.stock_quantity AS product_stock
+            FROM product_variants v
+            JOIN products p ON p.id = v.product_id
+            WHERE v.id = ? AND v.product_id = ?
+            """,
+            (variant_id, product_id),
+        ).fetchone()
+        if variant is None or variant["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Aina ya bidhaa haikupatikana.")
+        connection.execute(
+            "UPDATE product_variants SET stock_quantity = ? WHERE id = ?",
+            (payload.stock_quantity, variant_id),
+        )
+        total_stock = connection.execute(
+            "SELECT COALESCE(SUM(stock_quantity), 0) AS total FROM product_variants WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()["total"]
+        stock_delta = total_stock - variant["product_stock"]
+        connection.execute(
+            "UPDATE products SET stock_quantity = ? WHERE id = ?",
+            (total_stock, product_id),
+        )
+        if stock_delta:
+            record_inventory_movement(
+                connection,
+                product_id,
+                seller["id"],
+                seller["id"],
+                stock_delta,
+                "VARIANT_STOCK_ADJUSTMENT",
+            )
+    invalidate_public_product_lists()
+    record_audit(
+        "PRODUCT_VARIANT_STOCK_UPDATED",
+        "product_variant",
+        variant_id,
+        f"{variant['label']} stock={payload.stock_quantity}",
+        actor=seller,
+        request=request,
+    )
+    return {
+        "id": variant_id,
+        "product_id": product_id,
+        "label": variant["label"],
+        "stock_quantity": payload.stock_quantity,
+    }
+
+
+def add_product_variant(
+    product_id: str,
+    payload: ProductVariantInput,
+    request: Request,
+):
+    seller = require_seller(request)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE products SET stock_quantity = stock_quantity WHERE id = ? AND seller_id = ?",
+            (product_id, seller["id"]),
+        )
+        product = connection.execute(
+            "SELECT seller_id, stock_quantity FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        variants = product_variants_for(connection, product_id)
+        if len(variants) >= 100:
+            raise HTTPException(status_code=409, detail="Bidhaa haiwezi kuwa na variants zaidi ya 100.")
+        if any(variant["label"].casefold() == payload.label.casefold() for variant in variants):
+            raise HTTPException(status_code=409, detail="Variant yenye jina hili tayari ipo.")
+        variant_id = secrets.token_hex(16)
+        connection.execute(
+            """
+            INSERT INTO product_variants (id, product_id, label, stock_quantity)
+            VALUES (?, ?, ?, ?)
+            """,
+            (variant_id, product_id, payload.label, payload.stock_quantity),
+        )
+        total_stock = sum(variant["stock_quantity"] for variant in variants)
+        total_stock += payload.stock_quantity
+        stock_delta = total_stock - product["stock_quantity"]
+        connection.execute(
+            "UPDATE products SET stock_quantity = ? WHERE id = ?",
+            (total_stock, product_id),
+        )
+        if stock_delta:
+            record_inventory_movement(
+                connection,
+                product_id,
+                seller["id"],
+                seller["id"],
+                stock_delta,
+                "VARIANT_ADDED",
+            )
+    invalidate_public_product_lists()
+    record_audit(
+        "PRODUCT_VARIANT_ADDED",
+        "product_variant",
+        variant_id,
+        f"{payload.label} stock={payload.stock_quantity}",
+        actor=seller,
+        request=request,
+    )
+    return {
+        "id": variant_id,
+        "product_id": product_id,
+        "label": payload.label,
+        "stock_quantity": payload.stock_quantity,
     }
 
 
@@ -6302,6 +7999,15 @@ def update_product(product_id: str, payload: ProductUpdateInput, request: Reques
             raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
         if user["role"] != "ADMIN" and product["seller_id"] != user["id"]:
             raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        has_variants = connection.execute(
+            "SELECT 1 FROM product_variants WHERE product_id = ? LIMIT 1",
+            (product_id,),
+        ).fetchone()
+        if has_variants and payload.stock_quantity is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Badilisha stock ya kila variant kivyake.",
+            )
         name = payload.name if payload.name is not None else product["name"]
         description = payload.description if payload.description is not None else product["description"]
         image_url = payload.image_url if payload.image_url is not None else product["image_url"]
@@ -6382,7 +8088,7 @@ def archive_product(product_id: str, request: Request):
 
 def read_product(product_id: str):
     product = get_product(product_id)
-    return {
+    result = {
         "id": product["id"],
         "name": product["name"],
         "description": product["description"],
@@ -6394,6 +8100,21 @@ def read_product(product_id: str):
         "store_slug": product["store_slug"] or "",
         **list_product_reviews(product["id"]),
     }
+    return attach_product_variants(
+        attach_product_videos(attach_product_gallery([result]))
+    )[0]
+
+
+def read_uploaded_product_image(image):
+    content_type = (image.content_type or "").lower()
+    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=415, detail="Tumia picha ya JPEG, PNG au WebP.")
+    image_data = image.file.read(MAX_PRODUCT_IMAGE_BYTES + 1)
+    if len(image_data) > MAX_PRODUCT_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
+    if not image_data or not upload_media_type(content_type, image_data):
+        raise HTTPException(status_code=422, detail="Faili halilingani na aina ya picha iliyochaguliwa.")
+    return content_type, image_data
 
 
 def upload_product_image(
@@ -6406,14 +8127,7 @@ def upload_product_image(
     if declared_length and declared_length.isdigit() and int(declared_length) > MAX_PRODUCT_IMAGE_BYTES + 65536:
         raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
 
-    content_type = (image.content_type or "").lower()
-    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
-        raise HTTPException(status_code=415, detail="Tumia picha ya JPEG, PNG au WebP.")
-    image_data = image.file.read(MAX_PRODUCT_IMAGE_BYTES + 1)
-    if len(image_data) > MAX_PRODUCT_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Picha imezidi ukubwa wa MB 5.")
-    if not image_data or not upload_media_type(content_type, image_data):
-        raise HTTPException(status_code=422, detail="Faili halilingani na aina ya picha iliyochaguliwa.")
+    content_type, image_data = read_uploaded_product_image(image)
 
     with db_connection() as connection:
         product = connection.execute(
@@ -6446,6 +8160,7 @@ def upload_product_image(
         actor=seller,
         request=request,
     )
+    invalidate_public_product_lists()
     return {"product_id": product_id, "image_url": image_url}
 
 
@@ -6952,6 +8667,274 @@ def read_seller_document(document_id: str, request: Request):
     )
 
 
+def upload_product_gallery(
+    product_id: str,
+    request: Request,
+    images: list[UploadFile] = File(...),
+):
+    seller = require_seller(request)
+    if not images or len(images) > MAX_PRODUCT_GALLERY_IMAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Chagua picha 1 hadi {MAX_PRODUCT_GALLERY_IMAGES} za bidhaa.",
+        )
+    declared_length = request.headers.get("content-length")
+    max_request_bytes = len(images) * (MAX_PRODUCT_IMAGE_BYTES + 65536)
+    if declared_length and declared_length.isdigit() and int(declared_length) > max_request_bytes:
+        raise HTTPException(status_code=413, detail="Picha za bidhaa zimezidi ukubwa unaoruhusiwa.")
+    prepared_images = [read_uploaded_product_image(image) for image in images]
+
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id, image_url FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        existing = connection.execute(
+            """
+            SELECT id, sort_order FROM product_gallery_images
+            WHERE product_id = ?
+            ORDER BY sort_order, id
+            """,
+            (product_id,),
+        ).fetchall()
+        primary_is_gallery = any(
+            product["image_url"] == f"/api/products/{product_id}/gallery/{row['id']}"
+            for row in existing
+        )
+        current_count = len(existing) + int(bool(product["image_url"]) and not primary_is_gallery)
+        if current_count + len(prepared_images) > MAX_PRODUCT_GALLERY_IMAGES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Bidhaa inaweza kuwa na picha {MAX_PRODUCT_GALLERY_IMAGES} tu kwa jumla.",
+            )
+        next_order = max((row["sort_order"] for row in existing), default=-1) + 1
+        new_ids = []
+        for index, (content_type, image_data) in enumerate(prepared_images):
+            image_id = secrets.token_hex(16)
+            connection.execute(
+                """
+                INSERT INTO product_gallery_images
+                    (id, product_id, sort_order, content_type, image_data)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (image_id, product_id, next_order + index, content_type, image_data),
+            )
+            new_ids.append(image_id)
+        if not product["image_url"]:
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                (f"/api/products/{product_id}/gallery/{new_ids[0]}", product_id),
+            )
+    invalidate_public_product_lists()
+    return {
+        "product_id": product_id,
+        "image_ids": new_ids,
+    }
+
+
+def read_product_gallery_image(product_id: str, image_id: str):
+    with db_connection() as connection:
+        image = connection.execute(
+            """
+            SELECT content_type, image_data FROM product_gallery_images
+            WHERE product_id = ? AND id = ?
+            """,
+            (product_id, image_id),
+        ).fetchone()
+    if image is None:
+        raise HTTPException(status_code=404, detail="Picha ya pembe ya bidhaa haikupatikana.")
+    return Response(
+        content=image["image_data"],
+        media_type=image["content_type"],
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def delete_product_gallery_image(product_id: str, image_id: str, request: Request):
+    seller = require_seller(request)
+    image_url = f"/api/products/{product_id}/gallery/{image_id}"
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id, image_url FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        deleted = connection.execute(
+            "DELETE FROM product_gallery_images WHERE product_id = ? AND id = ?",
+            (product_id, image_id),
+        )
+        if deleted.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Picha ya pembe ya bidhaa haikupatikana.")
+        if product["image_url"] == image_url:
+            replacement = connection.execute(
+                """
+                SELECT id FROM product_gallery_images
+                WHERE product_id = ?
+                ORDER BY sort_order, id
+                LIMIT 1
+                """,
+                (product_id,),
+            ).fetchone()
+            replacement_url = (
+                f"/api/products/{product_id}/gallery/{replacement['id']}"
+                if replacement
+                else ""
+            )
+            connection.execute(
+                "UPDATE products SET image_url = ? WHERE id = ?",
+                (replacement_url, product_id),
+            )
+    invalidate_public_product_lists()
+    return {"product_id": product_id, "image_id": image_id}
+
+
+def read_uploaded_product_video(video):
+    content_type = (video.content_type or "").lower().split(";", 1)[0].strip()
+    signatures = {
+        "video/mp4": lambda data: len(data) >= 12 and data[4:8] == b"ftyp",
+        "video/webm": lambda data: data.startswith(b"\x1a\x45\xdf\xa3"),
+    }
+    if content_type not in signatures:
+        raise HTTPException(status_code=415, detail="Tumia video ya MP4 au WebM.")
+    video_data = video.file.read(MAX_PRODUCT_VIDEO_BYTES + 1)
+    if len(video_data) > MAX_PRODUCT_VIDEO_BYTES:
+        raise HTTPException(status_code=413, detail="Video imezidi ukubwa wa MB 20.")
+    if not video_data or not signatures[content_type](video_data):
+        raise HTTPException(
+            status_code=422,
+            detail="Faili la video halilingani na aina iliyochaguliwa.",
+        )
+    return content_type, video_data
+
+
+def upload_product_video(
+    product_id: str,
+    request: Request,
+    video: UploadFile = File(...),
+):
+    seller = require_seller(request)
+    declared_length = request.headers.get("content-length")
+    if (
+        declared_length
+        and declared_length.isdigit()
+        and int(declared_length) > MAX_PRODUCT_VIDEO_BYTES + 65536
+    ):
+        raise HTTPException(status_code=413, detail="Video imezidi ukubwa wa MB 20.")
+
+    content_type, video_data = read_uploaded_product_video(video)
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ? AND is_active = 1",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        video_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM product_videos WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()["count"]
+        if video_count >= MAX_PRODUCT_VIDEOS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Bidhaa inaweza kuwa na video {MAX_PRODUCT_VIDEOS} tu.",
+            )
+        video_id = secrets.token_hex(16)
+        connection.execute(
+            """
+            INSERT INTO product_videos (id, product_id, content_type, video_data)
+            VALUES (?, ?, ?, ?)
+            """,
+            (video_id, product_id, content_type, video_data),
+        )
+    invalidate_public_product_lists()
+    return {
+        "product_id": product_id,
+        "video": {
+            "id": video_id,
+            "url": f"/api/products/{product_id}/videos/{video_id}",
+            "content_type": content_type,
+        },
+    }
+
+
+def read_product_video(product_id: str, video_id: str, request: Request):
+    with db_connection() as connection:
+        video = connection.execute(
+            """
+            SELECT v.content_type, v.video_data
+            FROM product_videos v
+            JOIN products p ON p.id = v.product_id
+            LEFT JOIN users u ON u.id = p.seller_id
+            WHERE v.product_id = ? AND v.id = ? AND p.is_active = 1
+              AND (p.seller_id IS NULL OR u.status = 'ACTIVE')
+            """,
+            (product_id, video_id),
+        ).fetchone()
+    if video is None:
+        raise HTTPException(status_code=404, detail="Video haikupatikana.")
+
+    video_data = video["video_data"]
+    total_bytes = len(video_data)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    }
+    range_header = request.headers.get("range")
+    if not range_header:
+        return Response(
+            content=video_data,
+            media_type=video["content_type"],
+            headers=headers,
+        )
+
+    normalized_range = range_header.strip()
+    match = (
+        re.fullmatch(r"bytes=(\d*)-(\d*)", normalized_range)
+        if len(normalized_range) <= 100
+        else None
+    )
+    if match is None or (not match.group(1) and not match.group(2)):
+        return Response(
+            status_code=416,
+            headers={**headers, "Content-Range": f"bytes */{total_bytes}"},
+        )
+    if not match.group(1):
+        suffix_bytes = int(match.group(2))
+        if suffix_bytes <= 0:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{total_bytes}"},
+            )
+        start = max(total_bytes - suffix_bytes, 0)
+        end = total_bytes - 1
+    else:
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else total_bytes - 1
+        if start >= total_bytes or start > end:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{total_bytes}"},
+            )
+        end = min(end, total_bytes - 1)
+
+    return Response(
+        content=video_data[start:end + 1],
+        status_code=206,
+        media_type=video["content_type"],
+        headers={
+            **headers,
+            "Content-Range": f"bytes {start}-{end}/{total_bytes}",
+        },
+    )
+
+
 def list_seller_documents(request: Request):
     require_admin(request)
     with db_connection() as connection:
@@ -6966,6 +8949,25 @@ def list_seller_documents(request: Request):
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def delete_product_video(product_id: str, video_id: str, request: Request):
+    seller = require_seller(request)
+    with db_connection() as connection:
+        product = connection.execute(
+            "SELECT seller_id FROM products WHERE id = ?",
+            (product_id,),
+        ).fetchone()
+        if product is None or product["seller_id"] != seller["id"]:
+            raise HTTPException(status_code=404, detail="Bidhaa haikupatikana.")
+        deleted = connection.execute(
+            "DELETE FROM product_videos WHERE product_id = ? AND id = ?",
+            (product_id, video_id),
+        )
+        if deleted.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Video haikupatikana.")
+    invalidate_public_product_lists()
+    return {"product_id": product_id, "video_id": video_id}
 
 
 def read_product_image(product_id: str):
@@ -6991,7 +8993,7 @@ def delete_product_image(product_id: str, request: Request):
     image_url = f"/api/products/{product_id}/image"
     with db_connection() as connection:
         product = connection.execute(
-            "SELECT seller_id FROM products WHERE id = ?",
+            "SELECT seller_id, image_url FROM products WHERE id = ?",
             (product_id,),
         ).fetchone()
         if product is None or product["seller_id"] != seller["id"]:
@@ -7000,23 +9002,30 @@ def delete_product_image(product_id: str, request: Request):
             "DELETE FROM product_images WHERE product_id = ?",
             (product_id,),
         )
-        connection.execute(
-            "UPDATE products SET image_url = '' WHERE id = ? AND image_url = ?",
-            (product_id, image_url),
-        )
+        if product["image_url"] and not product["image_url"].startswith(
+            f"/api/products/{product_id}/gallery/"
+        ):
+            connection.execute(
+                "UPDATE products SET image_url = '' WHERE id = ?",
+                (product_id,),
+            )
     record_audit("PRODUCT_IMAGE_DELETED", "product", product_id, actor=seller, request=request)
+    invalidate_public_product_lists()
     return {"product_id": product_id, "image_url": ""}
 
 
 async def create_checkout(product_id: str, payload: CheckoutInput, request: Request):
     demo_mode = is_demo_mode()
     sandbox_mode = validate_pesapal_sandbox_configuration()
-    if not demo_mode and not clickpesa_live_enabled():
+    abliner_mode = payload.payment_method == ABLINER_PAYMENT_METHOD
+    if abliner_mode:
+        require_abliner_live()
+    elif not demo_mode and not clickpesa_live_enabled():
         raise HTTPException(
             status_code=503,
             detail="Malipo ya ClickPesa hayajaanzishwa au hayajakamilisha mipangilio salama.",
         )
-    if not demo_mode and payload.payment_method not in {
+    if not demo_mode and not sandbox_mode and not abliner_mode and payload.payment_method not in {
         "M-Pesa",
         "Halo Pesa",
         "Tigo Pesa",
@@ -7061,16 +9070,34 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                 "sandbox": order["payment_method"] == "PesaPal Sandbox",
             }
 
+    demo_order = demo_mode and not sandbox_mode and not abliner_mode
     order_id = (
-        "TEST" if sandbox_mode else "DEMO" if demo_mode else "ORD"
+        "TEST" if sandbox_mode else "DEMO" if demo_order else "ORD"
     ) + secrets.token_hex(10).upper()
     provider_reference = (
         "LR" + secrets.token_hex(9).upper()
-        if sandbox_mode or not demo_mode
+        if sandbox_mode or not demo_order
         else ""
     )
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
+    buyer_email = checkout_buyer_email(payload, buyer)
+    with db_connection() as connection:
+        variant = validate_variant_selection(
+            connection,
+            product,
+            payload.variant_id,
+            1,
+        )
+        coupon_code, coupon_discount = coupon_discount_for_checkout(
+            connection,
+            payload.coupon_code,
+            product["amount"],
+            buyer_id,
+            buyer_email,
+            demo_checkout=demo_order,
+        )
+    amount = product["amount"] - coupon_discount
     try:
         with db_connection() as connection:
             tracking_code = generate_tracking_code(connection)
@@ -7080,21 +9107,22 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     (order_id, request_key, product_id, seller_id, amount,
                      buyer_name, buyer_email, buyer_phone, buyer_id,
                      payment_method, bank_branch, delivery_address, provider_reference,
-                     product_cost, expires_at, tracking_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     product_cost, expires_at, tracking_code, coupon_code, coupon_discount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
                     payload.request_key,
                     product_id,
                     product["seller_id"],
-                    product["amount"],
+                    amount,
                     payload.buyer_name.strip(),
-                    payload.buyer_email,
+                    buyer_email,
                     payload.buyer_phone,
                     buyer_id,
-                    "PesaPal Sandbox"
-                    if sandbox_mode
+                    ABLINER_PAYMENT_METHOD
+                    if abliner_mode
+                    else "PesaPal Sandbox" if sandbox_mode
                     else payload.payment_method if demo_mode else "ClickPesa USSD Push",
                     payload.bank_branch or "",
                     payload.delivery_address.strip(),
@@ -7102,6 +9130,8 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
                     product["cost_amount"],
                     time.time() + ORDER_TTL_SECONDS,
                     tracking_code,
+                    coupon_code,
+                    coupon_discount,
                 ),
             )
             connection.execute(
@@ -7115,10 +9145,28 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
             connection.execute(
                 """
                 INSERT INTO order_items
-                    (order_id, product_id, quantity, unit_amount, unit_cost)
-                VALUES (?, ?, 1, ?, ?)
+                    (order_id, product_id, quantity, unit_amount, unit_cost,
+                     variant_id, variant_label)
+                VALUES (?, ?, 1, ?, ?, ?, ?)
                 """,
-                (order_id, product_id, product["amount"], product["cost_amount"]),
+                (
+                    order_id,
+                    product_id,
+                    product["amount"],
+                    product["cost_amount"],
+                    variant["variant_id"],
+                    variant["variant_label"],
+                ),
+            )
+            schedule_abandoned_checkout_reminder(
+                connection,
+                "ORDER",
+                order_id,
+                buyer_email,
+                payload.buyer_name,
+                amount,
+                product_id=product_id,
+                consent=payload.abandoned_checkout_consent,
             )
     except Exception as error:
         if is_integrity_error(error):
@@ -7142,7 +9190,7 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
     checkout_url = f"{app_url}/pay/{quote(product_id)}?order_id={quote(order_id)}"
     if sandbox_mode:
         checkout_url += "&sandbox=1"
-    elif demo_mode:
+    elif demo_order:
         checkout_url += "&demo=1"
     with db_connection() as connection:
         connection.execute(
@@ -7154,7 +9202,7 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
     if sandbox_mode:
         payment_status, payment_url = await begin_pesapal_payment(
             provider_reference,
-            product["amount"],
+            amount,
             f"LipaRahisi: {product['name']}",
             f"{app_url}/api/callbacks/pesapal",
             checkout_url,
@@ -7162,31 +9210,44 @@ async def create_checkout(product_id: str, payload: CheckoutInput, request: Requ
             payload.buyer_email,
             payload.buyer_phone,
         )
+    elif abliner_mode:
+        payment_status = await begin_abliner_payment(
+            provider_reference,
+            payload.buyer_phone,
+            amount,
+            f"{app_url}/api/webhooks/abliner",
+        )
     elif not demo_mode:
         payment_status = await begin_clickpesa_payment(
             provider_reference,
             payload.buyer_phone,
-            product["amount"],
+            amount,
         )
     return {
         "order_id": order_id,
         "checkout_url": checkout_url,
         "payment_url": payment_url,
         "payment_status": payment_status,
-        "demo": demo_mode and not sandbox_mode,
+        "demo": demo_order,
         "sandbox": sandbox_mode,
+        "amount": amount,
+        "coupon_code": coupon_code,
+        "coupon_discount": coupon_discount,
     }
 
 
 async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     demo_mode = is_demo_mode()
     sandbox_mode = validate_pesapal_sandbox_configuration()
-    if not demo_mode and not clickpesa_live_enabled():
+    abliner_mode = payload.payment_method == ABLINER_PAYMENT_METHOD
+    if abliner_mode:
+        require_abliner_live()
+    elif not demo_mode and not clickpesa_live_enabled():
         raise HTTPException(
             status_code=503,
             detail="Malipo ya ClickPesa hayajaanzishwa au hayajakamilisha mipangilio salama.",
         )
-    if not demo_mode and payload.payment_method not in {
+    if not demo_mode and not sandbox_mode and not abliner_mode and payload.payment_method not in {
         "M-Pesa",
         "Halo Pesa",
         "Tigo Pesa",
@@ -7202,8 +9263,16 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
     merged = {}
     buyer = optional_current_user(request)
     buyer_id = buyer["id"] if buyer and buyer["role"] == "BUYER" else None
+    buyer_email = checkout_buyer_email(payload, buyer)
     with db_connection() as connection:
+        seen_product_ids = set()
         for item in payload.items:
+            if item.product_id in seen_product_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Kila bidhaa iwe mara moja tu kwenye kikapu; chagua variant moja.",
+                )
+            seen_product_ids.add(item.product_id)
             product = connection.execute(
                 """
                 SELECT p.id, p.name, p.amount, p.cost_amount, p.stock_quantity, p.seller_id,
@@ -7220,6 +9289,16 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     status_code=409,
                     detail=f"Stock ya {product['name']} haitoshi; inabaki {product['stock_quantity']}.",
                 )
+            variant = validate_variant_selection(
+                connection,
+                product,
+                item.variant_id,
+                item.quantity,
+            )
+            product = {
+                **dict(product),
+                **variant,
+            }
             seller_id = product["seller_id"]
             merged.setdefault(seller_id, []).append(
                 (product, item.quantity)
@@ -7231,20 +9310,44 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         if existing:
             return get_cart_checkout(existing["checkout_id"], request)
 
+        seller_subtotals = [
+            (
+                seller_id,
+                sum(product["amount"] * quantity for product, quantity in seller_items),
+            )
+            for seller_id, seller_items in merged.items()
+        ]
+        subtotal = sum(amount for _seller_id, amount in seller_subtotals)
+        coupon_code, total_coupon_discount = coupon_discount_for_checkout(
+            connection,
+            payload.coupon_code,
+            subtotal,
+            buyer_id,
+            buyer_email,
+            minimum_total=len(seller_subtotals),
+            demo_checkout=demo_mode and not sandbox_mode and not abliner_mode,
+        )
+        coupon_allocations = allocate_coupon_discount(
+            total_coupon_discount,
+            seller_subtotals,
+        ) if total_coupon_discount else {}
         checkout_id = "CART" + secrets.token_hex(16).upper()
+        demo_order = demo_mode and not sandbox_mode and not abliner_mode
         provider_reference = (
             "LR" + secrets.token_hex(9).upper()
-            if sandbox_mode or not demo_mode
+            if sandbox_mode or not demo_order
             else ""
         )
         expires_at = time.time() + ORDER_TTL_SECONDS
         order_ids = []
         for seller_index, (seller_id, seller_items) in enumerate(merged.items()):
-            order_id = (
-                "TEST" if sandbox_mode else "DEMO" if demo_mode else "ORD"
-            ) + secrets.token_hex(10).upper()
+            order_id = ("TEST" if sandbox_mode else "DEMO" if demo_order else "ORD") + secrets.token_hex(10).upper()
             tracking_code = generate_tracking_code(connection)
-            amount = sum(product["amount"] * quantity for product, quantity in seller_items)
+            seller_subtotal = sum(
+                product["amount"] * quantity for product, quantity in seller_items
+            )
+            coupon_discount = coupon_allocations.get(seller_id, 0)
+            amount = seller_subtotal - coupon_discount
             product_cost = sum(product["cost_amount"] * quantity for product, quantity in seller_items)
             fee = 0 if sandbox_mode else commission_amount(amount)
             payout = 0 if sandbox_mode else amount - fee
@@ -7257,8 +9360,9 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                      buyer_name, buyer_email, buyer_phone, buyer_id,
                      payment_method, bank_branch, delivery_address, provider_reference,
                      product_cost, platform_fee, seller_payout, net_profit,
-                      checkout_id, cart_request_key, expires_at, tracking_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     checkout_id, cart_request_key, expires_at, tracking_code,
+                     coupon_code, coupon_discount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -7267,11 +9371,12 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     seller_id,
                     amount,
                     payload.buyer_name.strip(),
-                    payload.buyer_email,
+                    buyer_email,
                     payload.buyer_phone,
                     buyer_id,
-                    "PesaPal Sandbox"
-                    if sandbox_mode
+                    ABLINER_PAYMENT_METHOD
+                    if abliner_mode
+                    else "PesaPal Sandbox" if sandbox_mode
                     else payload.payment_method if demo_mode else "ClickPesa USSD Push",
                     payload.bank_branch or "",
                     payload.delivery_address.strip(),
@@ -7284,6 +9389,8 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     payload.request_key,
                     expires_at,
                     tracking_code,
+                    coupon_code,
+                    coupon_discount,
                 ),
             )
             connection.execute(
@@ -7298,8 +9405,9 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                 connection.execute(
                     """
                     INSERT INTO order_items
-                        (order_id, product_id, quantity, unit_amount, unit_cost)
-                    VALUES (?, ?, ?, ?, ?)
+                        (order_id, product_id, quantity, unit_amount, unit_cost,
+                         variant_id, variant_label)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_id,
@@ -7307,14 +9415,27 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                         quantity,
                         product["amount"],
                         product["cost_amount"],
+                        product["variant_id"],
+                        product["variant_label"],
                     ),
                 )
             order_ids.append(order_id)
+        schedule_abandoned_checkout_reminder(
+            connection,
+            "CART",
+            checkout_id,
+            buyer_email,
+            payload.buyer_name,
+            subtotal - total_coupon_discount,
+            consent=payload.abandoned_checkout_consent,
+        )
 
     app_url = public_app_url(str(request.base_url))
     checkout_url = f"{app_url}/cart/{quote(checkout_id)}"
     if sandbox_mode:
         checkout_url += "?sandbox=1"
+    elif demo_order:
+        checkout_url += "?demo=1"
     with db_connection() as connection:
         connection.execute(
             "UPDATE orders SET checkout_url = ? WHERE checkout_id = ?",
@@ -7322,11 +9443,8 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         )
     payment_status = "PENDING"
     payment_url = None
+    total_amount = subtotal - total_coupon_discount
     if sandbox_mode:
-        total_amount = sum(
-            sum(product["amount"] * quantity for product, quantity in seller_items)
-            for seller_items in merged.values()
-        )
         payment_status, payment_url = await begin_pesapal_payment(
             provider_reference,
             total_amount,
@@ -7351,11 +9469,14 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
                     """,
                     (payment_url, payment_id, checkout_id),
                 )
-    elif not demo_mode:
-        total_amount = sum(
-            sum(product["amount"] * quantity for product, quantity in seller_items)
-            for seller_items in merged.values()
+    elif abliner_mode:
+        payment_status = await begin_abliner_payment(
+            provider_reference,
+            payload.buyer_phone,
+            total_amount,
+            f"{app_url}/api/webhooks/abliner",
         )
+    elif not demo_mode:
         payment_status = await begin_clickpesa_payment(
             provider_reference,
             payload.buyer_phone,
@@ -7367,8 +9488,11 @@ async def create_cart_checkout(payload: CartCheckoutInput, request: Request):
         "payment_url": payment_url,
         "order_ids": order_ids,
         "payment_status": payment_status,
-        "demo": demo_mode and not sandbox_mode,
+        "demo": demo_order,
         "sandbox": sandbox_mode,
+        "total_amount": total_amount,
+        "coupon_code": coupon_code,
+        "coupon_discount": total_coupon_discount,
     }
 
 
@@ -7392,7 +9516,7 @@ def get_cart_checkout(checkout_id: str, request: Request):
         with db_connection() as connection:
             items = connection.execute(
                 """
-                SELECT oi.product_id, oi.quantity, oi.unit_amount,
+                SELECT oi.product_id, oi.quantity, oi.unit_amount, oi.variant_label,
                        p.name AS product_name
                 FROM order_items oi JOIN products p ON p.id = oi.product_id
                 WHERE oi.order_id = ?
@@ -7424,6 +9548,8 @@ def get_cart_checkout(checkout_id: str, request: Request):
         else None,
         "commission_percent": COMMISSION_PERCENT,
         "total_amount": sum(split["amount"] for split in splits),
+        "coupon_code": orders[0]["coupon_code"] or "",
+        "coupon_discount": sum(order["coupon_discount"] for order in orders),
         "platform_fee": sum(split["platform_fee"] for split in splits),
         "completed_at": next((row["completed_at"] for row in orders if row["completed_at"]), None),
         "splits": splits,
@@ -7468,14 +9594,25 @@ def order_status(order_id: str, request: Request):
     order = get_order(order_id)
     with db_connection() as connection:
         product = connection.execute(
-            "SELECT name FROM products WHERE id = ?",
-            (order["product_id"],),
+            """
+            SELECT p.name, oi.variant_label,
+                   rr.status AS return_status, rr.reason AS return_reason,
+                   cr.status AS cancellation_status
+            FROM products p
+            LEFT JOIN order_items oi
+              ON oi.product_id = p.id AND oi.order_id = ?
+            LEFT JOIN return_requests rr ON rr.order_id = ?
+            LEFT JOIN cancellation_requests cr ON cr.order_id = ?
+            WHERE p.id = ?
+            """,
+            (order_id, order_id, order_id, order["product_id"]),
         ).fetchone()
     result = {
         "order_id": order_id,
         "payment_status": order["payment_status"],
         "amount": order["amount"],
         "product_name": product["name"] if product else "Bidhaa",
+        "variant_label": product["variant_label"] if product else "",
         "payment_method": order["payment_method"],
         "completed_at": order["completed_at"],
         "platform_fee": order["platform_fee"],
@@ -7484,6 +9621,8 @@ def order_status(order_id: str, request: Request):
         "demo": not bool(order["provider_reference"]),
         "sandbox": order["payment_method"] == "PesaPal Sandbox",
         "payment_url": stored_pesapal_payment_url(order),
+        "coupon_code": order["coupon_code"] or "",
+        "coupon_discount": order["coupon_discount"],
     }
     buyer = optional_current_user(request)
     if buyer and buyer["role"] == "BUYER" and buyer["id"] == order["buyer_id"]:
@@ -7492,7 +9631,12 @@ def order_status(order_id: str, request: Request):
             "bank_branch": order["bank_branch"],
             "delivery_address": order["delivery_address"],
             "delivery_status": order["delivery_status"],
+            "delivery_carrier": order["delivery_carrier"],
             "tracking_code": order["tracking_code"],
+            "delivery_fee": order["delivery_fee"],
+            "return_status": product["return_status"] if product else None,
+            "return_reason": product["return_reason"] if product else None,
+            "cancellation_status": product["cancellation_status"] if product else None,
         })
     return result
 
@@ -7503,12 +9647,19 @@ def order_history(request: Request):
         rows = connection.execute(
             """
             SELECT o.order_id, o.product_id, o.amount, o.payment_status,
-                   o.delivery_status, o.tracking_code, o.delivery_address,
+                   o.delivery_status, o.delivery_carrier, o.tracking_code,
+                   o.delivery_fee, o.delivery_address,
                    o.created_at, o.completed_at, p.name AS product_name,
-                   p.image_url, u.shop_name
+                   p.image_url, u.shop_name, oi.variant_label,
+                   rr.status AS return_status, rr.reason AS return_reason,
+                   cr.status AS cancellation_status
             FROM orders o
             JOIN products p ON p.id = o.product_id
             LEFT JOIN users u ON u.id = o.seller_id
+            LEFT JOIN order_items oi
+              ON oi.order_id = o.order_id AND oi.product_id = o.product_id
+            LEFT JOIN return_requests rr ON rr.order_id = o.order_id
+            LEFT JOIN cancellation_requests cr ON cr.order_id = o.order_id
             WHERE o.buyer_id = ? AND o.payment_method != 'PesaPal Sandbox'
             ORDER BY o.created_at DESC
             LIMIT 200
@@ -7576,15 +9727,36 @@ def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Reques
             raise HTTPException(status_code=409, detail="Hatua ya delivery haiwezi kurukwa au kurudishwa nyuma.")
         tracking_code = payload.tracking_code.strip() or order["tracking_code"]
         if not tracking_code:
-                tracking_code = generate_tracking_code(connection)
+            tracking_code = generate_tracking_code(connection)
+        if payload.delivery_status == "SHIPPED":
+            pending_cancellation = connection.execute(
+                """
+                SELECT 1 FROM cancellation_requests
+                WHERE order_id = ? AND status = 'PENDING'
+                """,
+                (order_id,),
+            ).fetchone()
+            if pending_cancellation:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Tatua ombi la kughairi kabla ya kusafirisha oda.",
+                )
         connection.execute(
             """
             UPDATE orders
-            SET delivery_status = ?, tracking_code = ?,
+            SET delivery_status = ?, delivery_carrier = ?, tracking_code = ?,
+                delivery_fee = ?,
                 delivered_at = CASE WHEN ? = 'DELIVERED' THEN CURRENT_TIMESTAMP ELSE delivered_at END
             WHERE order_id = ?
             """,
-                (next_status, tracking_code, next_status, order_id),
+            (
+                next_status,
+                payload.delivery_carrier.strip(),
+                tracking_code,
+                payload.delivery_fee,
+                next_status,
+                order_id,
+            ),
         )
         connection.execute(
                 """
@@ -7612,6 +9784,7 @@ def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Reques
         "order",
         order_id,
         next_status,
+        f"status={next_status}; carrier={payload.delivery_carrier.strip()}; fee={payload.delivery_fee}",
         actor=actor,
         request=request,
     )
@@ -7634,6 +9807,8 @@ def update_delivery(order_id: str, payload: DeliveryUpdateInput, request: Reques
         "order_id": order_id,
         "delivery_status": next_status,
         "tracking_code": tracking_code,
+        "delivery_carrier": payload.delivery_carrier.strip(),
+        "delivery_fee": payload.delivery_fee,
     }
 
 
@@ -8236,9 +10411,14 @@ def accept_delivery(order_id: str, request: Request):
 def request_cancellation(order_id: str, payload: CancellationInput, request: Request):
     buyer = require_buyer(request)
     with db_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET order_id = order_id WHERE order_id = ? AND buyer_id = ?",
+            (order_id, buyer["id"]),
+        )
         order = connection.execute(
             """
-            SELECT buyer_id, seller_id, payment_status, cancelled_at, payment_method
+            SELECT buyer_id, seller_id, payment_status, delivery_status,
+                   cancelled_at, payment_method
             FROM orders WHERE order_id = ?
             """,
             (order_id,),
@@ -8247,8 +10427,24 @@ def request_cancellation(order_id: str, payload: CancellationInput, request: Req
             raise HTTPException(status_code=404, detail="Oda haikupatikana.")
         if order["payment_method"] == "PesaPal Sandbox":
             raise HTTPException(status_code=409, detail="Oda ya sandbox haiwezi kuombewa kughairiwa.")
-        if order["cancelled_at"] or order["payment_status"] not in {"PENDING", "COMPLETED"}:
+        if (
+            order["cancelled_at"]
+            or order["payment_status"] not in {"PENDING", "COMPLETED"}
+            or order["delivery_status"] not in {
+                "UNFULFILLED", "PROCESSING", "ORDER_CONFIRMED",
+                "SELLER_PREPARING", "READY_FOR_PICKUP", "AGENT_ASSIGNED",
+            }
+        ):
             raise HTTPException(status_code=409, detail="Oda hii haiwezi kuombewa kughairiwa.")
+        return_request = connection.execute(
+            "SELECT status FROM return_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if return_request and return_request["status"] in {"PENDING", "APPROVED"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Oda hii ina ombi la kurejesha linalosubiri au limeidhinishwa.",
+            )
         existing = connection.execute(
             "SELECT status FROM cancellation_requests WHERE order_id = ?",
             (order_id,),
@@ -8298,7 +10494,7 @@ def resolve_cancellation(
         cancellation = connection.execute(
             """
             SELECT c.order_id, c.status, o.payment_status, o.product_id,
-                   o.seller_id
+                   o.seller_id, o.checkout_id, o.delivery_status
             FROM cancellation_requests c
             JOIN orders o ON o.order_id = c.order_id
             WHERE c.id = ?
@@ -8310,15 +10506,36 @@ def resolve_cancellation(
         if cancellation["status"] != "PENDING":
             raise HTTPException(status_code=409, detail="Ombi hili limeshughulikiwa tayari.")
         if payload.status == "APPROVED":
+            if cancellation["delivery_status"] in {"SHIPPED", "DELIVERED"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Oda imeshasafirishwa; shughulikia ombi la marejesho badala ya kughairi.",
+                )
             if cancellation["payment_status"] == "COMPLETED":
                 if not is_demo_mode():
                     raise HTTPException(status_code=409, detail="Refund ya malipo halisi haijaunganishwa.")
                 items = connection.execute(
-                    "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                    """
+                    SELECT product_id, quantity, variant_id
+                    FROM order_items WHERE order_id = ?
+                    """,
                     (cancellation["order_id"],),
                 ).fetchall()
                 if items:
                     for item in items:
+                        if item["variant_id"]:
+                            connection.execute(
+                                """
+                                UPDATE product_variants
+                                SET stock_quantity = stock_quantity + ?
+                                WHERE id = ? AND product_id = ?
+                                """,
+                                (
+                                    item["quantity"],
+                                    item["variant_id"],
+                                    item["product_id"],
+                                ),
+                            )
                         connection.execute(
                             "UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?",
                             (item["quantity"], item["product_id"]),
@@ -8352,6 +10569,7 @@ def resolve_cancellation(
                 """,
                 (cancellation["order_id"],),
             )
+            cancel_checkout_reminders_for_order(connection, dict(cancellation))
         connection.execute(
             """
             UPDATE cancellation_requests
@@ -8387,6 +10605,154 @@ def list_cancellations(request: Request):
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def request_return(order_id: str, payload: ReturnRequestInput, request: Request):
+    buyer = require_buyer(request)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET order_id = order_id WHERE order_id = ? AND buyer_id = ?",
+            (order_id, buyer["id"]),
+        )
+        order = connection.execute(
+            """
+            SELECT payment_status, delivery_status, delivered_at, cancelled_at
+            FROM orders
+            WHERE order_id = ? AND buyer_id = ?
+            """,
+            (order_id, buyer["id"]),
+        ).fetchone()
+        if order is None:
+            raise HTTPException(status_code=404, detail="Oda haikupatikana.")
+        if (
+            order["payment_status"] != "COMPLETED"
+            or order["delivery_status"] != "DELIVERED"
+            or order["cancelled_at"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Ombi la kurejesha linapatikana baada ya oda iliyolipiwa kufikishwa.",
+            )
+        delivered_at = order["delivered_at"]
+        if not delivered_at:
+            raise HTTPException(
+                status_code=409,
+                detail="Muda wa delivery haujarekodiwa; wasiliana na msaada kuhusu ombi la marejesho.",
+            )
+        if isinstance(delivered_at, str):
+            delivered_at = datetime.fromisoformat(
+                delivered_at.replace("Z", "+00:00")
+            )
+        if delivered_at.tzinfo is None:
+            delivered_at = delivered_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > delivered_at + timedelta(
+            seconds=RETURN_REQUEST_WINDOW_SECONDS
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Muda wa siku 7 wa kuomba marejesho umeisha.",
+            )
+        cancellation = connection.execute(
+            "SELECT status FROM cancellation_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if cancellation and cancellation["status"] in {"PENDING", "APPROVED"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Ombi la kughairi oda hii linasubiri au tayari limeidhinishwa.",
+            )
+        if connection.execute(
+            "SELECT 1 FROM return_requests WHERE order_id = ?",
+            (order_id,),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="Ombi la kurejesha oda hii limeshatumwa.")
+        request_id = secrets.token_hex(16)
+        try:
+            connection.execute(
+                """
+                INSERT INTO return_requests (id, order_id, requester_id, reason)
+                VALUES (?, ?, ?, ?)
+                """,
+                (request_id, order_id, buyer["id"], payload.reason.strip()),
+            )
+        except Exception as error:
+            if is_integrity_error(error):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ombi la kurejesha oda hii limeshatumwa.",
+                ) from error
+            raise
+    record_audit(
+        "RETURN_REQUESTED",
+        "order",
+        order_id,
+        payload.reason.strip(),
+        actor=buyer,
+        request=request,
+    )
+    return {"id": request_id, "order_id": order_id, "status": "PENDING"}
+
+
+def list_return_requests(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT r.id, r.order_id, r.reason, r.status, r.admin_note,
+                   r.created_at, o.amount, o.payment_status,
+                   o.delivery_status, u.full_name AS buyer_name,
+                   u.email AS buyer_email
+            FROM return_requests r
+            JOIN orders o ON o.order_id = r.order_id
+            JOIN users u ON u.id = r.requester_id
+            ORDER BY r.created_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resolve_return_request(
+    return_id: str,
+    payload: ReturnResolutionInput,
+    request: Request,
+):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE return_requests
+            SET status = ?, admin_note = ?, resolved_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'PENDING'
+            """,
+            (payload.status, payload.admin_note.strip(), return_id),
+        )
+        if result.rowcount == 0:
+            exists = connection.execute(
+                "SELECT 1 FROM return_requests WHERE id = ?",
+                (return_id,),
+            ).fetchone()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Ombi la kurejesha halikupatikana.")
+            raise HTTPException(status_code=409, detail="Ombi hili limeshughulikiwa tayari.")
+        order_id = connection.execute(
+            "SELECT order_id FROM return_requests WHERE id = ?",
+            (return_id,),
+        ).fetchone()["order_id"]
+    record_audit(
+        "RETURN_REQUEST_RESOLVED",
+        "order",
+        order_id,
+        f"{payload.status}; no payment was transferred",
+        actor=actor,
+        request=request,
+    )
+    return {
+        "id": return_id,
+        "order_id": order_id,
+        "status": payload.status,
+        "refund_issued": False,
+    }
 
 
 def create_review(order_id: str, product_id: str, payload: ReviewInput, request: Request):
@@ -8779,6 +11145,150 @@ def admin_dashboard_summary(request: Request):
     }
 
 
+def list_payout_ledger(request: Request):
+    actor = get_current_user(request)
+    if actor["role"] not in {"ADMIN", "SELLER"}:
+        raise HTTPException(status_code=403, detail="Taarifa za malipo zinapatikana kwa wauzaji na admin pekee.")
+    seller_filter = "WHERE u.role = 'SELLER'"
+    parameters = ()
+    if actor["role"] == "SELLER":
+        seller_filter += " AND u.id = ?"
+        parameters = (actor["id"],)
+    with db_connection() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT u.id AS seller_id, u.full_name AS seller_name, u.shop_name,
+                   COALESCE(earned.total, 0) AS completed_earned,
+                   COALESCE(paid.total, 0) AS recorded_paid
+            FROM users u
+            LEFT JOIN (
+                SELECT seller_id, SUM(seller_payout) AS total
+                FROM orders
+                WHERE payment_status = 'COMPLETED'
+                GROUP BY seller_id
+            ) earned ON earned.seller_id = u.id
+            LEFT JOIN (
+                SELECT seller_id, SUM(amount) AS total
+                FROM seller_payouts
+                GROUP BY seller_id
+            ) paid ON paid.seller_id = u.id
+            {seller_filter}
+            ORDER BY u.shop_name, u.full_name
+            LIMIT 500
+            """,
+            parameters,
+        ).fetchall()
+        entry_query = """
+            SELECT p.id, p.seller_id, p.amount, p.payment_method,
+                   p.payment_reference, p.note, p.created_at,
+                   u.full_name AS seller_name, u.shop_name,
+                   admin.full_name AS recorded_by_name
+            FROM seller_payouts p
+            JOIN users u ON u.id = p.seller_id
+            LEFT JOIN users admin ON admin.id = p.recorded_by
+        """
+        entry_parameters = ()
+        if actor["role"] == "SELLER":
+            entry_query += " WHERE p.seller_id = ?"
+            entry_parameters = (actor["id"],)
+        entry_query += " ORDER BY p.created_at DESC LIMIT 500"
+        entries = connection.execute(entry_query, entry_parameters).fetchall()
+
+    accounts = []
+    for row in rows:
+        account = dict(row)
+        eligible_total = max(0, account["completed_earned"])
+        account["outstanding_amount"] = max(
+            0,
+            eligible_total - account["recorded_paid"],
+        )
+        account["overpaid_amount"] = max(
+            0,
+            account["recorded_paid"] - eligible_total,
+        )
+        accounts.append(account)
+    return {
+        "accounts": accounts,
+        "entries": [dict(row) for row in entries],
+        "automatic_transfers_enabled": False,
+    }
+
+
+def create_manual_payout(payload: PayoutEntryInput, request: Request):
+    actor = require_admin(request)
+    payout_id = secrets.token_hex(16)
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE users SET id = id WHERE id = ? AND role = 'SELLER'",
+            (payload.seller_id,),
+        )
+        seller = connection.execute(
+            "SELECT id FROM users WHERE id = ? AND role = 'SELLER'",
+            (payload.seller_id,),
+        ).fetchone()
+        if seller is None:
+            raise HTTPException(status_code=404, detail="Muuzaji hakupatikana.")
+        completed_earned = connection.execute(
+            """
+            SELECT COALESCE(SUM(seller_payout), 0) AS total
+            FROM orders
+            WHERE seller_id = ? AND payment_status = 'COMPLETED'
+            """,
+            (payload.seller_id,),
+        ).fetchone()["total"]
+        recorded_paid = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM seller_payouts WHERE seller_id = ?",
+            (payload.seller_id,),
+        ).fetchone()["total"]
+        outstanding = max(0, max(0, completed_earned) - recorded_paid)
+        if payload.amount > outstanding:
+            raise HTTPException(
+                status_code=409,
+                detail="Malipo yanazidi salio la muuzaji.",
+            )
+        try:
+            connection.execute(
+                """
+                INSERT INTO seller_payouts
+                    (id, seller_id, amount, payment_method, payment_reference, note, recorded_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payout_id,
+                    payload.seller_id,
+                    payload.amount,
+                    payload.payment_method,
+                    payload.payment_reference,
+                    payload.note.strip(),
+                    actor["id"],
+                ),
+            )
+        except Exception as error:
+            if is_integrity_error(error):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Rejea ya malipo hii tayari imerekodiwa kwa muuzaji.",
+                ) from error
+            raise
+    record_audit(
+        "MANUAL_PAYOUT_RECORDED",
+        "seller_payout",
+        payout_id,
+        f"amount={payload.amount}; method={payload.payment_method}; no transfer initiated",
+        actor=actor,
+        request=request,
+    )
+    return {
+        "id": payout_id,
+        "seller_id": payload.seller_id,
+        "amount": payload.amount,
+        "payment_method": payload.payment_method,
+        "payment_reference": payload.payment_reference,
+        "outstanding_amount": outstanding - payload.amount,
+        "transfer_initiated": False,
+    }
+
+
 def list_sales(
     request: Request,
     start_date: str = "",
@@ -8790,13 +11300,16 @@ def list_sales(
         SELECT o.order_id, o.product_id, o.seller_id, o.amount, o.buyer_name,
                o.buyer_email, o.payment_method, o.payment_status, o.product_cost,
                o.provider_fee, o.platform_fee, o.seller_payout, o.net_profit,
-               o.delivery_address, o.delivery_status, o.tracking_code,
+               o.delivery_address, o.delivery_status, o.delivery_carrier,
+               o.tracking_code, o.delivery_fee,
                o.completed_at, o.archived_at,
                o.created_at, p.name AS product_name,
-               u.shop_name
+               u.shop_name, oi.variant_label
         FROM orders o
         JOIN products p ON p.id = o.product_id
         LEFT JOIN users u ON u.id = o.seller_id
+        LEFT JOIN order_items oi
+          ON oi.order_id = o.order_id AND oi.product_id = o.product_id
     """
     if user["role"] == "ADMIN":
         conditions = ["o.payment_method != 'PesaPal Sandbox'"]
@@ -8900,6 +11413,47 @@ def list_audit(request: Request):
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_system_alerts(request: Request):
+    require_admin(request)
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, alert_type, message, created_at, acknowledged_at
+            FROM system_alerts
+            ORDER BY created_at DESC
+            LIMIT 200
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def acknowledge_system_alert(alert_id: str, request: Request):
+    actor = require_admin(request)
+    with db_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE system_alerts SET acknowledged_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND acknowledged_at IS NULL
+            """,
+            (alert_id,),
+        )
+        if result.rowcount == 0:
+            exists = connection.execute(
+                "SELECT 1 FROM system_alerts WHERE id = ?",
+                (alert_id,),
+            ).fetchone()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Arifa haikupatikana.")
+    record_audit(
+        "SYSTEM_ALERT_ACKNOWLEDGED",
+        "system_alert",
+        alert_id,
+        actor=actor,
+        request=request,
+    )
+    return {"id": alert_id, "acknowledged": True}
 
 
 def export_sales(request: Request):

@@ -8,13 +8,18 @@ from backend.main import (
     ProductInput,
     ProductCsvInput,
     ProductUpdateInput,
+    ProductVariantInput,
+    ProductVariantStockInput,
     StorefrontInput,
     add_to_wishlist,
     archive_product,
     connect_db,
+    add_product_variant,
     create_category,
     create_product,
     delete_product_image,
+    delete_product_video,
+    delete_product_gallery_image,
     export_products,
     import_products,
     list_categories,
@@ -24,11 +29,16 @@ from backend.main import (
     product_inventory_movements,
     read_product,
     read_product_image,
+    read_product_video,
+    read_product_gallery_image,
     read_storefront,
     remove_from_wishlist,
     update_product,
+    update_product_variant_stock,
     update_storefront,
     upload_product_image,
+    upload_product_video,
+    upload_product_gallery,
 )
 
 
@@ -108,6 +118,32 @@ def stock_movements(product_id: str, request: Request):
     return product_inventory_movements(product_id, request)
 
 
+@app.patch(
+    "/products/{product_id}/variants/{variant_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def variant_stock(
+    product_id: str,
+    variant_id: str,
+    payload: ProductVariantStockInput,
+    request: Request,
+):
+    return update_product_variant_stock(product_id, variant_id, payload, request)
+
+
+@app.post(
+    "/products/{product_id}/variants",
+    status_code=201,
+    dependencies=[Depends(verify_gateway_token)],
+)
+def create_variant(
+    product_id: str,
+    payload: ProductVariantInput,
+    request: Request,
+):
+    return add_product_variant(product_id, payload, request)
+
+
 app.add_api_route(
     "/products/{product_id}/image",
     upload_product_image,
@@ -123,6 +159,42 @@ app.add_api_route(
 app.add_api_route(
     "/products/{product_id}/image",
     delete_product_image,
+    methods=["DELETE"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/gallery",
+    upload_product_gallery,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/gallery/{image_id}",
+    read_product_gallery_image,
+    methods=["GET"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/gallery/{image_id}",
+    delete_product_gallery_image,
+    methods=["DELETE"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/videos",
+    upload_product_video,
+    methods=["POST"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/videos/{video_id}",
+    read_product_video,
+    methods=["GET"],
+    dependencies=[Depends(verify_gateway_token)],
+)
+app.add_api_route(
+    "/products/{product_id}/videos/{video_id}",
+    delete_product_video,
     methods=["DELETE"],
     dependencies=[Depends(verify_gateway_token)],
 )

@@ -6,26 +6,44 @@ import { formatDate, formatNumber } from "./translations.js";
 import { useFeedbackState, useNotification } from "./notifications.jsx";
 import { api, validateDocument, validateProductImage } from "./api.js";
 
+const API = "/api";
+const ABLINER_PAYMENT_METHOD = "Abliner Mobile Money";
+const productImageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
+const maxProductImageBytes = 5 * 1024 * 1024;
+const maxProductGalleryImages = 8;
+const productVideoTypes = new Set(["video/mp4", "video/webm"]);
+const maxProductVideoBytes = 20 * 1024 * 1024;
+const maxProductVideos = 3;
+const ablinerNetwork = {
+  value: ABLINER_PAYMENT_METHOD,
+  label: "Abliner Mobile Money",
+  short: "AB",
+  color: "bank",
+};
 const networks = [
-  { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa" },
-  { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo" },
-  { value: "Tigo Pesa", label: "Tigo Pesa", short: "TP", color: "tigo" },
-  { value: "Airtel Money", label: "Airtel Money", short: "AM", color: "airtel" },
-  { value: "NMB", label: "NMB", short: "NB", color: "bank" },
-  { value: "CRDB", label: "CRDB", short: "CR", color: "bank" },
-  { value: "NBC", label: "NBC", short: "NC", color: "bank" },
-  { value: "NMB Branch", label: "Tawi la NMB", short: "NT", color: "bank" },
-  { value: "CRDB Branch", label: "Tawi la CRDB", short: "CT", color: "bank" },
+  { value: "M-Pesa", label: "M-Pesa", short: "MP", color: "mpesa", logo: "/images/payment-networks/mpesa.svg" },
+  { value: "Halo Pesa", label: "Halo Pesa", short: "HP", color: "halo", logo: "/images/payment-networks/halo-pesa.png" },
+  { value: "Tigo Pesa", label: "Mixx by Yas", short: "TP", color: "tigo", logo: "/images/payment-networks/mixx-by-yas.jpg" },
+  { value: "Airtel Money", label: "Airtel Money", short: "AM", color: "airtel", logo: "/images/payment-networks/airtel-money.png" },
+  { value: "NMB", label: "NMB", short: "NB", color: "bank", logo: "/images/payment-networks/nmb.png" },
+  { value: "CRDB", label: "CRDB", short: "CR", color: "bank", logo: "/images/payment-networks/crdb.png" },
+  { value: "NBC", label: "NBC", short: "NC", color: "bank", logo: "/images/payment-networks/nbc.jpg" },
 ];
-const bankBranches = [
-  "Dar es Salaam - Kariakoo",
-  "Dar es Salaam - Posta",
-  "Dar es Salaam - Ubungo",
-  "Mwanza",
-  "Arusha",
-  "Dodoma",
-  "Tawi lingine",
-];
+const clickpesaNetworkValues = new Set(["M-Pesa", "Halo Pesa", "Tigo Pesa", "Airtel Money"]);
+
+function paymentOptionsFor(config) {
+  if (config?.abliner_live_enabled !== true) return networks;
+  const methods = config.demo_mode
+    ? networks
+    : config.live_payments_enabled
+      ? networks.filter((method) => clickpesaNetworkValues.has(method.value))
+      : [];
+  return [...methods, ablinerNetwork];
+}
+
+function paymentMethodLabel(method) {
+  return method === "Tigo Pesa" ? "Mixx by Yas" : method;
+}
 
 function formatMoney(amount, preferredLanguage) {
   let language = "sw";
@@ -137,6 +155,215 @@ async function uploadProductImage(productId, file) {
   });
 }
 
+async function uploadProductGallery(productId, files) {
+  const formData = new FormData();
+  files.forEach((file) => {
+    validateProductImage(file);
+    formData.append("images", file);
+  });
+  return api(`/products/${encodeURIComponent(productId)}/gallery`, {
+    method: "POST",
+    body: formData,
+  });
+}
+
+function validateProductVideo(file) {
+  if (!productVideoTypes.has(file.type)) {
+    throw new Error(translate("Tumia video ya MP4 au WebM."));
+  }
+  if (file.size > maxProductVideoBytes) {
+    throw new Error(translate("Video imezidi ukubwa wa MB 20."));
+  }
+}
+
+async function uploadProductVideo(productId, file) {
+  validateProductVideo(file);
+  const formData = new FormData();
+  formData.append("video", file);
+  return api(`/products/${encodeURIComponent(productId)}/videos`, {
+    method: "POST",
+    body: formData,
+  });
+}
+
+function ProductGallery({ product, className = "", editable = false, onDeleteImage }) {
+  const { language } = useLanguage();
+  const images = product.gallery_images?.length
+    ? product.gallery_images
+    : product.image_url
+      ? [{ id: null, url: product.image_url, primary: true }]
+      : [];
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [expanded, setExpanded] = useState(false);
+  const dragStart = useRef(null);
+  const imageSignature = images.map((image) => `${image.id || ""}:${image.url}`).join("|");
+  const t = (text) => translate(text, language);
+  const multipleImages = images.length > 1;
+  const activeImage = images[activeIndex] || images[0];
+
+  useEffect(() => {
+    setActiveIndex(0);
+    setExpanded(false);
+  }, [product.id, imageSignature]);
+
+  useEffect(() => {
+    if (!expanded) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setExpanded(false);
+    }
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [expanded]);
+
+  if (!activeImage) return null;
+
+  function move(delta) {
+    if (multipleImages) {
+      setActiveIndex((index) => (index + delta + images.length) % images.length);
+    }
+  }
+
+  function startDrag(event) {
+    if (!multipleImages || event.target.closest("button")) return;
+    dragStart.current = event.clientX;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function finishDrag(event) {
+    if (dragStart.current === null) return;
+    const distance = event.clientX - dragStart.current;
+    dragStart.current = null;
+    if (Math.abs(distance) > 30) move(distance > 0 ? -1 : 1);
+  }
+
+  function handleKeyDown(event) {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      move(-1);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      move(1);
+    }
+  }
+
+  function renderFrame(isExpanded = false) {
+    return (
+      <div
+        className={`product-gallery-frame ${multipleImages ? "is-rotatable" : ""} ${isExpanded ? "is-expanded" : ""}`}
+        role="group"
+        aria-label={t("Mionekano ya bidhaa")}
+        tabIndex={multipleImages ? 0 : undefined}
+        onKeyDown={handleKeyDown}
+        onPointerDown={startDrag}
+        onPointerUp={finishDrag}
+        onPointerCancel={() => { dragStart.current = null; }}
+      >
+        <img
+          src={activeImage.url}
+          alt={`${product.name} (${activeIndex + 1}/${images.length})`}
+          draggable="false"
+        />
+        {editable && activeImage.id && onDeleteImage && (
+          <button
+            className="product-gallery-delete"
+            type="button"
+            aria-label={`${t("Ondoa picha hii")} ${activeIndex + 1}`}
+            onClick={() => onDeleteImage(product.id, activeImage.id)}
+          >
+            ×
+          </button>
+        )}
+        {multipleImages && (
+          <>
+            <button
+              className="product-gallery-arrow previous"
+              type="button"
+              aria-label={t("Picha iliyotangulia")}
+              onClick={() => move(-1)}
+            >
+              ‹
+            </button>
+            <span className="product-gallery-count" aria-live="polite">
+              {activeIndex + 1}/{images.length}
+            </span>
+            <button
+              className="product-gallery-arrow next"
+              type="button"
+              aria-label={t("Picha inayofuata")}
+              onClick={() => move(1)}
+            >
+              ›
+            </button>
+          </>
+        )}
+        {isExpanded ? (
+          <button
+            className="product-gallery-close"
+            type="button"
+            aria-label={t("Funga picha kubwa")}
+            onClick={() => setExpanded(false)}
+          >
+            ×
+          </button>
+        ) : (
+          <button
+            className="product-gallery-expand"
+            type="button"
+            aria-label={t("Fungua picha kubwa")}
+            onClick={() => setExpanded(true)}
+          >
+            ⤢
+          </button>
+        )}
+        {multipleImages && (
+          <div className="product-gallery-dots" aria-label={t("Chagua pembe ya bidhaa")}>
+            {images.map((image, index) => (
+              <button
+                key={image.id || image.url}
+                type="button"
+                className={index === activeIndex ? "active" : ""}
+                aria-label={`${t("Pembe")} ${index + 1}`}
+                aria-current={index === activeIndex ? "true" : undefined}
+                onClick={() => setActiveIndex(index)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`product-gallery ${className}`}>
+      {renderFrame()}
+      {multipleImages && (
+        <p className="product-gallery-hint">{t("Buruta picha kushoto au kulia ili kuzungusha bidhaa.")}</p>
+      )}
+      {expanded && (
+        <div className="product-gallery-backdrop" onClick={() => setExpanded(false)}>
+          <div
+            className="product-gallery-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${product.name} — ${t("Mionekano ya bidhaa")}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {renderFrame(true)}
+            {multipleImages && (
+              <p className="product-gallery-hint">{t("Buruta picha kushoto au kulia ili kuzungusha bidhaa.")}</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Header({ label = "Demo", user, onLogout }) {
   const { language, setLanguage } = useLanguage();
   const localize = useLocalize();
@@ -175,7 +402,7 @@ function Header({ label = "Demo", user, onLogout }) {
             className="logout-button"
             type="button"
             onClick={onLogout}
-            aria-label={`Toka kwenye akaunti ya ${user.full_name}`}
+            aria-label={`${translate("Toka kwenye akaunti ya", language)} ${user.full_name}`}
             key="logout"
           >
             Toka<span className="logout-name" key="logout-name"> ({user.full_name})</span>
@@ -364,10 +591,34 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
   );
 }
 
-function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArchive }) {
+function ProductTile({
+  product,
+  onArchive,
+  onUploadImage,
+  onUploadGallery,
+  onUploadVideos,
+  onDeleteImage,
+  onDeleteGalleryImage,
+  onDeleteVideo,
+  onAddVariant,
+  onUpdateVariantStock,
+  canArchive,
+}) {
   const localize = useLocalize();
+  const { language } = useLanguage();
   const [qr, setQr] = useState("");
+  const [variantStocks, setVariantStocks] = useState({});
+  const [newVariantLabel, setNewVariantLabel] = useState("");
+  const [newVariantStock, setNewVariantStock] = useState(String(product.stock_quantity ?? 0));
   const barcodeRef = useRef(null);
+  useEffect(() => {
+    setVariantStocks(Object.fromEntries(
+      (product.variants || []).map((variant) => [variant.id, String(variant.stock_quantity)]),
+    ));
+    setNewVariantStock(product.variants?.length ? "0" : String(product.stock_quantity ?? 0));
+    setNewVariantLabel("");
+  }, [product.id, product.variants]);
+
   useEffect(() => {
     let active = true;
     QRCode.toDataURL(product.qr_url, {
@@ -412,16 +663,113 @@ function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArch
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
 
+  async function submitNewVariant(event) {
+    event.preventDefault();
+    const added = await onAddVariant(product.id, newVariantLabel, Number(newVariantStock));
+    if (added) {
+      setNewVariantLabel("");
+      setNewVariantStock("0");
+    }
+  }
+
   return localize(
     <article className={`product-tile ${product.is_active ? "" : "product-inactive"}`}>
-      {product.image_url && <img className="product-card-image" src={product.image_url} alt="" loading="lazy" />}
-      {qr ? <img className="product-qr" src={qr} alt={`QR ya ${product.name}`} /> : <div className="product-qr qr-placeholder" />}
+      <ProductGallery
+        product={product}
+        className="product-card-gallery"
+        editable={canArchive}
+        onDeleteImage={onDeleteGalleryImage}
+      />
+      {product.videos?.length > 0 && (
+        <div className="seller-product-videos">
+          {product.videos.map((video) => (
+            <div className="seller-product-video" key={video.id}>
+              <video controls preload="metadata" playsInline src={video.url} />
+              {canArchive && (
+                <button
+                  className="table-action"
+                  type="button"
+                  onClick={() => onDeleteVideo(product.id, video.id)}
+                >
+                  {translate("Ondoa video", language)}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {qr ? <img className="product-qr" src={qr} alt={`${translate("QR ya", language)} ${product.name}`} /> : <div className="product-qr qr-placeholder" />}
       <div className="product-tile-details">
         <strong>{product.name}</strong>
         {product.category && <small>{product.category}</small>}
         {product.description && <small>{product.description}</small>}
         <span>TZS {formatMoney(product.amount)}</span>
         <small>Stock: {product.stock_quantity ?? 0}</small>
+        {(product.variants?.length > 0 || canArchive) && (
+          <div className="variant-stock-list">
+            <strong>Stock kwa variant</strong>
+            {!product.variants?.length && (
+              <small>Stock ya kawaida itakuwa stock ya variant mpya.</small>
+            )}
+            {(product.variants || []).map((variant) => (
+              <div className="variant-stock-row" key={variant.id}>
+                <span>{variant.label}: {variant.stock_quantity}</span>
+                {canArchive && (
+                  <>
+                    <input
+                      className="text-input"
+                      type="number"
+                      min="0"
+                      max="999999999"
+                      aria-label={`${translate("Stock kwa variant", language)} ${variant.label}`}
+                      value={variantStocks[variant.id] ?? String(variant.stock_quantity)}
+                      onChange={(event) => setVariantStocks((current) => ({
+                        ...current,
+                        [variant.id]: event.target.value,
+                      }))}
+                    />
+                    <button
+                      className="table-action"
+                      type="button"
+                      disabled={!Number.isInteger(Number(variantStocks[variant.id] ?? variant.stock_quantity))}
+                      onClick={() => onUpdateVariantStock(
+                        product.id,
+                        variant.id,
+                        Number(variantStocks[variant.id] ?? variant.stock_quantity),
+                      )}
+                    >
+                      Hifadhi stock
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+            {canArchive && (
+              <form className="variant-stock-row" onSubmit={submitNewVariant}>
+                <input
+                  className="text-input"
+                  aria-label={translate("Variant", language)}
+                  placeholder={translate("Mfano: Rangi nyeusi / Size M", language)}
+                  maxLength={80}
+                  required
+                  value={newVariantLabel}
+                  onChange={(event) => setNewVariantLabel(event.target.value)}
+                />
+                <input
+                  className="text-input"
+                  type="number"
+                  min="0"
+                  max="999999999"
+                  aria-label={translate("Stock kwa variant", language)}
+                  required
+                  value={newVariantStock}
+                  onChange={(event) => setNewVariantStock(event.target.value)}
+                />
+                <button className="table-action" type="submit">Ongeza variant</button>
+              </form>
+            )}
+          </div>
+        )}
         {product.shop_name && <small>{product.shop_name}</small>}
         {!product.is_active && <small className="muted-status">Imeondolewa</small>}
         <div className="product-tile-actions">
@@ -433,7 +781,7 @@ function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArch
               <input
                 type="file"
                 accept="image/jpeg,image/png,image/webp"
-                aria-label={`Pakia picha ya ${product.name}`}
+                aria-label={`${translate("Pakia picha ya", language)} ${product.name}`}
                 hidden
                 onChange={(event) => {
                   const [file] = event.target.files || [];
@@ -443,11 +791,48 @@ function ProductTile({ product, onArchive, onUploadImage, onDeleteImage, canArch
               />
             </label>
           )}
-          {canArchive && product.image_url && <button type="button" onClick={() => onDeleteImage(product.id)}>Ondoa picha</button>}
+          {canArchive && (
+            <label className="table-action">
+              Ongeza pembe za picha
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                aria-label="Ongeza pembe za picha"
+                multiple
+                hidden
+                onChange={(event) => {
+                  const files = Array.from(event.target.files || []);
+                  if (files.length) onUploadGallery(product.id, files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          )}
+          {canArchive && (
+            <label className={`table-action ${product.videos?.length >= maxProductVideos ? "is-disabled" : ""}`}>
+              {translate("Pakia video", language)} ({product.videos?.length || 0}/{maxProductVideos})
+              <input
+                type="file"
+                accept="video/mp4,video/webm"
+                aria-label={`${translate("Pakia video", language)} ${product.name}`}
+                multiple
+                hidden
+                disabled={(product.videos?.length || 0) >= maxProductVideos}
+                onChange={(event) => {
+                  const files = Array.from(event.target.files || []);
+                  if (files.length) onUploadVideos(product.id, files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          )}
+          {canArchive && product.image_url && !product.image_url.includes("/gallery/") && (
+            <button type="button" onClick={() => onDeleteImage(product.id)}>Ondoa picha kuu</button>
+          )}
           {canArchive && product.is_active && <button type="button" onClick={() => onArchive(product.id)}>Ondoa</button>}
         </div>
       </div>
-      <svg ref={barcodeRef} className="product-barcode" aria-label={`Barcode ya ${product.name}`} />
+      <svg ref={barcodeRef} className="product-barcode" aria-label={`${translate("Barcode ya", language)} ${product.name}`} />
     </article>
   );
 }
@@ -994,14 +1379,34 @@ function MarketplaceDashboard({ user, onLogout }) {
   const [stockProductId, setStockProductId] = useState("");
   const [stockMovements, setStockMovements] = useState([]);
   const [cancellations, setCancellations] = useState([]);
+  const [returnRequests, setReturnRequests] = useState([]);
+  const [payoutData, setPayoutData] = useState({ accounts: [], entries: [] });
   const [reviews, setReviews] = useState([]);
   const [tickets, setTickets] = useState([]);
+  const [systemAlerts, setSystemAlerts] = useState([]);
+  const [coupons, setCoupons] = useState([]);
+  const [couponForm, setCouponForm] = useState({
+    code: "",
+    discount_type: "PERCENT",
+    discount_value: "10",
+    max_redemptions: "",
+  });
+  const [payoutForm, setPayoutForm] = useState({
+    seller_id: "",
+    amount: "",
+    payment_method: "MOBILE_MONEY",
+    payment_reference: "",
+    note: "",
+  });
   const [productForm, setProductForm] = useState({
     name: "", description: "", image_url: "", category: "", amount: "",
     cost_amount: "", stock_quantity: "", low_stock_threshold: "5",
   });
-  const [productImage, setProductImage] = useState(null);
+  const [productVariants, setProductVariants] = useState([]);
+  const [productImages, setProductImages] = useState([]);
   const productImageInputRef = useRef(null);
+  const [productVideos, setProductVideos] = useState([]);
+  const productVideoInputRef = useRef(null);
   const [productQuery, setProductQuery] = useState("");
   const [salesFilters, setSalesFilters] = useState({ start_date: "", end_date: "", status: "" });
   const [categoryName, setCategoryName] = useState("");
@@ -1028,14 +1433,16 @@ function MarketplaceDashboard({ user, onLogout }) {
     const salesParams = new URLSearchParams(Object.fromEntries(
       Object.entries(salesFilters).filter(([, value]) => value),
     ));
-    const [dashboard, productRows, salesRows] = await Promise.all([
+    const [dashboard, productRows, salesRows, payouts] = await Promise.all([
       api("/dashboard"),
       api(`/products?q=${encodeURIComponent(productQuery)}`),
       api(`/sales?${salesParams.toString()}`),
+      api("/payouts"),
     ]);
     setStats(dashboard);
     setProducts(productRows);
     setSales(salesRows);
+    setPayoutData(payouts);
     if (!seenSalesRef.current) {
       seenSalesRef.current = new Set(salesRows.map((sale) => sale.order_id));
     }
@@ -1061,9 +1468,25 @@ function MarketplaceDashboard({ user, onLogout }) {
       const securityQuery = new URLSearchParams(
         Object.entries(securityFilters).filter(([, value]) => value),
       );
-      const [sellerRows, cancellationRows, reviewRows, ticketRows, documentRows, health, notificationConfig, kycRows, alertRows, appealRows, dashboardSummary] = await Promise.all([
+      const [
+        sellerRows,
+        cancellationRows,
+        returnRows,
+        reviewRows,
+        ticketRows,
+        documentRows,
+        health,
+        notificationConfig,
+        kycRows,
+        securityAlertRows,
+        appealRows,
+        dashboardSummary,
+        couponRows,
+        systemAlertRows,
+      ] = await Promise.all([
         api("/admin/sellers"),
         api("/admin/cancellations"),
+        api("/admin/returns"),
         api("/admin/reviews"),
         api("/admin/support-tickets"),
         api("/admin/documents"),
@@ -1073,24 +1496,31 @@ function MarketplaceDashboard({ user, onLogout }) {
         api(`/admin/security/alerts?${securityQuery.toString()}`),
         api("/admin/security/appeals"),
         api("/admin/dashboard"),
+        api("/admin/coupons"),
+        api("/admin/system-alerts"),
       ]);
       setSellers(sellerRows);
       setCancellations(cancellationRows);
+      setReturnRequests(returnRows);
       setReviews(reviewRows);
       setTickets(ticketRows);
       setAdminDocuments(documentRows);
       setSystemHealth(health);
       setNotificationSettings(notificationConfig);
       setSellerKycRows(kycRows);
-      setSecurityAlerts(alertRows);
+      setSecurityAlerts(securityAlertRows);
       setSecurityAppeals(appealRows);
       setAdminSummary(dashboardSummary);
+      setCoupons(couponRows);
+      setSystemAlerts(systemAlertRows);
       if (!seenAdminEventsRef.current) {
         seenAdminEventsRef.current = new Set(adminEventKeys([
           ["seller", sellerRows],
           ["cancellation", cancellationRows],
+          ["return", returnRows],
           ["review", reviewRows],
           ["ticket", ticketRows],
+          ["alert", alertRows],
         ]));
       }
     }
@@ -1108,35 +1538,43 @@ function MarketplaceDashboard({ user, onLogout }) {
       inFlight = true;
       try {
         const params = new URLSearchParams(Object.entries(salesFilters).filter(([, value]) => value));
-        const [dashboard, latestSales, adminData] = await Promise.all([
+        const [dashboard, latestSales, payouts, adminData] = await Promise.all([
           api("/dashboard"),
           api(`/sales?${params.toString()}`),
+          api("/payouts"),
           isAdmin ? Promise.all([
             api("/admin/sellers"),
             api("/admin/cancellations"),
+            api("/admin/returns"),
             api("/admin/reviews"),
             api("/admin/support-tickets"),
+            api("/admin/system-alerts"),
           ]) : Promise.resolve(null),
         ]);
         if (active) {
           setStats(dashboard);
           setSales(latestSales);
+          setPayoutData(payouts);
           const knownSales = seenSalesRef.current || new Set();
           const newSales = latestSales.filter((sale) => !knownSales.has(sale.order_id));
           latestSales.forEach((sale) => knownSales.add(sale.order_id));
           seenSalesRef.current = knownSales;
           if (newSales.length) notify("Oda mpya imepokelewa.", "info");
           if (adminData) {
-            const [sellerRows, cancellationRows, reviewRows, ticketRows] = adminData;
+            const [sellerRows, cancellationRows, returnRows, reviewRows, ticketRows, alertRows] = adminData;
             setSellers(sellerRows);
             setCancellations(cancellationRows);
+            setReturnRequests(returnRows);
             setReviews(reviewRows);
             setTickets(ticketRows);
+            setSystemAlerts(alertRows);
             const eventRows = [
               ["seller", sellerRows],
               ["cancellation", cancellationRows],
+              ["return", returnRows],
               ["review", reviewRows],
               ["ticket", ticketRows],
+              ["alert", alertRows],
             ];
             const knownEvents = seenAdminEventsRef.current || new Set(adminEventKeys(eventRows));
             const currentKeys = adminEventKeys(eventRows);
@@ -1173,16 +1611,35 @@ function MarketplaceDashboard({ user, onLogout }) {
       .catch((requestError) => setError(requestError.message));
   }, []);
 
+  function addProductVariant() {
+    setProductVariants((current) => [...current, { label: "", stock_quantity: "0" }]);
+  }
+
+  function updateProductVariant(index, field, value) {
+    setProductVariants((current) => current.map((variant, variantIndex) => (
+      variantIndex === index ? { ...variant, [field]: value } : variant
+    )));
+  }
+
+  function removeProductVariant(index) {
+    setProductVariants((current) => current.filter((_, variantIndex) => variantIndex !== index));
+  }
+
   async function createProduct(event) {
     event.preventDefault();
     setMessage("");
     setError("");
     setBusy(true);
     try {
-      if (productImage && productForm.image_url.trim()) {
-        throw new Error("Chagua kutumia URL au kupakia picha; si vyote kwa pamoja.");
+      const totalImages = productImages.length + Number(Boolean(productForm.image_url.trim()));
+      if (totalImages > maxProductGalleryImages) {
+        throw new Error(`Chagua picha zisizozidi ${maxProductGalleryImages} kwa bidhaa.`);
       }
-      if (productImage) validateProductImage(productImage);
+      productImages.forEach(validateProductImage);
+      if (productVideos.length > maxProductVideos) {
+        throw new Error(translate("Bidhaa inaweza kuwa na video 3 tu.", language));
+      }
+      productVideos.forEach(validateProductVideo);
       const createdProduct = await api("/products", {
         method: "POST",
         body: JSON.stringify({
@@ -1194,23 +1651,45 @@ function MarketplaceDashboard({ user, onLogout }) {
           cost_amount: Number(productForm.cost_amount) || 0,
           stock_quantity: Number(productForm.stock_quantity) || 0,
           low_stock_threshold: Number(productForm.low_stock_threshold) || 0,
+          variants: productVariants.map((variant) => ({
+            label: variant.label.trim(),
+            stock_quantity: Number(variant.stock_quantity) || 0,
+          })),
         }),
       });
       setProductForm({ name: "", description: "", image_url: "", category: "", amount: "", cost_amount: "", stock_quantity: "", low_stock_threshold: "5" });
-      setProductImage(null);
+      setProductVariants([]);
+      setProductImages([]);
+      setProductVideos([]);
       if (productImageInputRef.current) productImageInputRef.current.value = "";
-      if (productImage) {
+      if (productVideoInputRef.current) productVideoInputRef.current.value = "";
+      if (productImages.length) {
         try {
-          await uploadProductImage(createdProduct.id, productImage);
+          await uploadProductGallery(createdProduct.id, productImages);
         } catch (uploadError) {
-          setError(`Bidhaa imehifadhiwa, lakini picha haikupakiwa: ${uploadError.message}`);
+          setError(`Bidhaa imehifadhiwa, lakini picha hazikupakiwa: ${uploadError.message}`);
           await refresh();
           return;
         }
       }
-      setMessage(productImage
-        ? "Bidhaa na picha yake zimehifadhiwa."
-        : "Bidhaa imehifadhiwa. QR na barcode yake vipo kwenye orodha hapa chini.");
+      if (productVideos.length) {
+        try {
+          for (const file of productVideos) {
+            await uploadProductVideo(createdProduct.id, file);
+          }
+        } catch (uploadError) {
+          setError(`Bidhaa imehifadhiwa, lakini video hazikupakiwa: ${uploadError.message}`);
+          await refresh();
+          return;
+        }
+      }
+      setMessage(productImages.length && productVideos.length
+        ? "Bidhaa, picha na video zimehifadhiwa."
+        : productImages.length
+          ? "Bidhaa na picha zake zimehifadhiwa."
+          : productVideos.length
+            ? "Bidhaa na video zimehifadhiwa."
+            : "Bidhaa imehifadhiwa. QR na barcode yake vipo kwenye orodha hapa chini.");
       await refresh();
     } catch (requestError) {
       setError(requestError.message);
@@ -1231,12 +1710,109 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function updateProductVariantStock(productId, variantId, stockQuantity) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/products/${encodeURIComponent(productId)}/variants/${encodeURIComponent(variantId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ stock_quantity: stockQuantity }),
+      });
+      setMessage(translate("Stock ya variant imehifadhiwa.", language));
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function addExistingProductVariant(productId, label, stockQuantity) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/products/${encodeURIComponent(productId)}/variants`, {
+        method: "POST",
+        body: JSON.stringify({ label, stock_quantity: stockQuantity }),
+      });
+      setMessage(translate("Variant imeongezwa.", language));
+      await refresh();
+      return true;
+    } catch (requestError) {
+      setError(requestError.message);
+      return false;
+    }
+  }
+
+  async function uploadExistingProductGallery(productId, files) {
+    setError("");
+    setMessage("");
+    try {
+      await uploadProductGallery(productId, files);
+      setMessage("Picha za pembe za bidhaa zimehifadhiwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function uploadExistingProductVideos(productId, files) {
+    setError("");
+    setMessage("");
+    let uploadedCount = 0;
+    try {
+      files.forEach(validateProductVideo);
+      const currentCount = products.find((product) => product.id === productId)?.videos?.length || 0;
+      if (currentCount + files.length > maxProductVideos) {
+        throw new Error(translate("Bidhaa inaweza kuwa na video 3 tu.", language));
+      }
+      for (const file of files) {
+        await uploadProductVideo(productId, file);
+        uploadedCount += 1;
+      }
+      setMessage(translate("Video zimehifadhiwa.", language));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      if (uploadedCount > 0) {
+        await refresh().catch((refreshError) => setError(refreshError.message));
+      }
+    }
+  }
+
+  async function deleteProductVideo(productId, videoId) {
+    setError("");
+    setMessage("");
+    try {
+      await api(
+        `/products/${encodeURIComponent(productId)}/videos/${encodeURIComponent(videoId)}`,
+        { method: "DELETE" },
+      );
+      setMessage(translate("Video imeondolewa.", language));
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function deleteProductImage(productId) {
     setError("");
     setMessage("");
     try {
       await api(`/products/${encodeURIComponent(productId)}/image`, { method: "DELETE" });
       setMessage("Picha ya bidhaa imeondolewa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function deleteProductGalleryImage(productId, imageId) {
+    setError("");
+    setMessage("");
+    try {
+      await api(`/products/${encodeURIComponent(productId)}/gallery/${encodeURIComponent(imageId)}`, {
+        method: "DELETE",
+      });
+      setMessage("Picha ya pembe ya bidhaa imeondolewa.");
       await refresh();
     } catch (requestError) {
       setError(requestError.message);
@@ -1385,29 +1961,29 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function submitSecurityAppeal(alertId) {
+    const messageText = (appealDrafts[alertId] || "").trim();
+    if (messageText.length < 10) {
+      setError("Andika maelezo ya appeal yenye angalau herufi 10.");
+      return;
+    }
+    try {
+      await api(`/security/alerts/${encodeURIComponent(alertId)}/appeal`, {
+        method: "POST",
+        body: JSON.stringify({ message: messageText }),
+      });
+      setMessage("Appeal imetumwa kwa ukaguzi wa admin.");
+      setAppealDrafts({ ...appealDrafts, [alertId]: "" });
+      setMySecurityAlerts(await api("/security/alerts"));
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function reviewSecurityAppeal(appealId, status) {
     if (securityAppealNote.trim().length < 2) {
       setError("Andika sababu ya uamuzi wa appeal.");
       return;
-    }
-
-    async function submitSecurityAppeal(alertId) {
-      const messageText = (appealDrafts[alertId] || "").trim();
-      if (messageText.length < 10) {
-        setError("Andika maelezo ya appeal yenye angalau herufi 10.");
-        return;
-      }
-      try {
-        await api(`/security/alerts/${encodeURIComponent(alertId)}/appeal`, {
-          method: "POST",
-          body: JSON.stringify({ message: messageText }),
-        });
-        setMessage("Appeal imetumwa kwa ukaguzi wa admin.");
-        setAppealDrafts({ ...appealDrafts, [alertId]: "" });
-        setMySecurityAlerts(await api("/security/alerts"));
-      } catch (requestError) {
-        setError(requestError.message);
-      }
     }
     try {
       await api(`/admin/security/appeals/${encodeURIComponent(appealId)}`, {
@@ -1424,10 +2000,21 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
-  async function updateDelivery(orderId, status, trackingCode) {
+  async function updateDelivery(
+    orderId,
+    status,
+    deliveryCarrier = "",
+    trackingCode = "",
+    deliveryFee = 0,
+  ) {
     await api(`/orders/${encodeURIComponent(orderId)}/delivery`, {
       method: "PUT",
-      body: JSON.stringify({ delivery_status: status, tracking_code: trackingCode }),
+      body: JSON.stringify({
+        delivery_status: status,
+        delivery_carrier: deliveryCarrier,
+        tracking_code: trackingCode,
+        delivery_fee: deliveryFee,
+      }),
     });
     await refresh();
   }
@@ -1643,6 +2230,28 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function resolveReturnRequest(id, status) {
+    try {
+      await api(`/admin/returns/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, admin_note: "" }),
+      });
+      setMessage("Uamuzi wa marejesho umehifadhiwa; hakuna pesa iliyohamishwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function acknowledgeSystemAlert(id) {
+    try {
+      await api(`/admin/system-alerts/${encodeURIComponent(id)}`, { method: "PATCH" });
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function moderateReview(id, status) {
     try {
       await api(`/admin/reviews/${id}`, {
@@ -1656,10 +2265,87 @@ function MarketplaceDashboard({ user, onLogout }) {
     }
   }
 
+  async function createCoupon(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    try {
+      await api("/admin/coupons", {
+        method: "POST",
+        body: JSON.stringify({
+          ...couponForm,
+          discount_value: Number(couponForm.discount_value),
+          max_redemptions: couponForm.max_redemptions
+            ? Number(couponForm.max_redemptions)
+            : null,
+        }),
+      });
+      setCouponForm({
+        code: "",
+        discount_type: "PERCENT",
+        discount_value: "10",
+        max_redemptions: "",
+      });
+      setMessage("Kuponi imeundwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function changeCouponStatus(coupon, isActive) {
+    try {
+      await api(`/admin/coupons/${coupon.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_active: isActive }),
+      });
+      await refresh();
+      setMessage("Hali ya kuponi imehifadhiwa.");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function recordManualPayout(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    const sellerId = payoutForm.seller_id || payoutData.accounts[0]?.seller_id;
+    if (!sellerId) {
+      setError("Hakuna muuzaji mwenye akaunti ya malipo.");
+      return;
+    }
+    try {
+      await api("/payouts", {
+        method: "POST",
+        body: JSON.stringify({
+          ...payoutForm,
+          seller_id: sellerId,
+          amount: Number(payoutForm.amount),
+        }),
+      });
+      setPayoutForm((current) => ({
+        ...current,
+        seller_id: sellerId,
+        amount: "",
+        payment_reference: "",
+        note: "",
+      }));
+      setMessage("Rekodi ya malipo imehifadhiwa; mfumo haukutuma pesa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  const selectedPayoutAccount = payoutData.accounts.find(
+    (account) => account.seller_id === payoutForm.seller_id,
+  ) || payoutData.accounts[0];
   const nav = [
     ["overview", "Muhtasari"],
     ["products", "Bidhaa"],
     ["sales", "Mauzo"],
+    ["payouts", isAdmin ? "Malipo ya wauzaji" : "Malipo yangu"],
     ...(!isAdmin ? [["storefront", "Duka lako"], ["stock", "Stock"]] : []),
     ...(!isAdmin ? [["business", "Biashara na Matawi"], ["assistant", translateKey("assistant.title", language)]] : []),
     ...(isAdmin ? [["sellers", "Wauzaji"]] : []),
@@ -1673,6 +2359,8 @@ function MarketplaceDashboard({ user, onLogout }) {
     ...(isAdmin ? [["health", "Afya ya mfumo"]] : []),
     ...(isAdmin ? [["notifications", "Arifa"]] : []),
     ["settings", translateKey("settings.title", language)],
+    ...(isAdmin ? [["alerts", `Arifa za mfumo${systemAlerts.some((alert) => !alert.acknowledged_at) ? ` (${systemAlerts.filter((alert) => !alert.acknowledged_at).length})` : ""}`], ["policies", "Sera (rasimu)"]] : []),
+    ...(isAdmin ? [["coupons", "Kuponi"], ["returns", "Marejesho"]] : []),
   ];
 
   return localize(
@@ -1797,16 +2485,28 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <textarea id="product-description" className="text-input feature-textarea" maxLength={2000} value={productForm.description} onChange={(event) => setProductForm({ ...productForm, description: event.target.value })} />
                 <label className="field-label" htmlFor="product-image">URL ya picha (HTTP/HTTPS)</label>
                 <input id="product-image" className="text-input" type="url" maxLength={2048} value={productForm.image_url} onChange={(event) => setProductForm({ ...productForm, image_url: event.target.value })} />
-                <label className="field-label" htmlFor="product-image-file">Au pakia picha (hiari)</label>
+                <label className="field-label" htmlFor="product-image-file">Pakia picha za bidhaa (picha kuu na pembe tofauti)</label>
                 <input
                   id="product-image-file"
                   ref={productImageInputRef}
                   className="text-input"
                   type="file"
                   accept="image/jpeg,image/png,image/webp"
-                  onChange={(event) => setProductImage(event.target.files?.[0] || null)}
+                  multiple
+                  onChange={(event) => setProductImages(Array.from(event.target.files || []))}
                 />
-                <p className="field-hint">JPEG, PNG au WebP; kiwango cha juu MB 5. Picha itahifadhiwa pamoja na bidhaa.</p>
+                <p className="field-hint">Chagua hadi picha 8 za pembe tofauti. JPEG, PNG au WebP; kila picha hadi MB 5. Mnunuzi anaweza kuzizungusha.</p>
+                <label className="field-label" htmlFor="product-video-files">{translate("Pakia video za bidhaa (hiari)", language)}</label>
+                <input
+                  id="product-video-files"
+                  ref={productVideoInputRef}
+                  className="text-input"
+                  type="file"
+                  accept="video/mp4,video/webm"
+                  multiple
+                  onChange={(event) => setProductVideos(Array.from(event.target.files || []))}
+                />
+                <p className="field-hint">{translate("Chagua hadi video 3 za MP4 au WebM; kila video hadi MB 20.", language)}</p>
                 <label className="field-label" htmlFor="product-category">Kundi</label>
                 <input id="product-category" className="text-input" list="product-categories" maxLength={60} value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} />
                 <datalist id="product-categories">{categories.map((item) => <option key={item.id} value={item.name} />)}</datalist>
@@ -1814,8 +2514,45 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <input id="product-amount" className="text-input" type="number" min="1" step="1" required value={productForm.amount} onChange={(event) => setProductForm({ ...productForm, amount: event.target.value })} />
                 <label className="field-label" htmlFor="product-cost">Gharama ya bidhaa (TZS)</label>
                 <input id="product-cost" className="text-input" type="number" min="0" step="1" value={productForm.cost_amount} onChange={(event) => setProductForm({ ...productForm, cost_amount: event.target.value })} />
-                <label className="field-label" htmlFor="product-stock">Stock inayopatikana</label>
-                <input id="product-stock" className="text-input" type="number" min="0" step="1" required value={productForm.stock_quantity} onChange={(event) => setProductForm({ ...productForm, stock_quantity: event.target.value })} />
+                {productVariants.length ? (
+                  <p className="field-hint">
+                    {translate("Stock ya jumla kutoka variants", language)}: {productVariants.reduce((sum, variant) => sum + (Number(variant.stock_quantity) || 0), 0)}
+                  </p>
+                ) : (
+                  <>
+                    <label className="field-label" htmlFor="product-stock">Stock inayopatikana</label>
+                    <input id="product-stock" className="text-input" type="number" min="0" step="1" required value={productForm.stock_quantity} onChange={(event) => setProductForm({ ...productForm, stock_quantity: event.target.value })} />
+                  </>
+                )}
+                <div className="variant-editor">
+                  <strong>Variants (hiari)</strong>
+                  <p className="field-hint">Kila variant hutumia bei ya bidhaa na ina stock yake.</p>
+                  {productVariants.map((variant, index) => (
+                    <div className="variant-editor-row" key={`variant-${index}`}>
+                      <input
+                        className="text-input"
+                        aria-label={`${translate("Variant", language)} ${index + 1}`}
+                        placeholder={translate("Mfano: Rangi nyeusi / Size M", language)}
+                        maxLength={80}
+                        required
+                        value={variant.label}
+                        onChange={(event) => updateProductVariant(index, "label", event.target.value)}
+                      />
+                      <input
+                        className="text-input"
+                        aria-label={`${translate("Stock kwa variant", language)} ${index + 1}`}
+                        type="number"
+                        min="0"
+                        max="999999999"
+                        required
+                        value={variant.stock_quantity}
+                        onChange={(event) => updateProductVariant(index, "stock_quantity", event.target.value)}
+                      />
+                      <button className="table-action" type="button" onClick={() => removeProductVariant(index)}>Ondoa variant</button>
+                    </div>
+                  ))}
+                  <button className="table-action" type="button" onClick={addProductVariant}>Ongeza variant</button>
+                </div>
                 <label className="field-label" htmlFor="product-low-stock">Tahadhari stock ikiwa chini ya</label>
                 <input id="product-low-stock" className="text-input" type="number" min="0" step="1" value={productForm.low_stock_threshold} onChange={(event) => setProductForm({ ...productForm, low_stock_threshold: event.target.value })} />
                 <p className="field-hint">Gharama hutumika kukadiria faida; inaweza kuachwa wazi.</p>
@@ -1854,7 +2591,13 @@ function MarketplaceDashboard({ user, onLogout }) {
                   canArchive={!isAdmin}
                   onArchive={archiveProduct}
                   onUploadImage={uploadExistingProductImage}
+                  onUploadGallery={uploadExistingProductGallery}
+                  onUploadVideos={uploadExistingProductVideos}
                   onDeleteImage={deleteProductImage}
+                  onDeleteGalleryImage={deleteProductGalleryImage}
+                  onDeleteVideo={deleteProductVideo}
+                  onAddVariant={addExistingProductVariant}
+                  onUpdateVariantStock={updateProductVariantStock}
                 />
               ))}
             </div>
@@ -1876,6 +2619,121 @@ function MarketplaceDashboard({ user, onLogout }) {
           </form>
           <SalesTable sales={sales} isAdmin={isAdmin} onArchive={archiveSale} onUpdateDelivery={updateDelivery} />
           {!isAdmin && <p className="field-hint">Ukificha rekodi, itaondoka kwenye orodha yako lakini admin ataendelea kuiona.</p>}
+        </section>
+      )}
+
+      {tab === "payouts" && (
+        <section className="dashboard-content feature-list">
+          <div className="dashboard-section-heading">
+            <h2>{isAdmin ? "Malipo ya wauzaji" : "Malipo yangu"}</h2>
+            <span>{payoutData.accounts.length} akaunti</span>
+          </div>
+          <p className="field-hint">Salio linatokana na oda zilizokamilika ukiondoa malipo yaliyorekodiwa. Rekodi haianzi uhamisho wa pesa.</p>
+          <div className="feature-columns">
+            <div className="feature-list">
+              {payoutData.accounts.map((account) => (
+                <article className="seller-card" key={account.seller_id}>
+                  <div>
+                    <strong>{account.shop_name || account.seller_name}</strong>
+                    <span>{account.seller_name}</span>
+                    <small>Mapato yaliyokamilika: TZS {formatMoney(account.completed_earned)}</small>
+                    <small>Malipo yaliyorekodiwa: TZS {formatMoney(account.recorded_paid)}</small>
+                    <small>Salio linalodaiwa: TZS {formatMoney(account.outstanding_amount)}</small>
+                    {account.overpaid_amount > 0 && <small>Malipo yanayozidi salio: TZS {formatMoney(account.overpaid_amount)}</small>}
+                  </div>
+                </article>
+              ))}
+              {!payoutData.accounts.length && <p className="empty-state">Hakuna akaunti ya malipo ya muuzaji.</p>}
+            </div>
+            {isAdmin && (
+              <form className="form-card" onSubmit={recordManualPayout}>
+                <h3>Rekodi malipo yaliyofanywa nje ya mfumo</h3>
+                <label className="field-label" htmlFor="payout-seller">Muuzaji</label>
+                <select
+                  id="payout-seller"
+                  className="text-input"
+                  required
+                  value={payoutForm.seller_id || selectedPayoutAccount?.seller_id || ""}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, seller_id: event.target.value })}
+                >
+                  {payoutData.accounts.map((account) => (
+                    <option key={account.seller_id} value={account.seller_id}>
+                      {account.shop_name || account.seller_name} · TZS {formatMoney(account.outstanding_amount)}
+                    </option>
+                  ))}
+                </select>
+                <label className="field-label" htmlFor="payout-amount">Kiasi (TZS)</label>
+                <input
+                  id="payout-amount"
+                  className="text-input"
+                  type="number"
+                  min="1"
+                  max={selectedPayoutAccount?.outstanding_amount || 0}
+                  step="1"
+                  required
+                  value={payoutForm.amount}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, amount: event.target.value })}
+                />
+                <label className="field-label" htmlFor="payout-method">Njia ya malipo</label>
+                <select
+                  id="payout-method"
+                  className="text-input"
+                  value={payoutForm.payment_method}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, payment_method: event.target.value })}
+                >
+                  <option value="MOBILE_MONEY">MOBILE_MONEY</option>
+                  <option value="BANK_TRANSFER">BANK_TRANSFER</option>
+                  <option value="CASH">CASH</option>
+                  <option value="OTHER">OTHER</option>
+                </select>
+                <label className="field-label" htmlFor="payout-reference">Rejea ya muamala</label>
+                <input
+                  id="payout-reference"
+                  className="text-input"
+                  minLength={3}
+                  maxLength={100}
+                  required
+                  value={payoutForm.payment_reference}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, payment_reference: event.target.value })}
+                />
+                <label className="field-label" htmlFor="payout-note">Maelezo (hiari)</label>
+                <input
+                  id="payout-note"
+                  className="text-input"
+                  maxLength={500}
+                  value={payoutForm.note}
+                  onChange={(event) => setPayoutForm({ ...payoutForm, note: event.target.value })}
+                />
+                <button
+                  className="generate-button"
+                  type="submit"
+                  disabled={
+                    !selectedPayoutAccount
+                    || selectedPayoutAccount.outstanding_amount <= 0
+                    || !Number.isInteger(Number(payoutForm.amount))
+                    || Number(payoutForm.amount) <= 0
+                    || Number(payoutForm.amount) > selectedPayoutAccount.outstanding_amount
+                  }
+                >
+                  Rekodi malipo yaliyofanywa
+                </button>
+                <p className="field-hint">Hakikisha malipo yamefanywa kwanza; usiweke PIN, nenosiri, au taarifa za siri za akaunti.</p>
+              </form>
+            )}
+          </div>
+          <div className="feature-list">
+            <h3>Historia ya malipo</h3>
+            {payoutData.entries.map((entry) => (
+              <article className="seller-card" key={entry.id}>
+                <div>
+                  <strong>{entry.shop_name || entry.seller_name} · TZS {formatMoney(entry.amount)}</strong>
+                  <span><span>{entry.payment_method}</span> · {entry.payment_reference} · {entry.created_at}</span>
+                  <small>{entry.recorded_by_name || "Admin"}{entry.note && ` · ${entry.note}`}</small>
+                </div>
+              </article>
+            ))}
+            {!payoutData.entries.length && <p className="empty-state">Hakuna malipo yaliyorekodiwa.</p>}
+          </div>
         </section>
       )}
 
@@ -1923,12 +2781,57 @@ function MarketplaceDashboard({ user, onLogout }) {
         </section>
       )}
 
+      {tab === "coupons" && isAdmin && (
+        <section className="dashboard-content">
+          <form className="form-card inline-feature-form" onSubmit={createCoupon}>
+            <h2>Tengeneza kuponi ya majaribio</h2>
+            <p className="field-hint">Kuponi zinatumika kwenye checkout ya demo pekee; hazipunguzi malipo halisi.</p>
+            <label className="field-label" htmlFor="coupon-code">Msimbo wa kuponi</label>
+            <input id="coupon-code" className="text-input" minLength={3} maxLength={32} required value={couponForm.code} onChange={(event) => setCouponForm({ ...couponForm, code: event.target.value.toUpperCase() })} />
+            <label className="field-label" htmlFor="coupon-type">Aina ya punguzo</label>
+            <select id="coupon-type" className="text-input" value={couponForm.discount_type} onChange={(event) => setCouponForm({ ...couponForm, discount_type: event.target.value })}>
+              <option value="PERCENT">Asilimia (%)</option>
+              <option value="FIXED">Kiasi maalum (TZS)</option>
+            </select>
+            <label className="field-label" htmlFor="coupon-value">Kiasi cha punguzo</label>
+            <input id="coupon-value" className="text-input" type="number" min="1" max={couponForm.discount_type === "PERCENT" ? "100" : "999999999"} required value={couponForm.discount_value} onChange={(event) => setCouponForm({ ...couponForm, discount_value: event.target.value })} />
+            <label className="field-label" htmlFor="coupon-limit">Idadi ya matumizi (hiari)</label>
+            <input id="coupon-limit" className="text-input" type="number" min="1" value={couponForm.max_redemptions} onChange={(event) => setCouponForm({ ...couponForm, max_redemptions: event.target.value })} />
+            <button className="generate-button" type="submit" disabled={busy}>Hifadhi kuponi</button>
+          </form>
+          <div className="feature-list">
+            {coupons.map((coupon) => (
+              <article className="seller-card" key={coupon.id}>
+                <div>
+                  <strong>{coupon.code}</strong>
+                  <span>{coupon.discount_type === "PERCENT" ? `${coupon.discount_value}%` : `TZS ${formatMoney(coupon.discount_value)}`} · {translate("Matumizi ya kuponi", language)} {coupon.redemption_count}{coupon.max_redemptions ? ` / ${coupon.max_redemptions}` : ""}</span>
+                  <small>{coupon.is_active ? "INAENDELEA" : "IMEZIMWA"} · Demo pekee</small>
+                </div>
+                <button className="table-action" type="button" onClick={() => changeCouponStatus(coupon, !coupon.is_active)}>
+                  {coupon.is_active ? "Zima kuponi" : "Washa kuponi"}
+                </button>
+              </article>
+            ))}
+            {!coupons.length && <p className="empty-state">Hakuna kuponi zilizoundwa.</p>}
+          </div>
+        </section>
+      )}
+
       {tab === "cancellations" && isAdmin && (
         <section className="dashboard-content feature-list">
           <h2>Maombi ya kughairi oda</h2>
           {cancellations.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.order_id} · {item.buyer_name}</strong><span>{item.reason} · TZS {formatMoney(item.amount)}</span><small>{item.status} · {item.payment_status}</small></div>{item.status === "PENDING" && <div className="seller-actions"><button type="button" onClick={() => resolveCancellation(item.id, "APPROVED")}>Idhinisha</button><button type="button" className="danger-action" onClick={() => resolveCancellation(item.id, "REJECTED")}>Kataa</button></div>}</article>)}
           {!cancellations.length && <p className="empty-state">Hakuna ombi la kughairi.</p>}
           <p className="field-hint">Kughairi oda iliyokamilika ni demo pekee: stock hurejeshwa, lakini refund ya pesa halisi haijatekelezwa.</p>
+        </section>
+      )}
+
+      {tab === "returns" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <h2>Maombi ya kurejesha bidhaa/refund</h2>
+          {returnRequests.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.order_id} · {item.buyer_name}</strong><span>{item.reason} · TZS {formatMoney(item.amount)}</span><small><span>{item.status}</span> · <span>{item.payment_status}</span> · <span>{item.delivery_status}</span></small>{item.admin_note && <small>{item.admin_note}</small>}</div>{item.status === "PENDING" && <div className="seller-actions"><button type="button" onClick={() => resolveReturnRequest(item.id, "APPROVED")}>Idhinisha</button><button type="button" className="danger-action" onClick={() => resolveReturnRequest(item.id, "REJECTED")}>Kataa</button></div>}</article>)}
+          {!returnRequests.length && <p className="empty-state">Hakuna ombi la marejesho.</p>}
+          <p className="field-hint">Uidhinishaji ni uamuzi tu; mfumo hautoi pesa wala kubadilisha hali ya malipo. Refund halisi ishughulikiwe nje ya mfumo.</p>
         </section>
       )}
 
@@ -2377,6 +3280,54 @@ function MarketplaceDashboard({ user, onLogout }) {
         </section>
       )}
 
+      {tab === "alerts" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <h2>{translate("Arifa za mfumo", language)}</h2>
+          {systemAlerts.map((alert) => (
+            <article className="seller-card" key={alert.id}>
+              <div>
+                <strong>{translate(alert.alert_type, language)}</strong>
+                <span>{translate(alert.message, language)}</span>
+                <small>{alert.created_at}</small>
+              </div>
+              {alert.acknowledged_at
+                ? <small>{translate("Imeshughulikiwa", language)}</small>
+                : <button className="table-action" type="button" onClick={() => acknowledgeSystemAlert(alert.id)}>{translate("Weka imeshughulikiwa", language)}</button>}
+            </article>
+          ))}
+          {!systemAlerts.length && <p className="empty-state">{translate("Hakuna arifa za mfumo.", language)}</p>}
+        </section>
+      )}
+
+      {tab === "policies" && isAdmin && (
+        <section className="dashboard-content feature-list">
+          <div className="demo-notice dashboard-notice">
+            <p><strong>{translate("RASIMU — HAIJACHAPISHWA", language)}</strong> {translate("Kurasa hizi ni rasimu za ukaguzi wa admin pekee; hazijawekwa hadharani.", language)}</p>
+            <p>{translate("Jaza jina la kisheria la biashara na mawasiliano ya msaada, kisha pata ukaguzi wa kisheria kabla ya kuchapisha.", language)}</p>
+          </div>
+          <article className="seller-card"><div><strong>{translate("Masharti ya matumizi", language)}</strong><ul>
+            <li>{translate("Marketplace huunganisha wanunuzi na wauzaji; muuzaji anawajibika kwa maelezo na stock ya bidhaa.", language)}</li>
+            <li>{translate("Bei ya delivery huwekwa tofauti na malipo ya bidhaa na huonyeshwa kwa mnunuzi.", language)}</li>
+            <li>{translate("Demo mode haihamishi pesa; PIN au OTP haipaswi kuingizwa kwenye tovuti.", language)}</li>
+          </ul></div></article>
+          <article className="seller-card"><div><strong>{translate("Sera ya faragha", language)}</strong><ul>
+            <li>{translate("Data inayokusanywa: jina, email, simu, anuani ya delivery, oda na ujumbe wa msaada.", language)}</li>
+            <li>{translate("Data hutumika kuendesha akaunti, malipo, ufuatiliaji wa oda na msaada.", language)}</li>
+            <li>{translate("Bainisha muda wa kuhifadhi data, ombi la nakala au kufuta data, na mawasiliano ya kampuni.", language)}</li>
+          </ul></div></article>
+          <article className="seller-card"><div><strong>{translate("Cancellation na refund", language)}</strong><ul>
+            <li>{translate("Cancellation inaruhusiwa kabla oda haijasafirishwa.", language)}</li>
+            <li>{translate("Ombi la return litumwe ndani ya siku 7 tangu delivery na litapitiwa na admin.", language)}</li>
+            <li>{translate("Approval ya return ni uamuzi tu; mfumo hautoi refund ya pesa halisi moja kwa moja.", language)}</li>
+          </ul></div></article>
+          <article className="seller-card"><div><strong>{translate("Delivery na payout", language)}</strong><ul>
+            <li>{translate("Muuzaji huingiza hatua za delivery, kampuni ya usafirishaji na tracking code kwa mikono.", language)}</li>
+            <li>{translate("Payout ya Abliner inalengwa baada ya siku 7 tangu delivery bila dispute inayosubiri.", language)}</li>
+            <li>{translate("Uhamisho wa payout haujawashwa; unahitaji KYC, salio la wallet, API na ratiba ya kuaminika.", language)}</li>
+          </ul></div></article>
+        </section>
+      )}
+
       {tab === "settings" && (
         <section className="dashboard-content">
           <div className="dashboard-section-heading"><h2>{translateKey("settings.title", language)}</h2></div>
@@ -2467,14 +3418,22 @@ function SalesTable({ sales, isAdmin, onArchive, onUpdateDelivery }) {
 function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
   const localize = useLocalize();
   const [deliveryStatus, setDeliveryStatus] = useState(sale.delivery_status || "UNFULFILLED");
+  const [deliveryCarrier, setDeliveryCarrier] = useState(sale.delivery_carrier || "");
   const [trackingCode, setTrackingCode] = useState(sale.tracking_code || "");
+  const [deliveryFee, setDeliveryFee] = useState(String(sale.delivery_fee || 0));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useFeedbackState("error");
   async function saveDelivery() {
     setBusy(true);
     setError("");
     try {
-      await onUpdateDelivery(sale.order_id, deliveryStatus, trackingCode);
+      await onUpdateDelivery(
+        sale.order_id,
+        deliveryStatus,
+        deliveryCarrier,
+        trackingCode,
+        Number(deliveryFee),
+      );
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -2483,9 +3442,9 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
   }
   return localize(
     <tr className={sale.archived_at ? "archived-row" : ""}>
-      <td><strong>{sale.product_name}</strong><small>{sale.order_id}</small></td>
+      <td><strong>{sale.product_name}</strong>{sale.variant_label && <small>{sale.variant_label}</small>}<small>{sale.order_id}</small></td>
       {isAdmin && <td>{sale.shop_name || "—"}</td>}
-      <td>{sale.buyer_name || "—"}<small>{sale.payment_method || ""}</small>{sale.delivery_address && <small>{sale.delivery_address}</small>}</td>
+      <td>{sale.buyer_name || "—"}<small>{paymentMethodLabel(sale.payment_method || "")}</small>{sale.delivery_address && <small>{sale.delivery_address}</small>}</td>
       <td><span className={`order-status ${sale.payment_status.toLowerCase()}`}>{sale.payment_status === "COMPLETED" ? "Imekamilika (demo)" : sale.payment_status}</span>{sale.archived_at && <small>Imefichwa na muuzaji</small>}</td>
       <td>
         {sale.payment_status === "COMPLETED" && onUpdateDelivery ? (
@@ -2505,8 +3464,11 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
               <option value="DELIVERY_FAILED">Delivery imeshindikana</option>
               <option value="RETURNED">Imerejeshwa</option>
             </select>
+            <input className="text-input" aria-label="Jina la kampuni ya usafirishaji" maxLength={100} placeholder="Jina la kampuni ya usafirishaji" value={deliveryCarrier} onChange={(event) => setDeliveryCarrier(event.target.value)} />
             <input className="text-input" aria-label="Namba ya ufuatiliaji" maxLength={100} placeholder="Tracking code" value={trackingCode} onChange={(event) => setTrackingCode(event.target.value)} />
-            <button type="button" className="table-action" disabled={busy || deliveryStatus === "UNFULFILLED"} onClick={saveDelivery}>{busy ? "..." : "Hifadhi"}</button>
+            <input className="text-input" aria-label="Ada ya delivery (TZS)" type="number" min="0" max="999999999" step="1" value={deliveryFee} onChange={(event) => setDeliveryFee(event.target.value)} />
+            <small>Ada ya delivery inalipwa moja kwa moja kwa muuzaji; haijajumuishwa kwenye malipo ya bidhaa.</small>
+            <button type="button" className="table-action" disabled={busy || deliveryStatus === "UNFULFILLED" || !Number.isInteger(Number(deliveryFee)) || Number(deliveryFee) < 0} onClick={saveDelivery}>{busy ? "..." : "Hifadhi"}</button>
             {error && <small className="form-error">{error}</small>}
           </div>
         ) : <span>{sale.delivery_status || "UNFULFILLED"}</span>}
@@ -2546,6 +3508,122 @@ function AdminSupportTicket({ ticket, onSave }) {
         {error && <small className="form-error">{error}</small>}
       </form>
     </article>
+  );
+}
+
+function VideoShoppingCard({ product, video }) {
+  const localize = useLocalize();
+  const { language } = useLanguage();
+  const { notify } = useNotification();
+  const [variantId, setVariantId] = useState("");
+  const [error, setError] = useState("");
+  const [added, setAdded] = useState(false);
+  const variants = product.variants || [];
+  const selectedVariant = variants.find((variant) => variant.id === variantId);
+  const hasAvailableVariant = variants.some((variant) => variant.stock_quantity > 0);
+  const isOutOfStock = variants.length
+    ? !hasAvailableVariant || Boolean(selectedVariant && selectedVariant.stock_quantity <= 0)
+    : product.stock_quantity <= 0;
+
+  function addToCart() {
+    setError("");
+    if (variants.length && !variantId) {
+      setError(translate("Chagua aina ya bidhaa.", language));
+      return;
+    }
+    const result = addProductToCart(product.id, variantId);
+    if (!result.added) {
+      const message = result.reason === "variant-conflict"
+        ? "Kikapu kina variant moja kwa kila bidhaa; badilisha variant kwenye kikapu."
+        : "Idadi ya bidhaa kwenye kikapu imefika kikomo.";
+      setError(translate(message, language));
+      return;
+    }
+    setAdded(true);
+    notify(translate("Bidhaa imeongezwa kwenye kikapu.", language), "success");
+  }
+
+  return localize(
+    <article className="video-shopping-card">
+      <video
+        className="video-shopping-player"
+        src={video.url}
+        controls
+        preload="metadata"
+        playsInline
+        aria-label={`${translate("Video ya bidhaa", language)} ${product.name}`}
+      />
+      <div className="video-shopping-details">
+        <small>{translate("Video ya bidhaa", language)}</small>
+        <h3>{product.name}</h3>
+        <strong>TZS {formatMoney(product.amount)}</strong>
+        <span>{product.shop_name || "Duka"}</span>
+        {variants.length > 0 && (
+          <label>
+            <span className="field-label">{translate("Aina ya bidhaa", language)}</span>
+            <select
+              className="text-input"
+              value={variantId}
+              onChange={(event) => setVariantId(event.target.value)}
+            >
+              <option value="">{translate("Chagua aina ya bidhaa", language)}</option>
+              {variants.map((variant) => (
+                <option
+                  key={variant.id}
+                  value={variant.id}
+                  disabled={variant.stock_quantity <= 0}
+                >
+                  {variant.label} · {translate("Stock inayopatikana", language)}: {variant.stock_quantity}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="video-shopping-actions">
+          <button
+            className="table-action"
+            type="button"
+            onClick={addToCart}
+            disabled={isOutOfStock}
+          >
+            {translate("Ongeza kikapuni", language)}
+          </button>
+          <a className="generate-button" href={`/pay/${product.id}`}>
+            {translate("Nunua sasa", language)}
+          </a>
+        </div>
+        {added && <a className="video-cart-link" href="/cart">{translate("Fungua kikapu", language)}</a>}
+      </div>
+    </article>
+  );
+}
+
+function ProductVideoFeed({ products }) {
+  const localize = useLocalize();
+  const videos = products.flatMap((product) => (
+    (product.videos || []).map((video) => ({ product, video }))
+  ));
+  if (!videos.length) return null;
+  return localize(
+    <section className="video-shopping-section">
+      <div className="video-shopping-heading">
+        <div>
+          <div className="eyebrow"><span /> LIPARAHISI VIDEO</div>
+          <h2>{translate("Video za bidhaa")}</h2>
+          <p>{translate("Tazama video, ongeza bidhaa kikapuni au anza kuinunua moja kwa moja.")}</p>
+        </div>
+      </div>
+      <div className="video-shopping-grid">
+        {videos.map(({ product, video }) => (
+          <VideoShoppingCard
+            key={`${product.id}-${video.id}`}
+            product={product}
+            video={video}
+          />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -2599,11 +3677,12 @@ function PublicMarketplace({ onLogin }) {
         <button className="table-action" type="submit">Tafuta</button>
       </form>
       {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
+      <ProductVideoFeed products={products} />
       {products.length ? (
         <div className="product-grid marketplace-grid">
           {products.map((product) => (
             <article className="market-product" key={product.id}>
-              {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+              <ProductGallery product={product} className="market-product-gallery" />
               <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description || "Bidhaa ya muuzaji wetu."}</p><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name || "Duka"}</span></div>
               <div className="market-product-actions">
                 {product.store_slug && <a className="table-action" href={`/store/${encodeURIComponent(product.store_slug)}`}>Tembelea duka</a>}
@@ -2925,10 +4004,11 @@ function StorefrontPage({ storeSlug }) {
             {storefront.store.store_image_url && <img src={storefront.store.store_image_url} alt="" />}
             <div><div className="eyebrow"><span /> DUKA LILILOIDHINISHWA</div><h1>{storefront.store.shop_name}</h1><p>{storefront.store.store_description || `Duka la ${storefront.store.full_name}`}</p></div>
           </section>
+          <ProductVideoFeed products={storefront.products} />
           <div className="product-grid marketplace-grid">
             {storefront.products.map((product) => (
               <article className="market-product" key={product.id}>
-                {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+                <ProductGallery product={product} className="market-product-gallery" />
                 <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description}</p><strong>TZS {formatMoney(product.amount)}</strong></div>
                 <a className="generate-button" href={`/pay/${product.id}`}>Nunua sasa</a>
               </article>
@@ -3147,10 +4227,11 @@ function BuyerDashboard({ user, onLogout }) {
             <input className="text-input" type="search" placeholder="Tafuta bidhaa au duka..." value={query} onChange={(event) => setQuery(event.target.value)} />
             <select className="text-input" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">Makundi yote</option>{categories.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select>
           </form>
+          <ProductVideoFeed products={filteredProducts} />
           <div className="product-grid marketplace-grid">
             {filteredProducts.map((product) => (
               <article className="market-product" key={product.id}>
-                {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+                <ProductGallery product={product} className="market-product-gallery" />
                 <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description}</p><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name || "Duka"}</span></div>
                 <div className="market-product-actions">
                   <button type="button" className="table-action" onClick={() => runAction(() => api(`/wishlist/${product.id}`, { method: "POST" }), "Bidhaa imehifadhiwa kwenye vipendwa.")}>Hifadhi</button>
@@ -3168,7 +4249,7 @@ function BuyerDashboard({ user, onLogout }) {
           <div className="product-grid marketplace-grid">
             {wishlist.map((product) => (
               <article className="market-product" key={product.id}>
-                {product.image_url && <img src={product.image_url} alt="" loading="lazy" />}
+                <ProductGallery product={product} className="market-product-gallery" />
                 <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name}</span></div>
                 <div className="market-product-actions"><button type="button" className="table-action" onClick={() => runAction(() => api(`/wishlist/${product.id}`, { method: "DELETE" }), "Bidhaa imeondolewa kwenye vipendwa.")}>Ondoa</button><a className="generate-button" href={`/pay/${product.id}`}>Nunua</a></div>
               </article>
@@ -3207,17 +4288,44 @@ function BuyerDashboard({ user, onLogout }) {
 function BuyerOrderRow({ order, onAction }) {
   const localize = useLocalize();
   const [reason, setReason] = useState("");
+  const [returnReason, setReturnReason] = useState("");
   const [rating, setRating] = useState("5");
   const [comment, setComment] = useState("");
   const [deliveryOtp, setDeliveryOtp] = useState("");
   const [recipientName, setRecipientName] = useState("");
-  const canCancel = ["PENDING", "COMPLETED"].includes(order.payment_status);
+  const cancellationInProgress = ["PENDING", "APPROVED"].includes(order.cancellation_status);
+  const canCancel = ["PENDING", "COMPLETED"].includes(order.payment_status)
+    && order.delivery_status !== "DELIVERED"
+    && !order.return_status
+    && !cancellationInProgress;
+  const canRequestReturn = order.payment_status === "COMPLETED"
+    && order.delivery_status === "DELIVERED"
+    && !order.return_status
+    && !cancellationInProgress;
   return localize(
     <tr>
       <td><strong>{order.order_id}</strong><small>{order.created_at}</small></td>
-      <td>{order.product_name}<small>{order.shop_name || "Muuzaji"}</small></td>
+      <td>{order.product_name}{order.variant_label && <small>{order.variant_label}</small>}<small>{order.shop_name || "Muuzaji"}</small></td>
       <td>{order.payment_status}</td>
-      <td>{order.delivery_status}{order.tracking_code && <small><a href={`/track/${encodeURIComponent(order.tracking_code)}`}>{order.tracking_code}</a></small>}{order.delivery_address && <small>{order.delivery_address}</small>}</td>
+      <td>
+        {order.delivery_status}
+        {order.delivery_carrier && <small><span>Kampuni ya usafirishaji:</span> {order.delivery_carrier}</small>}
+        {order.tracking_code && <small><span>Tracking code:</span> <a href={`/track/${encodeURIComponent(order.tracking_code)}`}>{order.tracking_code}</a></small>}
+        {order.delivery_fee > 0 && (
+          <small>
+            <span>Ada ya delivery:</span> TZS {formatMoney(order.delivery_fee)}
+            <br />
+            Ada ya delivery inalipwa moja kwa moja kwa muuzaji; haijajumuishwa kwenye malipo ya bidhaa.
+          </small>
+        )}
+        {order.return_status && (
+          <small>
+            <span>Hali ya ombi la kurejesha:</span> {order.return_status}
+            {order.return_reason && ` · ${order.return_reason}`}
+          </small>
+        )}
+        {order.delivery_address && <small>{order.delivery_address}</small>}
+      </td>
       <td>TZS {formatMoney(order.amount)}</td>
       <td>
         <a className="table-action" href={`/pay/${order.product_id}?order_id=${encodeURIComponent(order.order_id)}`}>Fungua</a>
@@ -3238,6 +4346,7 @@ function BuyerOrderRow({ order, onAction }) {
           </form>
         )}
         {canCancel && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/cancellation`, { method: "POST", body: JSON.stringify({ reason }) }), "Ombi la kughairi limetumwa."); }}><input aria-label="Sababu ya kughairi" className="text-input" minLength={5} placeholder="Sababu ya kughairi" required value={reason} onChange={(event) => setReason(event.target.value)} /><button className="table-action" type="submit">Omba kughairi</button></form>}
+        {canRequestReturn && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/return`, { method: "POST", body: JSON.stringify({ reason: returnReason }) }), "Ombi la kurejesha limetumwa; hakuna refund itakayotekelezwa na mfumo."); }}><input aria-label="Sababu ya kurejesha" className="text-input" minLength={5} maxLength={1000} placeholder="Sababu ya kurejesha bidhaa/refund" required value={returnReason} onChange={(event) => setReturnReason(event.target.value)} /><button className="table-action" type="submit">Omba marejesho</button></form>}
         {order.payment_status === "COMPLETED" && <form className="inline-feature-form" onSubmit={(event) => { event.preventDefault(); onAction(() => api(`/orders/${order.order_id}/products/${order.product_id}/review`, { method: "POST", body: JSON.stringify({ rating: Number(rating), comment }) }), "Maoni yametumwa kwa ukaguzi."); }}><select aria-label="Alama" className="text-input" value={rating} onChange={(event) => setRating(event.target.value)}>{[5, 4, 3, 2, 1].map((value) => <option key={value} value={value}>{value} / 5</option>)}</select><input aria-label="Maoni kuhusu bidhaa" className="text-input" maxLength={1000} placeholder="Maoni (hiari)" value={comment} onChange={(event) => setComment(event.target.value)} /><button className="table-action" type="submit">Tuma maoni</button></form>}
       </td>
     </tr>
@@ -3375,13 +4484,36 @@ function saveCart(items) {
   window.localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(items));
 }
 
+function addProductToCart(productId, variantId = "") {
+  const cart = loadCart();
+  const existing = cart.find((item) => item.product_id === productId);
+  if (existing && (existing.variant_id || "") !== variantId) {
+    return { added: false, reason: "variant-conflict" };
+  }
+  if (existing && Number(existing.quantity) >= 99) {
+    return { added: false, reason: "quantity-limit" };
+  }
+  if (existing) {
+    existing.quantity = Number(existing.quantity) + 1;
+  } else {
+    cart.push({ product_id: productId, quantity: 1, variant_id: variantId });
+  }
+  saveCart(cart);
+  return {
+    added: true,
+    count: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
+  };
+}
+
 function CheckoutPage({ productId }) {
   const localize = useLocalize();
   const { language } = useLanguage();
   const { notify } = useNotification();
   const [product, setProduct] = useState(null);
   const [paymentConfig, setPaymentConfig] = useState(null);
-  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", abandoned_checkout_consent: false });
+  const [couponCode, setCouponCode] = useState("");
+  const [variantId, setVariantId] = useState("");
   const [orderId, setOrderId] = useState(new URLSearchParams(window.location.search).get("order_id") || "");
   const [order, setOrder] = useState(null);
   const previousOrderStatus = useRef(null);
@@ -3390,6 +4522,7 @@ function CheckoutPage({ productId }) {
   const [cartCount, setCartCount] = useState(() => loadCart().reduce((sum, item) => sum + item.quantity, 0));
 
   useEffect(() => {
+    setVariantId("");
     api(`/products/${productId}`).then(setProduct).catch((requestError) => setError(requestError.message));
   }, [productId]);
 
@@ -3397,7 +4530,18 @@ function CheckoutPage({ productId }) {
     let active = true;
     api("/config/integrations")
       .then((config) => {
-        if (active) setPaymentConfig(config);
+        if (active) {
+          setPaymentConfig(config);
+          if (
+            config.abliner_live_enabled === true
+            && config.demo_mode !== true
+            && config.live_payments_enabled !== true
+          ) {
+            setForm((current) => current.payment_method === "M-Pesa"
+              ? { ...current, payment_method: ABLINER_PAYMENT_METHOD }
+              : current);
+          }
+        }
       })
       .catch((requestError) => {
         if (active) setError(requestError.message);
@@ -3438,12 +4582,20 @@ function CheckoutPage({ productId }) {
   }, [notify, orderId]);
 
   function addToCart() {
-    const cart = loadCart();
-    const existing = cart.find((item) => item.product_id === productId);
-    if (existing) existing.quantity += 1;
-    else cart.push({ product_id: productId, quantity: 1 });
-    saveCart(cart);
-    setCartCount(cart.reduce((sum, item) => sum + item.quantity, 0));
+    const hasVariants = (product?.variants || []).length > 0;
+    if (hasVariants && !variantId) {
+      setError(translate("Chagua aina ya bidhaa kabla ya kuongeza kwenye kikapu.", language));
+      return;
+    }
+    const result = addProductToCart(productId, variantId || "");
+    if (!result.added) {
+      const message = result.reason === "variant-conflict"
+        ? "Kikapu kina variant moja kwa kila bidhaa; badilisha variant kwenye kikapu."
+        : "Idadi ya bidhaa kwenye kikapu imefika kikomo.";
+      setError(translate(message, language));
+      return;
+    }
+    setCartCount(result.count);
   }
 
   async function submitCheckout(event) {
@@ -3451,10 +4603,6 @@ function CheckoutPage({ productId }) {
     setError("");
     setBusy(true);
     try {
-      const bankBranch = form.bank_branch === "Tawi lingine" ? form.bank_branch_name.trim() : form.bank_branch;
-      if (form.payment_method.endsWith("Branch") && !bankBranch) {
-        throw new Error("Weka jina la tawi la benki.");
-      }
       const result = await api(`/products/${productId}/checkout`, {
         method: "POST",
         body: JSON.stringify({
@@ -3463,7 +4611,9 @@ function CheckoutPage({ productId }) {
           buyer_phone: form.buyer_phone,
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
-          bank_branch: bankBranch,
+          coupon_code: couponCode,
+          variant_id: variantId || null,
+          abandoned_checkout_consent: form.abandoned_checkout_consent,
           request_key: newRequestKey(),
         }),
       });
@@ -3512,7 +4662,7 @@ function CheckoutPage({ productId }) {
     await downloadReceiptPdf({
       checkoutId: order.order_id,
       buyerName: order.buyer_name || form.buyer_name || "Mgeni",
-      paymentMethod: order.payment_method,
+      paymentMethod: paymentMethodLabel(order.payment_method),
       bankBranch: order.bank_branch,
       deliveryAddress: order.delivery_address,
       totalAmount: amount,
@@ -3526,7 +4676,13 @@ function CheckoutPage({ productId }) {
         amount,
         platformFee,
         sellerPayout: Number(order.seller_payout) || 0,
-        items: [{ product_name: order.product_name, quantity: 1, unit_amount: amount }],
+        items: [{
+          product_name: order.variant_label
+            ? `${order.product_name} — ${order.variant_label}`
+            : order.product_name,
+          quantity: 1,
+          unit_amount: amount,
+        }],
       }],
     }, language);
   }
@@ -3536,7 +4692,12 @@ function CheckoutPage({ productId }) {
   const isPesapalSandbox = paymentConfig?.pesapal_sandbox_enabled === true;
   const pesapalSandboxUnavailable =
     paymentConfig?.pesapal_sandbox_requested === true && !isPesapalSandbox;
+  const isAblinerLive = paymentConfig?.abliner_live_enabled === true;
+  const isAblinerSelected = form.payment_method === ABLINER_PAYMENT_METHOD;
+  const paymentMethods = paymentOptionsFor(paymentConfig);
   const selectedMethod = networks.find((method) => method.value === form.payment_method);
+  const productVariants = product?.variants || [];
+  const selectedVariant = productVariants.find((variant) => variant.id === variantId);
   return localize(
     <main className="page-shell checkout-shell">
       <Header label="Malipo ya bidhaa" />
@@ -3547,9 +4708,30 @@ function CheckoutPage({ productId }) {
           <section className="checkout-card">
             <div className="eyebrow"><span /> BIDHAA IMETAMBULIKA</div>
             <h1>{product.name}</h1>
+            <ProductGallery product={product} className="checkout-product-gallery" />
+            <ProductVideoFeed products={[product]} />
             <div className="checkout-amount">TZS {formatMoney(product.amount)}</div>
             <p className="buyer-intro">Jaza taarifa za oda na uchague njia ya malipo. PIN au OTP haiingizwe kwenye ukurasa huu.</p>
             <form className="buyer-form" onSubmit={submitCheckout}>
+              {productVariants.length > 0 && (
+                <>
+                  <label className="field-label" htmlFor="checkout-variant">Aina ya bidhaa</label>
+                  <select
+                    id="checkout-variant"
+                    className="text-input"
+                    required
+                    value={variantId}
+                    onChange={(event) => setVariantId(event.target.value)}
+                  >
+                    <option value="">Chagua aina ya bidhaa</option>
+                    {productVariants.map((variant) => (
+                      <option key={variant.id} value={variant.id} disabled={variant.stock_quantity <= 0}>
+                        {variant.label} · {translate("Stock inayopatikana", language)}: {variant.stock_quantity}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
               <label className="field-label" htmlFor="buyer-name">Jina la mnunuzi</label>
               <input id="buyer-name" className="text-input" autoComplete="name" required minLength={2} value={form.buyer_name} onChange={(event) => setForm({ ...form, buyer_name: event.target.value })} />
               <label className="field-label" htmlFor="buyer-email">Barua pepe ya risiti</label>
@@ -3558,19 +4740,32 @@ function CheckoutPage({ productId }) {
               <input id="buyer-phone" className="text-input" type="tel" inputMode="tel" autoComplete="tel" placeholder="Mf. 0712 345 678" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
               <label className="field-label" htmlFor="buyer-address">Anuani ya delivery (hiari)</label>
               <input id="buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
-              {isLivePayment ? (
+              <label className="checkout-consent">
+                <input
+                  type="checkbox"
+                  checked={form.abandoned_checkout_consent}
+                  onChange={(event) => setForm({ ...form, abandoned_checkout_consent: event.target.checked })}
+                />
+                <span>{translate("Nataka kupokea ukumbusho mmoja wa checkout kupitia email baada ya saa 24 ikiwa sijalipa. Naweza kujiondoa kupitia link kwenye email.", language)}</span>
+              </label>
+              <label className="field-label" htmlFor="checkout-coupon">Msimbo wa kuponi (demo pekee)</label>
+              <input id="checkout-coupon" className="text-input" maxLength={32} autoComplete="off" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} />
+              {isAblinerSelected && (
+                <p className="field-hint">Abliner itatuma ombi la malipo kwenye simu yako. Thibitisha kwenye simu; usiweke PIN au OTP kwenye tovuti hii.</p>
+              )}
+              {isLivePayment && !isAblinerSelected && (
                 <p className="field-hint">ClickPesa itatuma ombi la USSD kwenye namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha malipo kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</p>
-              ) : isPesapalSandbox ? (
-                <p className="field-hint">Malipo yatafunguliwa kwenye PesaPal Sandbox. Hii ni ya majaribio tu; hakuna pesa halisi itakayokatwa.</p>
-              ) : pesapalSandboxUnavailable ? (
-                <p className="form-error" role="alert">Mipangilio ya PesaPal Sandbox haijakamilika. Wasiliana na msimamizi wa mfumo.</p>
-              ) : (
+              )}
+              {isPesapalSandbox && <p className="field-hint">Malipo yatafunguliwa kwenye PesaPal Sandbox. Hii ni ya majaribio tu; hakuna pesa halisi itakayokatwa.</p>}
+              {pesapalSandboxUnavailable && <p className="form-error" role="alert">Mipangilio ya PesaPal Sandbox haijakamilika. Wasiliana na msimamizi wa mfumo.</p>}
+              {!isPesapalSandbox && (!isLivePayment || isAblinerLive) && (
                 <fieldset className="payment-fieldset">
                   <legend>Chagua mtandao wa malipo</legend>
                   <div className="method-grid">
-                    {networks.map((method) => (
-                      <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value, bank_branch: method.value.endsWith("Branch") ? form.bank_branch : "", bank_branch_name: method.value.endsWith("Branch") ? form.bank_branch_name : "" })}>
-                        <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                    {paymentMethods.map((method) => (
+                      <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
+                        {method.logo ? <img className="method-logo" src={method.logo} alt="" /> : <span className={`method-icon ${method.color}`}>{method.short}</span>}
+                        <span className="method-label">{method.label}</span><span className="radio-indicator" />
                       </button>
                     ))}
                   </div>
@@ -3592,28 +4787,42 @@ function CheckoutPage({ productId }) {
                 </>
               )}
               {error && <p className="form-error" role="alert">{error}</p>}
-              <button className="generate-button" type="submit" disabled={busy || pesapalSandboxUnavailable}>{busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}</button>
+              <button
+                className="generate-button"
+                type="submit"
+                disabled={busy || pesapalSandboxUnavailable || (productVariants.length > 0 && (!selectedVariant || selectedVariant.stock_quantity <= 0))}
+              >
+                {busy ? "Inaandaa oda..." : `Endelea — TZS ${formatMoney(product.amount)}`}
+              </button>
             </form>
-            <button className="cart-secondary-button" type="button" onClick={addToCart}>Ongeza bidhaa nyingine kwenye kikapu</button>
+            <button className="cart-secondary-button" type="button" onClick={addToCart} disabled={productVariants.length > 0 && (!selectedVariant || selectedVariant.stock_quantity <= 0)}>Ongeza bidhaa nyingine kwenye kikapu</button>
             {cartCount > 0 && <a className="cart-link" href="/cart">Nenda kikapu ({cartCount})</a>}
-            <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : "Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji."}</p>
+            <p className="checkout-footnote">{isAblinerSelected ? "Malipo yatakusanywa kupitia Abliner kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa muuzaji utalipwa kwa mikono." : "Huu ni mfumo wa majaribio: hakuna pesa inayokatwa au kuhamishwa kwa muuzaji."}</p>
           </section>
         )}
         {orderId && order && !isCompleted && order.payment_status !== "FAILED" && (
           <section className="checkout-card">
-            <div className="eyebrow"><span /> {order.sandbox ? "PESAPAL SANDBOX" : order.demo ? "MALIPO YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+            <div className="eyebrow"><span /> {order.sandbox ? "PESAPAL SANDBOX" : order.demo ? "MALIPO YA MAJARIBIO" : order.payment_method === ABLINER_PAYMENT_METHOD ? "MALIPO YA ABLINER" : "MALIPO YA CLICKPESA"}</div>
             <h1>{order.demo ? "Thibitisha oda yako" : "Subiri ombi la malipo"}</h1>
-            <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
+            <div className="receipt-product">
+              <span>{order.variant_label
+                ? `${order.product_name || product?.name} — ${order.variant_label}`
+                : order.product_name || product?.name}</span>
+              <strong>TZS {formatMoney(order.amount)}</strong>
+            </div>
+            {order.coupon_discount > 0 && <p className="field-hint">{translate("Punguzo la kuponi", language)} ({order.coupon_code}): TZS {formatMoney(order.coupon_discount)}</p>}
             <div className="payment-result pending">
               <strong>Haijalipwa bado</strong>
               {order.sandbox ? (
                 <span>Malipo ya PesaPal Sandbox yanathibitishwa. Hakuna pesa halisi inayohamishwa.</span>
               ) : order.demo ? (
                 <span>Bonyeza kitufe chini kuthibitisha demo. Hakuna pesa halisi itakayohamishwa.</span>
+              ) : order.payment_method === ABLINER_PAYMENT_METHOD ? (
+                <span>Ombi la malipo la Abliner limetumwa kwa namba uliyoingiza. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
               ) : (
                 <span>Ombi la malipo limetumwa kwa namba uliyoingiza. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP kwenye tovuti hii.</span>
               )}
-              <span>Njia ya malipo: {order.payment_method || selectedMethod?.label}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
+              <span>Njia ya malipo: {paymentMethodLabel(order.payment_method || (isAblinerSelected ? ABLINER_PAYMENT_METHOD : selectedMethod?.label))}{order.bank_branch ? ` — ${order.bank_branch}` : ""}.</span>
             </div>
             {error && <p className="form-error" role="alert">{error}</p>}
             {order.sandbox && order.payment_url && <a className="generate-button" href={order.payment_url}>Endelea na malipo ya sandbox</a>}
@@ -3634,13 +4843,19 @@ function CheckoutPage({ productId }) {
             <div className="receipt-success" aria-hidden="true">✓</div>
             <p className="receipt-kicker">{order.sandbox ? "RISITI YA PESAPAL SANDBOX" : order.demo ? "RISITI YA MAJARIBIO" : "RISITI YA MALIPO"}</p>
             <h1>Oda imekamilika</h1>
-            <div className="receipt-product"><span>{order.product_name || product?.name}</span><strong>TZS {formatMoney(order.amount)}</strong></div>
+            <div className="receipt-product">
+              <span>{order.variant_label
+                ? `${order.product_name || product?.name} — ${order.variant_label}`
+                : order.product_name || product?.name}</span>
+              <strong>TZS {formatMoney(order.amount)}</strong>
+            </div>
             <dl className="receipt-details">
               <div><dt>Namba ya oda</dt><dd>{order.order_id}</dd></div>
               <div><dt>Mnunuzi</dt><dd>{order.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
-              <div><dt>Njia ya malipo</dt><dd>{order.payment_method}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
+              <div><dt>Njia ya malipo</dt><dd>{paymentMethodLabel(order.payment_method)}{order.bank_branch ? ` — ${order.bank_branch}` : ""}</dd></div>
               <div><dt>Hali</dt><dd>{order.sandbox ? "Imehakikiwa kwenye sandbox" : order.demo ? "Imekamilika (demo)" : "Malipo yamepokelewa"}</dd></div>
               <div><dt>Jumla ya malipo</dt><dd>TZS {formatMoney(order.amount)}</dd></div>
+              {order.coupon_discount > 0 && <div><dt>Punguzo la kuponi ({order.coupon_code})</dt><dd>- TZS {formatMoney(order.coupon_discount)}</dd></div>}
               <div><dt>Kamisheni ya jukwaa ({order.commission_percent}%)</dt><dd>TZS {formatMoney(order.platform_fee)}</dd></div>
               <div><dt>Mgao wa muuzaji baada ya kamisheni</dt><dd>TZS {formatMoney(order.seller_payout)}</dd></div>
               <div><dt>Tarehe</dt><dd>{order.completed_at || "—"}</dd></div>
@@ -3667,7 +4882,8 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   const [checkoutId, setCheckoutId] = useState(initialCheckoutId);
   const [checkout, setCheckout] = useState(null);
   const previousCheckoutStatus = useRef(null);
-  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", bank_branch: "", bank_branch_name: "" });
+  const [form, setForm] = useState({ buyer_name: "", buyer_email: "", buyer_phone: "", delivery_address: "", payment_method: "M-Pesa", abandoned_checkout_consent: false });
+  const [couponCode, setCouponCode] = useState("");
   const [error, setError] = useFeedbackState("error");
   const [busy, setBusy] = useState(false);
 
@@ -3680,7 +4896,18 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
     let active = true;
     api("/config/integrations")
       .then((config) => {
-        if (active) setPaymentConfig(config);
+        if (active) {
+          setPaymentConfig(config);
+          if (
+            config.abliner_live_enabled === true
+            && config.demo_mode !== true
+            && config.live_payments_enabled !== true
+          ) {
+            setForm((current) => current.payment_method === "M-Pesa"
+              ? { ...current, payment_method: ABLINER_PAYMENT_METHOD }
+              : current);
+          }
+        }
       })
       .catch((requestError) => {
         if (active) setError(requestError.message);
@@ -3726,6 +4953,14 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
     saveCart(next);
   }
 
+  function updateVariant(productId, variantId) {
+    const next = items.map((item) => item.product_id === productId
+      ? { ...item, variant_id: variantId }
+      : item);
+    setItems(next);
+    saveCart(next);
+  }
+
   function removeItem(productId) {
     const next = items.filter((item) => item.product_id !== productId);
     setItems(next);
@@ -3735,6 +4970,24 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   async function submitCart(event) {
     event.preventDefault();
     setError("");
+    const missingVariant = products.some((product) => (
+      product.variants?.length
+      && !items.find((item) => item.product_id === product.id)?.variant_id
+    ));
+    if (missingVariant) {
+      setError(translate("Chagua aina ya bidhaa.", language));
+      return;
+    }
+    const unavailableVariant = products.some((product) => {
+      if (!product.variants?.length) return false;
+      const item = items.find((row) => row.product_id === product.id);
+      const variant = product.variants.find((row) => row.id === item?.variant_id);
+      return !variant || variant.stock_quantity < (item?.quantity || 0);
+    });
+    if (unavailableVariant) {
+      setError(translate("Stock ya aina hii ya bidhaa haitoshi.", language));
+      return;
+    }
     setBusy(true);
     try {
       const result = await api("/cart/checkout", {
@@ -3746,10 +4999,12 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
           buyer_phone: form.buyer_phone,
           delivery_address: form.delivery_address,
           payment_method: form.payment_method,
-          bank_branch: form.bank_branch,
+          coupon_code: couponCode,
+          abandoned_checkout_consent: form.abandoned_checkout_consent,
           items: items.map((item) => ({
             product_id: item.product_id,
             quantity: item.quantity,
+            variant_id: item.variant_id || null,
           })),
         }),
       });
@@ -3793,7 +5048,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
       buyerName: checkout.buyer_name || form.buyer_name || "Mgeni",
       buyerEmail: checkout.buyer_email || form.buyer_email,
       buyerPhone: checkout.buyer_phone || form.buyer_phone,
-      paymentMethod: checkout.payment_method,
+      paymentMethod: paymentMethodLabel(checkout.payment_method),
       bankBranch: checkout.bank_branch,
       totalAmount: checkout.total_amount,
       platformFee: checkout.platform_fee,
@@ -3816,6 +5071,9 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
   const isPesapalSandbox = paymentConfig?.pesapal_sandbox_enabled === true;
   const pesapalSandboxUnavailable =
     paymentConfig?.pesapal_sandbox_requested === true && !isPesapalSandbox;
+  const isAblinerLive = paymentConfig?.abliner_live_enabled === true;
+  const isAblinerSelected = form.payment_method === ABLINER_PAYMENT_METHOD;
+  const paymentMethods = paymentOptionsFor(paymentConfig);
 
   return localize(
     <main className="page-shell checkout-shell">
@@ -3829,7 +5087,24 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
               {products.length === 0 && <p className="buyer-intro">Kikapu kiko tupu. Scan QR ya bidhaa ili uongeze bidhaa.</p>}
               {products.map((product) => (
                 <div className="cart-row" key={product.id}>
-                  <div><strong>{product.name}</strong><span>Wauzaji: {product.shop_name}</span><small>TZS {formatMoney(product.amount)}</small></div>
+                  <div>
+                    <strong>{product.name}</strong><span>Wauzaji: {product.shop_name}</span><small>TZS {formatMoney(product.amount)}</small>
+                    {product.variants?.length > 0 && (
+                      <select
+                        className="text-input"
+                        aria-label={`${translate("Aina ya bidhaa", language)} ${product.name}`}
+                        value={items.find((item) => item.product_id === product.id)?.variant_id || ""}
+                        onChange={(event) => updateVariant(product.id, event.target.value)}
+                      >
+                        <option value="">Chagua aina ya bidhaa</option>
+                        {product.variants.map((variant) => (
+                          <option key={variant.id} value={variant.id} disabled={variant.stock_quantity <= 0}>
+                            {variant.label} · {translate("Stock inayopatikana", language)}: {variant.stock_quantity}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
                   <input aria-label={`Idadi ya ${product.name}`} className="cart-quantity" type="number" min="1" max="99" value={items.find((item) => item.product_id === product.id)?.quantity || 1} onChange={(event) => updateQuantity(product.id, Number(event.target.value) || 1)} />
                   <button type="button" onClick={() => removeItem(product.id)}>Ondoa</button>
                 </div>
@@ -3844,50 +5119,76 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                   <input id="cart-buyer-phone" className="text-input" type="tel" inputMode="tel" required value={form.buyer_phone} onChange={(event) => setForm({ ...form, buyer_phone: event.target.value })} />
                   <label className="field-label" htmlFor="cart-buyer-address">Anuani ya delivery (hiari)</label>
                   <input id="cart-buyer-address" className="text-input" maxLength={500} autoComplete="street-address" value={form.delivery_address} onChange={(event) => setForm({ ...form, delivery_address: event.target.value })} />
-                  {isLivePayment ? (
+                  <label className="checkout-consent">
+                    <input
+                      type="checkbox"
+                      checked={form.abandoned_checkout_consent}
+                      onChange={(event) => setForm({ ...form, abandoned_checkout_consent: event.target.checked })}
+                    />
+                    <span>{translate("Nataka kupokea ukumbusho mmoja wa checkout kupitia email baada ya saa 24 ikiwa sijalipa. Naweza kujiondoa kupitia link kwenye email.", language)}</span>
+                  </label>
+                  <label className="field-label" htmlFor="cart-coupon">Msimbo wa kuponi (demo pekee)</label>
+                  <input id="cart-coupon" className="text-input" maxLength={32} autoComplete="off" value={couponCode} onChange={(event) => setCouponCode(event.target.value.toUpperCase())} />
+                  {isAblinerSelected && (
+                    <p className="field-hint">Abliner itatuma ombi moja la malipo kwa jumla ya kikapu. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
+                  )}
+                  {isLivePayment && !isAblinerSelected && (
                     <p className="field-hint">ClickPesa itatuma ombi moja la USSD kwa jumla ya kikapu. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; usiweke PIN au OTP hapa.</p>
-                  ) : isPesapalSandbox ? (
-                    <p className="field-hint">Malipo yatafunguliwa kwenye PesaPal Sandbox. Hii ni ya majaribio tu; hakuna pesa halisi itakayokatwa.</p>
-                  ) : pesapalSandboxUnavailable ? (
-                    <p className="form-error" role="alert">Mipangilio ya PesaPal Sandbox haijakamilika. Wasiliana na msimamizi wa mfumo.</p>
-                  ) : (
+                  )}
+                  {isPesapalSandbox && <p className="field-hint">Malipo yatafunguliwa kwenye PesaPal Sandbox. Hii ni ya majaribio tu; hakuna pesa halisi itakayokatwa.</p>}
+                  {pesapalSandboxUnavailable && <p className="form-error" role="alert">Mipangilio ya PesaPal Sandbox haijakamilika. Wasiliana na msimamizi wa mfumo.</p>}
+                  {!isPesapalSandbox && (!isLivePayment || isAblinerLive) && (
                     <fieldset className="payment-fieldset">
                       <legend>Chagua mtandao wa malipo</legend>
                       <div className="method-grid">
-                        {networks.map((method) => (
+                        {paymentMethods.map((method) => (
                           <button key={method.value} type="button" className={`method-option ${form.payment_method === method.value ? "selected" : ""}`} onClick={() => setForm({ ...form, payment_method: method.value })}>
-                            <span className={`method-icon ${method.color}`}>{method.short}</span>{method.label}<span className="radio-indicator" />
+                            {method.logo ? <img className="method-logo" src={method.logo} alt="" /> : <span className={`method-icon ${method.color}`}>{method.short}</span>}
+                            <span className="method-label">{method.label}</span><span className="radio-indicator" />
                           </button>
                         ))}
                       </div>
                     </fieldset>
                   )}
                   {error && <p className="form-error" role="alert">{error}</p>}
-                  <button className="generate-button" type="submit" disabled={busy || pesapalSandboxUnavailable}>{busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}</button>
+                  <button
+                    className="generate-button"
+                    type="submit"
+                    disabled={busy || pesapalSandboxUnavailable || products.some((product) => product.variants?.length && !items.find((item) => item.product_id === product.id)?.variant_id)}
+                  >
+                    {busy ? "Inaandaa bili..." : `Lipa TZS ${formatMoney(total)}`}
+                  </button>
                 </form>
               )}
-              <p className="checkout-footnote">{isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : "Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa."}</p>
+              <p className="checkout-footnote">{isAblinerSelected ? "Malipo yatakusanywa kupitia Abliner kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : isLivePayment ? "Malipo yatakusanywa na ClickPesa kwenye akaunti ya jukwaa; mgao wa wauzaji utalipwa kwa mikono." : "Kikapu hiki ni majaribio. Malipo halisi hayajaunganishwa."}</p>
             </>
           )}
           {checkoutId && checkout && (
             <>
-              <div className="eyebrow"><span /> {checkout.sandbox ? "PESAPAL SANDBOX" : checkout.demo ? "ODA YA MAJARIBIO" : "MALIPO YA CLICKPESA"}</div>
+              <div className="eyebrow"><span /> {checkout.sandbox ? "PESAPAL SANDBOX" : checkout.demo ? "ODA YA MAJARIBIO" : checkout.payment_method === ABLINER_PAYMENT_METHOD ? "MALIPO YA ABLINER" : "MALIPO YA CLICKPESA"}</div>
               <h1>{checkout.payment_status === "COMPLETED" ? "Malipo yamekamilika" : checkout.demo ? "Gawanya kwa wauzaji" : "Subiri ombi la malipo"}</h1>
               {checkout.payment_status === "COMPLETED" && <img className="receipt-logo" src="/images/liparahisi-logo.svg" alt="LipaRahisi" />}
               {checkout.splits.map((split) => (
                 <div className="cart-split" key={split.order_id}>
                   <strong>{split.shop_name}</strong>
-                  <span>{split.items.map((item) => `${item.quantity} x ${item.product_name} @ TZS ${formatMoney(item.unit_amount)} = TZS ${formatMoney(item.quantity * item.unit_amount)}`).join(", ")}</span>
+                  <span>{split.items.map((item) => `${item.quantity} x ${item.product_name}${item.variant_label ? ` (${item.variant_label})` : ""} @ TZS ${formatMoney(item.unit_amount)} = TZS ${formatMoney(item.quantity * item.unit_amount)}`).join(", ")}</span>
                   <b>TZS {formatMoney(split.amount)}</b>
                   <small>Kamisheni ({checkout.commission_percent}%): TZS {formatMoney(split.platform_fee)}</small>
                   <small>Mgao wa muuzaji baada ya kamisheni: TZS {formatMoney(split.seller_payout)}</small>
                 </div>
               ))}
+              {checkout.coupon_discount > 0 && <p className="field-hint">{translate("Punguzo la kuponi", language)} ({checkout.coupon_code}): - TZS {formatMoney(checkout.coupon_discount)}</p>}
               <div className="checkout-amount">Jumla ya mteja: TZS {formatMoney(checkout.total_amount)}</div>
               <p className="field-hint">Kamisheni inakatwa kwenye mgao wa kila muuzaji; haiongezwi kwenye bili ya mnunuzi.</p>
               {checkout.payment_status === "PENDING" && checkout.sandbox && <p className="payment-result pending">Malipo ya PesaPal Sandbox yanathibitishwa. Hakuna pesa halisi inayohamishwa.</p>}
-              {checkout.payment_status === "PENDING" && !checkout.demo && !checkout.sandbox && <p className="payment-result pending">Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti.</p>}
               {checkout.payment_status === "PENDING" && checkout.sandbox && checkout.payment_url && <a className="generate-button" href={checkout.payment_url}>Endelea na malipo ya sandbox</a>}
+              {checkout.payment_status === "PENDING" && !checkout.demo && !checkout.sandbox && (
+                <p className="payment-result pending">
+                  {checkout.payment_method === ABLINER_PAYMENT_METHOD
+                    ? "Ombi moja la Abliner limetumwa kwa jumla ya kikapu. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti."
+                    : "Ombi moja la malipo limetumwa kwa namba uliyoweka. Ada za ClickPesa au mtandao zinaweza kutumika na zitaonyeshwa kwenye prompt. Thibitisha kwenye simu yako; PIN/OTP haihitajiki kwenye tovuti."}
+                </p>
+              )}
               {checkout.payment_status === "PENDING" && checkout.demo && (
                 <button className="generate-button" type="button" disabled={busy} onClick={completeCart}>{busy ? "Inathibitisha..." : "Thibitisha demo kwa wauzaji wote"}</button>
               )}
@@ -3905,7 +5206,7 @@ function CartPage({ checkoutId: initialCheckoutId = "" }) {
                 <>
                   <dl className="receipt-details">
                     <div><dt>Mnunuzi</dt><dd>{checkout.buyer_name || form.buyer_name || "Mgeni"}</dd></div>
-                    <div><dt>Njia ya malipo</dt><dd>{checkout.payment_method}{checkout.bank_branch ? ` — ${checkout.bank_branch}` : ""}</dd></div>
+                    <div><dt>Njia ya malipo</dt><dd>{paymentMethodLabel(checkout.payment_method)}{checkout.bank_branch ? ` — ${checkout.bank_branch}` : ""}</dd></div>
                     <div><dt>Kamisheni jumla ({checkout.commission_percent}%)</dt><dd>TZS {formatMoney(checkout.platform_fee)}</dd></div>
                     <div><dt>Mgao wa wauzaji baada ya kamisheni</dt><dd>TZS {formatMoney(checkout.splits.reduce((sum, split) => sum + Number(split.seller_payout || 0), 0))}</dd></div>
                     <div><dt>Tarehe</dt><dd>{checkout.completed_at || "—"}</dd></div>

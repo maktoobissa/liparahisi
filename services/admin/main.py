@@ -5,6 +5,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
 from backend.main import (
     CancellationResolutionInput,
+    CouponInput,
+    CouponStatusInput,
+    ReturnResolutionInput,
     ReviewModerationInput,
     SellerStatusInput,
     SupportTicketUpdateInput,
@@ -16,18 +19,25 @@ from backend.main import (
     SecurityAppealReviewInput,
     connect_db,
     admin_dashboard_summary,
+    acknowledge_system_alert,
+    create_coupon,
     create_support_ticket,
     export_sales,
     list_cancellations,
     list_audit,
+    list_coupons,
     list_reviews,
     list_sellers,
     list_seller_documents,
+    list_system_alerts,
+    list_return_requests,
     list_support_tickets,
     system_health,
     moderate_review,
     resolve_cancellation,
+    resolve_return_request,
     update_seller_status,
+    set_coupon_status,
     update_support_ticket,
     list_seller_kyc,
     review_seller_kyc,
@@ -70,6 +80,28 @@ def health():
     with connect_db() as connection:
         connection.execute("SELECT 1").fetchone()
     return {"status": "ok"}
+
+
+@app.get("/coupons", dependencies=[Depends(verify_gateway_token)])
+def coupons(request: Request):
+    return list_coupons(request)
+
+
+@app.post("/coupons", status_code=201, dependencies=[Depends(verify_gateway_token)])
+def coupons_create(payload: CouponInput, request: Request):
+    return create_coupon(payload, request)
+
+
+@app.patch(
+    "/coupons/{coupon_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def coupons_status(
+    coupon_id: str,
+    payload: CouponStatusInput,
+    request: Request,
+):
+    return set_coupon_status(coupon_id, payload, request)
 
 
 @app.get("/sellers", dependencies=[Depends(verify_gateway_token)])
@@ -221,6 +253,19 @@ def seller_kyc_review(
     return review_seller_kyc(seller_id, payload, request)
 
 
+@app.get("/system-alerts", dependencies=[Depends(verify_gateway_token)])
+def system_alerts(request: Request):
+    return list_system_alerts(request)
+
+
+@app.patch(
+    "/system-alerts/{alert_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def system_alert_acknowledge(alert_id: str, request: Request):
+    return acknowledge_system_alert(alert_id, request)
+
+
 @app.get("/export/sales", dependencies=[Depends(verify_gateway_token)])
 def sales_export(request: Request):
     return export_sales(request)
@@ -241,6 +286,23 @@ def cancellation_decision(
     request: Request,
 ):
     return resolve_cancellation(cancellation_id, payload, request)
+
+
+@app.get("/returns", dependencies=[Depends(verify_gateway_token)])
+def return_requests(request: Request):
+    return list_return_requests(request)
+
+
+@app.patch(
+    "/returns/{return_id}",
+    dependencies=[Depends(verify_gateway_token)],
+)
+def return_decision(
+    return_id: str,
+    payload: ReturnResolutionInput,
+    request: Request,
+):
+    return resolve_return_request(return_id, payload, request)
 
 
 @app.get("/reviews", dependencies=[Depends(verify_gateway_token)])
