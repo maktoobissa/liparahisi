@@ -616,7 +616,7 @@ def initialize_db():
             CREATE TABLE IF NOT EXISTS account_images (
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 content_type TEXT NOT NULL,
-                image_data BLOB NOT NULL,
+                image_data {"BYTEA" if connection.postgres else "BLOB"} NOT NULL,
                 updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS seller_documents (
