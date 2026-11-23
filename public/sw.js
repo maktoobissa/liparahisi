@@ -1,4 +1,4 @@
-const CACHE_NAME = "liparahisi-shell-v10";
+const CACHE_NAME = "liparahisi-shell-v11";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -37,7 +37,7 @@ self.addEventListener("fetch", (event) => {
         .then((response) => {
           if (response.ok) {
             return caches.open(CACHE_NAME)
-              .then((cache) => cache.put("/", response.clone())
+              .then((cache) => cache.put(request, response.clone())
                 .catch((error) => console.error("Could not cache the app shell.", error)))
               .then(() => response);
           }
@@ -49,9 +49,7 @@ self.addEventListener("fetch", (event) => {
   }
 
   event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) return cached;
-      return fetch(request).then((response) => {
+    fetch(request).then((response) => {
         if (response.ok && response.type === "basic") {
           return caches.open(CACHE_NAME)
             .then((cache) => cache.put(request, response.clone())
@@ -59,8 +57,7 @@ self.addEventListener("fetch", (event) => {
             .then(() => response);
         }
         return response;
-      });
-    }),
+      }).catch(async () => (await caches.match(request))),
   );
 });
 
