@@ -2502,7 +2502,6 @@ function MarketplaceDashboard({ user, onLogout }) {
     ...(isAdmin ? [["documents", "Nyaraka"]] : []),
     ...(isAdmin ? [["health", "Afya ya mfumo"]] : []),
     ...(isAdmin ? [["notifications", "Arifa"]] : []),
-    ["settings", translateKey("settings.title", language)],
     ...(isAdmin ? [["alerts", `Arifa za mfumo${systemAlerts.some((alert) => !alert.acknowledged_at) ? ` (${systemAlerts.filter((alert) => !alert.acknowledged_at).length})` : ""}`], ["policies", "Sera (rasimu)"]] : []),
     ...(isAdmin ? [["coupons", "Kuponi"], ["returns", "Marejesho"]] : []),
   ];
@@ -2518,15 +2517,23 @@ function MarketplaceDashboard({ user, onLogout }) {
         </div>
         <span className="demo-pill">Majaribio: hakuna pesa halisi</span>
       </section>
-      <nav className="dashboard-tabs" aria-label="Sehemu za dashboard">
-        {nav.map(([key, title]) => (
-          <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>
-            {title}
-          </button>
-        ))}
-      </nav>
-      {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
-      {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
+      <div className="dashboard-layout">
+        <aside className="dashboard-sidebar">
+          <div className="dashboard-sidebar-heading">
+            <span>{isAdmin ? "Admin" : "Muuzaji"}</span>
+            <strong>{user.shop_name || user.full_name}</strong>
+          </div>
+          <nav className="dashboard-tabs" aria-label="Sehemu za dashboard">
+            {nav.map(([key, title]) => (
+              <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>
+                {title}
+              </button>
+            ))}
+          </nav>
+        </aside>
+        <div className="dashboard-workspace">
+          {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
+          {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
 
       {tab === "assistant" && !isAdmin && <BusinessAssistant businessId={selectedBusinessId} />}
 
@@ -3555,6 +3562,8 @@ function MarketplaceDashboard({ user, onLogout }) {
         </section>
       )}
 
+        </div>
+      </div>
       <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="privacy">Data ya akaunti na mauzo hutenganishwa kwa muuzaji</span></BrandFooter>
     </main>
   );
@@ -4433,11 +4442,19 @@ function BuyerDashboard({ user, onLogout }) {
     <main className="page-shell">
       <Header label="Akaunti ya mnunuzi" user={user} onLogout={onLogout} />
       <section className="dashboard-welcome"><div><div className="eyebrow"><span /> AKAUNTI YA MNUNUZI</div><h1>Habari, <span>{user.full_name}</span></h1><p>Vinjari bidhaa, fuatilia oda na wasiliana na timu ya msaada.</p></div><a className="table-action" href="/">Marketplace ya umma</a></section>
-      <nav className="dashboard-tabs" aria-label="Sehemu za mnunuzi">
-        {tabs.map(([key, title]) => <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>{title}</button>)}
-      </nav>
-      {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
-      {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
+      <div className="dashboard-layout buyer-dashboard-layout">
+        <aside className="dashboard-sidebar">
+          <div className="dashboard-sidebar-heading">
+            <span>Akaunti</span>
+            <strong>{user.full_name}</strong>
+          </div>
+          <nav className="dashboard-tabs" aria-label="Sehemu za mnunuzi">
+            {tabs.map(([key, title]) => <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>{title}</button>)}
+          </nav>
+        </aside>
+        <div className="dashboard-workspace">
+          {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
+          {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
       {tab === "overview" && (
         <section className="dashboard-content">
           <div className="stats-grid">
@@ -4575,6 +4592,8 @@ function BuyerDashboard({ user, onLogout }) {
           <AccountSecurity />
         </section>
       )}
+        </div>
+      </div>
       <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="payments">Malipo ya majaribio pekee</span></BrandFooter>
     </main>
   );
@@ -4582,6 +4601,7 @@ function BuyerDashboard({ user, onLogout }) {
 
 function BuyerOrderRow({ order, onAction }) {
   const localize = useLocalize();
+  const { language } = useLanguage();
   const [reason, setReason] = useState("");
   const [returnReason, setReturnReason] = useState("");
   const [rating, setRating] = useState("5");
@@ -4601,9 +4621,9 @@ function BuyerOrderRow({ order, onAction }) {
     <tr>
       <td><strong>{order.order_id}</strong><small>{order.created_at}</small></td>
       <td>{order.product_name}{order.variant_label && <small>{order.variant_label}</small>}<small>{order.shop_name || "Muuzaji"}</small></td>
-      <td>{order.payment_status}</td>
+      <td>{translate(order.payment_status, language)}</td>
       <td>
-        {order.delivery_status}
+        {translate(order.delivery_status || "UNFULFILLED", language)}
         {order.delivery_carrier && <small><span>Kampuni ya usafirishaji:</span> {order.delivery_carrier}</small>}
         {order.tracking_code && <small><span>Tracking code:</span> <a href={`/track/${encodeURIComponent(order.tracking_code)}`}>{order.tracking_code}</a></small>}
         {order.delivery_fee > 0 && (
