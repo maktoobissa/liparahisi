@@ -397,15 +397,6 @@ function Header({ label = "Demo", user, onLogout }) {
       notify(requestError.message, "error");
     });
   }
-  function openFullSettings() {
-    setSettingsOpen(false);
-    if (user) {
-      window.location.hash = "settings";
-      window.dispatchEvent(new CustomEvent("liparahisi-open-settings"));
-    } else {
-      document.querySelector(".dashboard-content")?.scrollIntoView({ behavior: "smooth" });
-    }
-  }
   return localize(
     <header className="topbar">
       <a className="brand" href="/" aria-label="LipaRahisi mwanzo" key="brand">
@@ -467,11 +458,6 @@ function Header({ label = "Demo", user, onLogout }) {
                   ))}
                 </div>
               </div>
-              {user && ["BUYER", "SELLER", "ADMIN"].includes(user.role) && (
-                <button className="settings-menu-full" type="button" role="menuitem" onClick={openFullSettings}>
-                  {translateKey("settings.open", language)}
-                </button>
-              )}
             </div>
           )}
         </div>
@@ -1427,22 +1413,6 @@ function MarketplaceDashboard({ user, onLogout }) {
   const { language, backgroundColor, setBackgroundColor } = useLanguage();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
-  useEffect(() => {
-    function openRequestedSettings() {
-      if (window.location.hash === "#settings") setTab("settings");
-      else if (!window.location.hash) setTab("overview");
-    }
-    function openCustomSettings() {
-      setTab("settings");
-    }
-    openRequestedSettings();
-    window.addEventListener("hashchange", openRequestedSettings);
-    window.addEventListener("liparahisi-open-settings", openCustomSettings);
-    return () => {
-      window.removeEventListener("hashchange", openRequestedSettings);
-      window.removeEventListener("liparahisi-open-settings", openCustomSettings);
-    };
-  }, []);
   const [stats, setStats] = useState(null);
   const [products, setProducts] = useState([]);
   const [sales, setSales] = useState([]);
@@ -2525,7 +2495,7 @@ function MarketplaceDashboard({ user, onLogout }) {
           </div>
           <nav className="dashboard-tabs" aria-label="Sehemu za dashboard">
             {nav.map(([key, title]) => (
-              <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>
+              <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); }}>
                 {title}
               </button>
             ))}
@@ -3482,85 +3452,6 @@ function MarketplaceDashboard({ user, onLogout }) {
         </section>
       )}
 
-      {tab === "settings" && (
-        <section className="dashboard-content">
-          <div className="dashboard-section-heading"><h2>{translateKey("settings.title", language)}</h2></div>
-          <section className="form-card settings-form background-settings" aria-labelledby="background-settings-title">
-            <h2 id="background-settings-title">{translateKey("settings.background.title", language)}</h2>
-            <p className="field-hint">{translateKey("settings.background.description", language)}</p>
-            <div className="background-palette" role="group" aria-label={translateKey("settings.background.title", language)}>
-              {backgroundThemes.map((theme) => {
-                const label = translateKey(theme.labelKey, language);
-                const selected = backgroundColor === theme.color;
-                return (
-                  <button
-                    className={`background-choice${selected ? " selected" : ""}`}
-                    type="button"
-                    key={theme.color}
-                    aria-label={translateKey("settings.background.select", language, { color: label })}
-                    aria-pressed={selected}
-                    onClick={() => setBackgroundColor(theme.color)}
-                  >
-                    <span className="background-swatch" style={{ backgroundColor: theme.color }} aria-hidden="true" />
-                    <span>{label}</span>
-                    {selected && <small>{translateKey("settings.background.selected", language)}</small>}
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-          {!isAdmin && (
-            <section className="form-card settings-form profile-image-settings" aria-labelledby="seller-profile-image-title">
-              <h2 id="seller-profile-image-title">{translate("Picha ya profile ya muuzaji", language)}</h2>
-              {user.profile_image_url && (
-                <img className="profile-image-preview" src={user.profile_image_url} alt={user.shop_name || user.full_name} />
-              )}
-              <form className="buyer-form" onSubmit={uploadProfileImage}>
-                <label className="field-label" htmlFor="seller-profile-image">{translate("Pakia picha ya profile (JPEG, PNG au WebP)", language)}</label>
-                <input id="seller-profile-image" name="profile_image" className="text-input" type="file" accept="image/jpeg,image/png,image/webp" required />
-                <button className="generate-button" type="submit">{translate("Hifadhi picha", language)}</button>
-              </form>
-            </section>
-          )}
-          <form className="form-card settings-form" onSubmit={changePassword}>
-            <h2>{translateKey("settings.password", language)}</h2>
-            <label className="field-label" htmlFor="current-password">Nenosiri la sasa</label>
-            <input id="current-password" className="text-input" type="password" autoComplete="current-password" required value={passwordForm.current_password} onChange={(event) => setPasswordForm({ ...passwordForm, current_password: event.target.value })} />
-            <label className="field-label" htmlFor="new-password">Nenosiri jipya (angalau herufi 10)</label>
-            <input id="new-password" className="text-input" type="password" autoComplete="new-password" minLength={10} required value={passwordForm.new_password} onChange={(event) => setPasswordForm({ ...passwordForm, new_password: event.target.value })} />
-            <button className="generate-button" type="submit">Hifadhi nenosiri</button>
-          </form>
-          <AccountSecurity />
-          {!isAdmin && (
-            <section className="form-card settings-form">
-              <h2>Pakia nyaraka</h2>
-              <form className="buyer-form" onSubmit={uploadDocument}>
-                <label className="field-label" htmlFor="document-kind">Aina ya nyaraka</label>
-                <select id="document-kind" className="text-input" value={documentKind} onChange={(event) => setDocumentKind(event.target.value)}>
-                  <option value="seller_verification">Uthibitisho wa muuzaji</option>
-                  <option value="product_document">Nyaraka za bidhaa</option>
-                </select>
-                {documentKind === "product_document" && (
-                  <>
-                    <label className="field-label" htmlFor="document-product">Bidhaa</label>
-                    <select id="document-product" className="text-input" required value={documentProductId} onChange={(event) => setDocumentProductId(event.target.value)}>
-                      <option value="">Chagua bidhaa</option>
-                      {products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
-                    </select>
-                  </>
-                )}
-                <label className="field-label" htmlFor="account-document">Faili (PDF/JPEG/PNG/WebP; hadi MB 10)</label>
-                <input id="account-document" className="text-input" name="document" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" required />
-                <button className="generate-button" type="submit">Pakia nyaraka</button>
-              </form>
-              <div className="feature-list">
-                {documents.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.filename}</strong><span>{item.kind} · {item.created_at}</span></div><a className="table-action" href={`/api/documents/${encodeURIComponent(item.id)}`}>Pakua</a></article>)}
-                {!documents.length && <p className="empty-state">Bado hakuna nyaraka.</p>}
-              </div>
-            </section>
-          )}
-        </section>
-      )}
 
         </div>
       </div>
@@ -4266,22 +4157,6 @@ function BuyerDashboard({ user, onLogout }) {
   const { language, backgroundColor, setBackgroundColor } = useLanguage();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
-  useEffect(() => {
-    function openRequestedSettings() {
-      if (window.location.hash === "#settings") setTab("account");
-      else if (!window.location.hash) setTab("overview");
-    }
-    function openCustomSettings() {
-      setTab("account");
-    }
-    openRequestedSettings();
-    window.addEventListener("hashchange", openRequestedSettings);
-    window.addEventListener("liparahisi-open-settings", openCustomSettings);
-    return () => {
-      window.removeEventListener("hashchange", openRequestedSettings);
-      window.removeEventListener("liparahisi-open-settings", openCustomSettings);
-    };
-  }, []);
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   const [wishlist, setWishlist] = useState([]);
@@ -4449,7 +4324,7 @@ function BuyerDashboard({ user, onLogout }) {
             <strong>{user.full_name}</strong>
           </div>
           <nav className="dashboard-tabs" aria-label="Sehemu za mnunuzi">
-            {tabs.map(([key, title]) => <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>{title}</button>)}
+            {tabs.map(([key, title]) => <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); }}>{title}</button>)}
           </nav>
         </aside>
         <div className="dashboard-workspace">
@@ -4557,38 +4432,6 @@ function BuyerDashboard({ user, onLogout }) {
       )}
       {tab === "account" && (
         <section className="dashboard-content buyer-settings-layout">
-          <section className="form-card settings-form background-settings" aria-labelledby="buyer-background-settings-title">
-            <h2 id="buyer-background-settings-title">{translateKey("settings.background.title", language)}</h2>
-            <p className="field-hint">{translateKey("settings.background.description", language)}</p>
-            <div className="background-palette" role="group" aria-label={translateKey("settings.background.title", language)}>
-              {backgroundThemes.map((theme) => {
-                const label = translateKey(theme.labelKey, language);
-                const selected = backgroundColor === theme.color;
-                return (
-                  <button
-                    className={`background-choice${selected ? " selected" : ""}`}
-                    type="button"
-                    key={theme.color}
-                    aria-label={translateKey("settings.background.select", language, { color: label })}
-                    aria-pressed={selected}
-                    onClick={() => setBackgroundColor(theme.color)}
-                  >
-                    <span className="background-swatch" style={{ backgroundColor: theme.color }} aria-hidden="true" />
-                    <span>{label}</span>
-                    {selected && <small>{translateKey("settings.background.selected", language)}</small>}
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-          <form className="form-card settings-form" onSubmit={changePassword}>
-            <h2>{translateKey("settings.password", language)}</h2>
-            <label className="field-label" htmlFor="buyer-current-password">{translate("Nenosiri la sasa", language)}</label>
-            <input id="buyer-current-password" className="text-input" type="password" autoComplete="current-password" required value={passwordForm.current_password} onChange={(event) => setPasswordForm({ ...passwordForm, current_password: event.target.value })} />
-            <label className="field-label" htmlFor="buyer-new-password">{translate("Nenosiri jipya (angalau herufi 10)", language)}</label>
-            <input id="buyer-new-password" className="text-input" type="password" autoComplete="new-password" minLength={10} required value={passwordForm.new_password} onChange={(event) => setPasswordForm({ ...passwordForm, new_password: event.target.value })} />
-            <button className="generate-button" type="submit">{translate("Hifadhi nenosiri", language)}</button>
-          </form>
           <AccountSecurity />
         </section>
       )}
