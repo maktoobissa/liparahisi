@@ -365,9 +365,28 @@ function ProductGallery({ product, className = "", editable = false, onDeleteIma
 }
 
 function Header({ label = "Demo", user, onLogout }) {
-  const { language, setLanguage } = useLanguage();
+  const { language, setLanguage, backgroundColor, setBackgroundColor } = useLanguage();
   const localize = useLocalize();
   const { notify } = useNotification();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsRef = useRef(null);
+
+  useEffect(() => {
+    if (!settingsOpen) return undefined;
+    function closeOnOutsideClick(event) {
+      if (settingsRef.current && !settingsRef.current.contains(event.target)) setSettingsOpen(false);
+    }
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setSettingsOpen(false);
+    }
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [settingsOpen]);
+
   function changeLanguage(nextLanguage) {
     setLanguage(nextLanguage);
     if (!user) return;
@@ -377,6 +396,14 @@ function Header({ label = "Demo", user, onLogout }) {
     }).catch((requestError) => {
       notify(requestError.message, "error");
     });
+  }
+  function openFullSettings() {
+    setSettingsOpen(false);
+    if (user) {
+      window.location.hash = "settings";
+    } else {
+      document.querySelector(".dashboard-content")?.scrollIntoView({ behavior: "smooth" });
+    }
   }
   return localize(
     <header className="topbar">
@@ -388,15 +415,62 @@ function Header({ label = "Demo", user, onLogout }) {
         <span className="brand-mobile-name" key="brand-name">LipaRahisi</span>
       </a>
       <div className="header-right" key="controls">
-        <label className="language-control" key="language">
-          <span className="sr-only" key="language-label">{translateKey("language.label", language)}</span>
-          <select key="language-select" aria-label={translateKey("language.label", language)} value={language} onChange={(event) => changeLanguage(event.target.value)}>
-            <option key="sw" value="sw">🇹🇿 Kiswahili</option>
-            <option key="en" value="en">🇬🇧 English</option>
-            <option key="fr" value="fr">🇫🇷 Français</option>
-          </select>
-        </label>
         <span className="prototype-label" key="label"><span className="status-dot" key="status-dot" />{label}</span>
+        <div className="settings-menu" ref={settingsRef} key="settings-menu">
+          <button
+            className="settings-menu-toggle"
+            type="button"
+            aria-label={translateKey("settings.title", language)}
+            aria-haspopup="menu"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen((open) => !open)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.42 1.42-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56v.08h-2v-.08A1.7 1.7 0 0 0 12.38 18a1.7 1.7 0 0 0-1.88.34l-.06.06-1.42-1.42.06-.06A1.7 1.7 0 0 0 9.42 15a1.7 1.7 0 0 0-1.56-1.03h-.08v-2h.08A1.7 1.7 0 0 0 9.42 10a1.7 1.7 0 0 0-.34-1.88l-.06-.06 1.42-1.42.06.06A1.7 1.7 0 0 0 12.38 7a1.7 1.7 0 0 0 1.03-1.56v-.08h2v.08A1.7 1.7 0 0 0 16.44 7a1.7 1.7 0 0 0 1.88-.34l.06-.06 1.42 1.42-.06.06A1.7 1.7 0 0 0 19.4 10a1.7 1.7 0 0 0 1.56 1.03h.08v2h-.08A1.7 1.7 0 0 0 19.4 15Z" />
+            </svg>
+          </button>
+          {settingsOpen && (
+            <div className="settings-menu-popover" role="menu" aria-label={translateKey("settings.menu", language)}>
+              <div className="settings-menu-heading">
+                <strong>{translateKey("settings.title", language)}</strong>
+              </div>
+              <label className="settings-menu-language">
+                <span>{translateKey("language.label", language)}</span>
+                <select
+                  aria-label={translateKey("language.label", language)}
+                  value={language}
+                  onChange={(event) => changeLanguage(event.target.value)}
+                >
+                  <option value="sw">🇹🇿 Kiswahili</option>
+                  <option value="en">🇬🇧 English</option>
+                  <option value="fr">🇫🇷 Français</option>
+                </select>
+              </label>
+              <div className="settings-menu-colors" role="group" aria-label={translateKey("settings.background.title", language)}>
+                <span>{translateKey("settings.background.title", language)}</span>
+                <div>
+                  {backgroundThemes.map((theme) => (
+                    <button
+                      key={theme.color}
+                      type="button"
+                      className={backgroundColor === theme.color ? "selected" : ""}
+                      style={{ backgroundColor: theme.color }}
+                      aria-label={translateKey("settings.background.select", language, { color: translateKey(theme.labelKey, language) })}
+                      aria-pressed={backgroundColor === theme.color}
+                      onClick={() => setBackgroundColor(theme.color)}
+                    />
+                  ))}
+                </div>
+              </div>
+              {user && ["BUYER", "SELLER", "ADMIN"].includes(user.role) && (
+                <button className="settings-menu-full" type="button" role="menuitem" onClick={openFullSettings}>
+                  {translateKey("settings.open", language)}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
         {user && (
           <button
             className="logout-button"
@@ -1320,6 +1394,15 @@ function MarketplaceDashboard({ user, onLogout }) {
   const { language, backgroundColor, setBackgroundColor } = useLanguage();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
+  useEffect(() => {
+    function openRequestedSettings() {
+      if (window.location.hash === "#settings") setTab("settings");
+      else if (!window.location.hash) setTab("overview");
+    }
+    openRequestedSettings();
+    window.addEventListener("hashchange", openRequestedSettings);
+    return () => window.removeEventListener("hashchange", openRequestedSettings);
+  }, []);
   const [stats, setStats] = useState(null);
   const [products, setProducts] = useState([]);
   const [sales, setSales] = useState([]);
@@ -2376,7 +2459,7 @@ function MarketplaceDashboard({ user, onLogout }) {
       </section>
       <nav className="dashboard-tabs" aria-label="Sehemu za dashboard">
         {nav.map(([key, title]) => (
-          <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); }}>
+          <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>
             {title}
           </button>
         ))}
@@ -2612,7 +2695,10 @@ function MarketplaceDashboard({ user, onLogout }) {
             <label className="filter-field">Kuanzia<input className="text-input" type="date" value={salesFilters.start_date} onChange={(event) => setSalesFilters({ ...salesFilters, start_date: event.target.value })} /></label>
             <label className="filter-field">Mpaka<input className="text-input" type="date" value={salesFilters.end_date} onChange={(event) => setSalesFilters({ ...salesFilters, end_date: event.target.value })} /></label>
             <select className="text-input" aria-label="Hali ya oda" value={salesFilters.status} onChange={(event) => setSalesFilters({ ...salesFilters, status: event.target.value })}>
-              <option value="">Hali zote</option><option value="PENDING">PENDING</option><option value="COMPLETED">COMPLETED</option><option value="EXPIRED">EXPIRED</option><option value="CANCELLED">CANCELLED</option>
+              <option value="">{translate("Hali zote", language)}</option>
+              {["PENDING", "COMPLETED", "EXPIRED", "CANCELLED"].map((status) => (
+                <option key={status} value={status}>{translate(status, language)}</option>
+              ))}
             </select>
             <button type="submit" className="table-action">Chuja</button>
             <a className="table-action" href="/api/admin/export/sales">Pakua mauzo CSV</a>
@@ -2923,21 +3009,21 @@ function MarketplaceDashboard({ user, onLogout }) {
               Hali
               <select className="text-input" value={securityFilters.status} onChange={(event) => setSecurityFilters({ ...securityFilters, status: event.target.value })}>
                 <option value="">Hali zote</option>
-                {["OPEN", "IN_REVIEW", "ACCOUNT_REVIEW", "WARNED", "SUSPENDED", "APPEAL_PENDING", "FALSE_POSITIVE", "RESOLVED"].map((status) => <option key={status} value={status}>{status}</option>)}
+                {["OPEN", "IN_REVIEW", "ACCOUNT_REVIEW", "WARNED", "SUSPENDED", "APPEAL_PENDING", "FALSE_POSITIVE", "RESOLVED"].map((status) => <option key={status} value={status}>{translate(status, language)}</option>)}
               </select>
             </label>
             <label className="field-label">
               Kiwango cha hatari
               <select className="text-input" value={securityFilters.severity} onChange={(event) => setSecurityFilters({ ...securityFilters, severity: event.target.value })}>
                 <option value="">Viwango vyote</option>
-                {["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((severity) => <option key={severity} value={severity}>{severity}</option>)}
+                {["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((severity) => <option key={severity} value={severity}>{translate(severity, language)}</option>)}
               </select>
             </label>
             <label className="field-label">
               Aina ya alert
               <select className="text-input" value={securityFilters.category} onChange={(event) => setSecurityFilters({ ...securityFilters, category: event.target.value })}>
                 <option value="">Aina zote</option>
-                {["BRUTE_FORCE", "UNUSUAL_LOGIN_ACTIVITY", "SELLER_RISK", "REPEATED_CANCELLATIONS"].map((category) => <option key={category} value={category}>{category.replaceAll("_", " ")}</option>)}
+                {["BRUTE_FORCE", "UNUSUAL_LOGIN_ACTIVITY", "SELLER_RISK", "REPEATED_CANCELLATIONS"].map((category) => <option key={category} value={category}>{translate(category.replaceAll("_", " "), language)}</option>)}
               </select>
             </label>
             <button type="button" className="table-action" onClick={refreshSecurityData}>Tumia vichujio</button>
@@ -3147,8 +3233,8 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <form className="form-card" onSubmit={submitKyc}>
                   <label className="field-label" htmlFor="kyc-seller-type">Aina ya seller</label>
                   <select id="kyc-seller-type" className="text-input" value={kycForm.seller_type} onChange={(event) => setKycForm({ ...kycForm, seller_type: event.target.value })}>
-                    <option value="INDIVIDUAL">Individual Seller</option>
-                    <option value="BUSINESS">Business Seller</option>
+                    <option value="INDIVIDUAL">{translate("Individual Seller", language)}</option>
+                    <option value="BUSINESS">{translate("Business Seller", language)}</option>
                   </select>
                   <label className="field-label" htmlFor="kyc-phone">Namba ya simu</label>
                   <input id="kyc-phone" className="text-input" required value={kycForm.phone} onChange={(event) => setKycForm({ ...kycForm, phone: event.target.value })} />
@@ -3263,8 +3349,8 @@ function MarketplaceDashboard({ user, onLogout }) {
                 <input id="staff-email" className="text-input" type="email" required value={staffForm.email} onChange={(event) => setStaffForm({ ...staffForm, email: event.target.value })} />
                 <label className="field-label" htmlFor="staff-role">Ruhusa ya msingi</label>
                 <select id="staff-role" className="text-input" value={staffForm.role} onChange={(event) => setStaffForm({ ...staffForm, role: event.target.value })}>
-                  <option value="STAFF">Mfanyakazi wa tawi</option>
-                  <option value="BRANCH_MANAGER">Meneja wa tawi</option>
+                  <option value="STAFF">{translate("Mfanyakazi wa tawi", language)}</option>
+                  <option value="BRANCH_MANAGER">{translate("Meneja wa tawi", language)}</option>
                 </select>
                 <label className="field-label" htmlFor="staff-branch">Tawi</label>
                 <select id="staff-branch" className="text-input" value={staffForm.branch_id} onChange={(event) => setStaffForm({ ...staffForm, branch_id: event.target.value })}>
@@ -3417,6 +3503,7 @@ function SalesTable({ sales, isAdmin, onArchive, onUpdateDelivery }) {
 
 function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
   const localize = useLocalize();
+  const { language } = useLanguage();
   const [deliveryStatus, setDeliveryStatus] = useState(sale.delivery_status || "UNFULFILLED");
   const [deliveryCarrier, setDeliveryCarrier] = useState(sale.delivery_carrier || "");
   const [trackingCode, setTrackingCode] = useState(sale.tracking_code || "");
@@ -3445,24 +3532,14 @@ function SaleRow({ sale, isAdmin, onArchive, onUpdateDelivery }) {
       <td><strong>{sale.product_name}</strong>{sale.variant_label && <small>{sale.variant_label}</small>}<small>{sale.order_id}</small></td>
       {isAdmin && <td>{sale.shop_name || "—"}</td>}
       <td>{sale.buyer_name || "—"}<small>{paymentMethodLabel(sale.payment_method || "")}</small>{sale.delivery_address && <small>{sale.delivery_address}</small>}</td>
-      <td><span className={`order-status ${sale.payment_status.toLowerCase()}`}>{sale.payment_status === "COMPLETED" ? "Imekamilika (demo)" : sale.payment_status}</span>{sale.archived_at && <small>Imefichwa na muuzaji</small>}</td>
+      <td><span className={`order-status ${sale.payment_status.toLowerCase()}`}>{sale.payment_status === "COMPLETED" ? translate("Imekamilika (demo)", language) : translate(sale.payment_status, language)}</span>{sale.archived_at && <small>{translate("Imefichwa na muuzaji", language)}</small>}</td>
       <td>
         {sale.payment_status === "COMPLETED" && onUpdateDelivery ? (
           <div className="delivery-editor">
             <select className="text-input" aria-label="Hali ya delivery" value={deliveryStatus} onChange={(event) => setDeliveryStatus(event.target.value)}>
-              <option value="UNFULFILLED">Haijaanza</option>
-              <option value="PROCESSING">Inachakatwa</option>
-              <option value="ORDER_CONFIRMED">Oda imehakikiwa</option>
-              <option value="SELLER_PREPARING">Muuzaji anaandaa</option>
-              <option value="READY_FOR_PICKUP">Tayari kuchukuliwa</option>
-              <option value="AGENT_ASSIGNED">Agent amepangiwa</option>
-              <option value="PICKED_UP">Imechukuliwa</option>
-              <option value="IN_TRANSIT">Safarini</option>
-              <option value="NEAR_DESTINATION">Karibu na lengwa</option>
-              <option value="OUT_FOR_DELIVERY">Imeondoka kwa delivery</option>
-              <option value="DELIVERED">Imefikishwa</option>
-              <option value="DELIVERY_FAILED">Delivery imeshindikana</option>
-              <option value="RETURNED">Imerejeshwa</option>
+              {["UNFULFILLED", "PROCESSING", "ORDER_CONFIRMED", "SELLER_PREPARING", "READY_FOR_PICKUP", "AGENT_ASSIGNED", "PICKED_UP", "IN_TRANSIT", "NEAR_DESTINATION", "OUT_FOR_DELIVERY", "DELIVERED", "DELIVERY_FAILED", "RETURNED"].map((status) => (
+                <option key={status} value={status}>{translate(status, language)}</option>
+              ))}
             </select>
             <input className="text-input" aria-label="Jina la kampuni ya usafirishaji" maxLength={100} placeholder="Jina la kampuni ya usafirishaji" value={deliveryCarrier} onChange={(event) => setDeliveryCarrier(event.target.value)} />
             <input className="text-input" aria-label="Namba ya ufuatiliaji" maxLength={100} placeholder="Tracking code" value={trackingCode} onChange={(event) => setTrackingCode(event.target.value)} />
@@ -3502,7 +3579,9 @@ function AdminSupportTicket({ ticket, onSave }) {
     <article className="seller-card">
       <div><strong>{ticket.subject}</strong><span>{ticket.email} · {ticket.created_at}</span><small>{ticket.message}</small></div>
       <form className="ticket-response-form" onSubmit={submit}>
-        <select className="text-input" aria-label="Hali ya ombi" value={status} onChange={(event) => setStatus(event.target.value)}><option value="OPEN">OPEN</option><option value="IN_PROGRESS">IN_PROGRESS</option><option value="RESOLVED">RESOLVED</option></select>
+        <select className="text-input" aria-label={translate("Hali ya ombi", language)} value={status} onChange={(event) => setStatus(event.target.value)}>
+          {["OPEN", "IN_PROGRESS", "RESOLVED"].map((value) => <option key={value} value={value}>{translate(value, language)}</option>)}
+        </select>
         <textarea className="text-input feature-textarea" aria-label="Jibu la admin" maxLength={4000} value={response} onChange={(event) => setResponse(event.target.value)} />
         <button className="table-action" type="submit" disabled={busy}>{busy ? "Inahifadhi..." : "Hifadhi jibu"}</button>
         {error && <small className="form-error">{error}</small>}
@@ -3795,6 +3874,8 @@ function PublicTrackingPage({ trackingNumber }) {
 
 
 function DeliveryAgentDashboard({ user, onLogout }) {
+  const { language } = useLanguage();
+  const localize = useLocalize();
   const [deliveries, setDeliveries] = useState([]);
   const [availableDeliveries, setAvailableDeliveries] = useState([]);
   const [sharing, setSharing] = useState(false);
@@ -3887,7 +3968,7 @@ function DeliveryAgentDashboard({ user, onLogout }) {
   const activeDeliveries = deliveries.filter((delivery) => activeStatuses.includes(delivery.delivery_status));
   const completedDeliveries = deliveries.filter((delivery) => ["DELIVERED", "DELIVERY_FAILED", "RETURNED"].includes(delivery.delivery_status));
 
-  return (
+  return localize(
     <main className="page-shell">
       <Header label="Delivery Agent" user={user} onLogout={onLogout} />
       <section className="dashboard-welcome">
@@ -3935,9 +4016,9 @@ function DeliveryAgentDashboard({ user, onLogout }) {
                         <button type="button" onClick={() => startSharing(delivery.order_id)}>Anzisha GPS live</button>
                         {sharing && activeOrderId === delivery.order_id && <button type="button" onClick={stopSharing}>Acha kushare GPS</button>}
                         {delivery.delivery_status === "AGENT_ASSIGNED" && <button type="button" onClick={() => updateStatus(delivery.order_id, "PICKED_UP")}>Thibitisha pickup</button>}
-                        {["PICKED_UP", "AGENT_ASSIGNED"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "IN_TRANSIT")}>In transit</button>}
-                        {["IN_TRANSIT", "NEAR_DESTINATION"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "OUT_FOR_DELIVERY")}>Out for delivery</button>}
-                        {["PICKED_UP", "IN_TRANSIT", "NEAR_DESTINATION", "OUT_FOR_DELIVERY"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "DELIVERY_FAILED")}>Delivery failed</button>}
+                        {["PICKED_UP", "AGENT_ASSIGNED"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "IN_TRANSIT")}>{translate("In transit", language)}</button>}
+                        {["IN_TRANSIT", "NEAR_DESTINATION"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "OUT_FOR_DELIVERY")}>{translate("Out for delivery", language)}</button>}
+                        {["PICKED_UP", "IN_TRANSIT", "NEAR_DESTINATION", "OUT_FOR_DELIVERY"].includes(delivery.delivery_status) && <button type="button" onClick={() => updateStatus(delivery.order_id, "DELIVERY_FAILED")}>{translate("Delivery failed", language)}</button>}
                       </>
                     )}
                     {delivery.delivery_status === "DELIVERY_FAILED" && <small>Imeshindikana · angalia historia/maelezo ya oda.</small>}
@@ -3971,7 +4052,7 @@ function DeliveryAgentDashboard({ user, onLogout }) {
             {completedDeliveries.map((delivery) => (
               <div className="dashboard-status-row" key={delivery.order_id}>
                 <span>{delivery.product_name} · {delivery.order_id}</span>
-                <strong>{delivery.delivery_status}</strong>
+                <strong>{translate(delivery.delivery_status, language)}</strong>
               </div>
             ))}
             {!completedDeliveries.length && <p className="empty-state">Bado hakuna delivery iliyokamilika au kushindikana.</p>}
@@ -4026,6 +4107,15 @@ function BuyerDashboard({ user, onLogout }) {
   const localize = useLocalize();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
+  useEffect(() => {
+    function openRequestedSettings() {
+      if (window.location.hash === "#settings") setTab("account");
+      else if (!window.location.hash) setTab("overview");
+    }
+    openRequestedSettings();
+    window.addEventListener("hashchange", openRequestedSettings);
+    return () => window.removeEventListener("hashchange", openRequestedSettings);
+  }, []);
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   const [wishlist, setWishlist] = useState([]);
@@ -4170,7 +4260,7 @@ function BuyerDashboard({ user, onLogout }) {
       <Header label="Akaunti ya mnunuzi" user={user} onLogout={onLogout} />
       <section className="dashboard-welcome"><div><div className="eyebrow"><span /> AKAUNTI YA MNUNUZI</div><h1>Habari, <span>{user.full_name}</span></h1><p>Vinjari bidhaa, fuatilia oda na wasiliana na timu ya msaada.</p></div><a className="table-action" href="/">Marketplace ya umma</a></section>
       <nav className="dashboard-tabs" aria-label="Sehemu za mnunuzi">
-        {tabs.map(([key, title]) => <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); }}>{title}</button>)}
+        {tabs.map(([key, title]) => <button key={key} type="button" className={tab === key ? "active" : ""} onClick={() => { setTab(key); setError(""); setMessage(""); if (window.location.hash === "#settings") window.history.replaceState(null, "", window.location.pathname + window.location.search); }}>{title}</button>)}
       </nav>
       {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
       {message && <p className="success-message dashboard-alert" role="status">{message}</p>}
