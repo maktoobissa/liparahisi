@@ -1508,6 +1508,7 @@ function MarketplaceDashboard({ user, onLogout }) {
     store_slug: user.store_slug || "",
     store_description: "",
     store_image_url: "",
+    profile_image_url: user.profile_image_url || "",
   });
   const [csvText, setCsvText] = useState("");
   const [passwordForm, setPasswordForm] = useState({ current_password: "", new_password: "" });
@@ -1700,6 +1701,10 @@ function MarketplaceDashboard({ user, onLogout }) {
         store_slug: result.store.store_slug,
         store_description: result.store.store_description,
         store_image_url: result.store.store_image_url,
+        profile_image_url: result.store.profile_image_url || "",
+        profile_full_name: result.store.full_name,
+        profile_phone: result.store.phone,
+        kyc_status: result.store.kyc_status,
       }))
       .catch((requestError) => setError(requestError.message));
   }, []);
@@ -1940,27 +1945,6 @@ function MarketplaceDashboard({ user, onLogout }) {
         body: JSON.stringify({ status }),
       });
       await refresh();
-    } catch (requestError) {
-      setError(requestError.message);
-    }
-  }
-
-  async function uploadProfileImage(event) {
-    event.preventDefault();
-    setError("");
-    setMessage("");
-    const file = event.currentTarget.elements.profile_image?.files?.[0];
-    if (!file) {
-      setError(translate("Chagua picha ya profile.", language));
-      return;
-    }
-    const formData = new FormData();
-    formData.append("image", file);
-    try {
-      await api("/account/profile-image", { method: "POST", body: formData });
-      setMessage(translate("Picha ya profile imehifadhiwa.", language));
-      await refresh();
-      window.location.reload();
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -2277,6 +2261,26 @@ function MarketplaceDashboard({ user, onLogout }) {
       });
       setStorefront(updated);
       setMessage("Taarifa za duka zimehifadhiwa.");
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function uploadProfileImage(event) {
+    setError("");
+    setMessage("");
+    const file = event.target?.files?.[0] || event.currentTarget?.elements?.profile_image?.files?.[0];
+    if (!file) {
+      setError(translate("Chagua picha ya profile.", language));
+      return;
+    }
+    const formData = new FormData();
+    formData.append("image", file);
+    try {
+      const result = await api("/account/profile-image", { method: "POST", body: formData });
+      setStorefront((current) => ({ ...current, profile_image_url: result.profile_image_url }));
+      setMessage(translate("Picha ya profile imehifadhiwa.", language));
       await refresh();
     } catch (requestError) {
       setError(requestError.message);
@@ -2865,6 +2869,13 @@ function MarketplaceDashboard({ user, onLogout }) {
         <section className="dashboard-content feature-columns">
           <form className="form-card" onSubmit={saveStorefront}>
             <h2>Wasifu wa duka</h2>
+            {storefront.profile_image_url && (
+              <img className="profile-image-preview" src={storefront.profile_image_url} alt={storefront.shop_name} />
+            )}
+            <div className="buyer-form profile-inline-upload">
+              <label className="field-label" htmlFor="seller-profile-image">{translate("Pakia picha ya profile (JPEG, PNG au WebP)", language)}</label>
+              <input id="seller-profile-image" name="profile_image" className="text-input" type="file" accept="image/jpeg,image/png,image/webp" onChange={uploadProfileImage} />
+            </div>
             <label className="field-label" htmlFor="store-name">Jina la duka</label>
             <input id="store-name" className="text-input" minLength={2} maxLength={100} required value={storefront.shop_name} onChange={(event) => setStorefront({ ...storefront, shop_name: event.target.value })} />
             <label className="field-label" htmlFor="store-description">Maelezo ya duka</label>
@@ -4047,6 +4058,18 @@ function StorefrontPage({ storeSlug }) {
           <section className="dashboard-welcome storefront-welcome">
             {storefront.store.store_image_url && <img src={storefront.store.store_image_url} alt="" />}
             <div><div className="eyebrow"><span /> DUKA LILILOIDHINISHWA</div><h1>{storefront.store.shop_name}</h1><p>{storefront.store.store_description || `Duka la ${storefront.store.full_name}`}</p></div>
+            <div className="storefront-seller-profile">
+              <img
+                src={`/api/sellers/${encodeURIComponent(storefront.store.id)}/profile-image`}
+                alt={storefront.store.full_name}
+                onError={(event) => { event.currentTarget.style.display = "none"; }}
+              />
+              <div>
+                <strong>{storefront.store.full_name}</strong>
+                {storefront.store.phone && <span>{storefront.store.phone}</span>}
+                <small>{storefront.store.kyc_status === "VERIFIED" ? "Muuzaji amethibitishwa" : "Muuzaji bado hayajathibitishwa kikamilifu"}</small>
+              </div>
+            </div>
           </section>
           <ProductVideoFeed products={storefront.products} />
           <div className="product-grid marketplace-grid">

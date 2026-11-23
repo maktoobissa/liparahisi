@@ -7166,8 +7166,8 @@ def read_storefront(store_slug: str):
     with db_connection() as connection:
         seller = connection.execute(
             """
-            SELECT id, full_name, shop_name, store_slug, store_description,
-                   store_image_url, kyc_status
+            SELECT id, full_name, phone, shop_name, store_slug, store_description,
+                   store_image_url, profile_image_url, kyc_status
             FROM users
             WHERE store_slug = ? AND role = 'SELLER' AND status = 'ACTIVE'
             """,
@@ -8111,6 +8111,22 @@ def read_product(product_id: str):
     return attach_product_variants(
         attach_product_videos(attach_product_gallery([result]))
     )[0]
+
+
+@app.get("/api/sellers/{seller_id}/profile-image")
+def seller_profile_image(seller_id: str):
+    with db_connection() as connection:
+        row = connection.execute(
+            "SELECT content_type, image_data FROM account_images WHERE user_id = ?",
+            (seller_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Picha ya muuzaji haijapakiwa.")
+    return Response(
+        content=bytes(row["image_data"]),
+        media_type=row["content_type"],
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.api_route("/api/account/profile-image", methods=["GET", "POST", "DELETE"])

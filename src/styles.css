@@ -1533,6 +1533,51 @@ select {
   margin: 4px 0 12px;
 }
 
+.storefront-seller-profile {
+  min-width: 190px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(23, 77, 170, 0.10);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.storefront-seller-profile img {
+  width: 48px;
+  height: 48px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  object-fit: cover;
+  box-shadow: 0 0 0 1px var(--line);
+}
+
+.storefront-seller-profile div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.storefront-seller-profile strong,
+.storefront-seller-profile span,
+.storefront-seller-profile small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storefront-seller-profile strong {
+  color: var(--brand-navy);
+  font-size: 12px;
+}
+
+.storefront-seller-profile span,
+.storefront-seller-profile small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
 .settings-menu-toggle {
   width: 36px;
   height: 36px;
