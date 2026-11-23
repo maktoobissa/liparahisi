@@ -3758,18 +3758,7 @@ function PublicMarketplace({ onLogin }) {
       {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
       <ProductVideoFeed products={products} />
       {products.length ? (
-        <div className="product-grid marketplace-grid">
-          {products.map((product) => (
-            <article className="market-product" key={product.id}>
-              <ProductGallery product={product} className="market-product-gallery" />
-              <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description || "Bidhaa ya muuzaji wetu."}</p><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name || "Duka"}</span></div>
-              <div className="market-product-actions">
-                {product.store_slug && <a className="table-action" href={`/store/${encodeURIComponent(product.store_slug)}`}>Tembelea duka</a>}
-                <a className="generate-button" href={`/pay/${product.id}`}>Nunua sasa</a>
-              </div>
-            </article>
-          ))}
-        </div>
+        <SellerProductSections products={products} showSave={false} />
       ) : <p className="empty-state">Hakuna bidhaa za kuonyesha kwa sasa.</p>}
       <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="payments">Malipo halisi hayajaunganishwa</span></BrandFooter>
     </main>
@@ -4103,8 +4092,91 @@ function StorefrontPage({ storeSlug }) {
   );
 }
 
+function SellerProductSections({ products, onSave, showSave = true, maxPerPage = 4 }) {
+  const { language } = useLanguage();
+  const [pages, setPages] = useState({});
+  const grouped = products.reduce((groups, product) => {
+    const seller = product.shop_name || translate("Duka", language);
+    if (!groups[seller]) groups[seller] = [];
+    groups[seller].push(product);
+    return groups;
+  }, {});
+
+  return (
+    <div className="seller-product-sections">
+      {Object.entries(grouped).map(([seller, sellerProducts]) => {
+        const currentPage = pages[seller] || 0;
+        const pageCount = Math.max(1, Math.ceil(sellerProducts.length / maxPerPage));
+        const safePage = Math.min(currentPage, pageCount - 1);
+        const visible = sellerProducts.slice(safePage * maxPerPage, (safePage + 1) * maxPerPage);
+        return (
+          <section className="seller-product-section" key={seller}>
+            <div className="seller-product-heading">
+              <div>
+                <span>{translate("Muuzaji", language)}</span>
+                <h2>{seller}</h2>
+              </div>
+              <span>{sellerProducts.length} {translate("Bidhaa", language)}</span>
+            </div>
+            <div className="seller-product-row">
+              {visible.map((product) => (
+                <article className="market-product seller-product-card" key={product.id}>
+                  <ProductGallery product={product} className="market-product-gallery" />
+                  <div>
+                    <small>{product.category || translate("Bidhaa", language)}</small>
+                    <h2>{product.name}</h2>
+                    <p>{product.description || ""}</p>
+                    <strong>TZS {formatMoney(product.amount, language)}</strong>
+                  </div>
+                  <div className="market-product-actions">
+                    {showSave && (
+                      <button type="button" className="table-action" onClick={() => onSave(product)}>
+                        {translate("Hifadhi", language)}
+                      </button>
+                    )}
+                    {product.store_slug && (
+                      <a className="table-action" href={`/store/${encodeURIComponent(product.store_slug)}`}>
+                        {translate("Tembelea duka", language)}
+                      </a>
+                    )}
+                    <a className="generate-button" href={`/pay/${product.id}`}>
+                      {translate("Nunua", language)}
+                    </a>
+                  </div>
+                </article>
+              ))}
+            </div>
+            {pageCount > 1 && (
+              <div className="seller-pagination" aria-label={`${translate("Pages", language)} ${seller}`}>
+                <button type="button" disabled={safePage === 0} onClick={() => setPages((current) => ({ ...current, [seller]: safePage - 1 }))}>
+                  ‹
+                </button>
+                {Array.from({ length: pageCount }, (_, index) => (
+                  <button
+                    type="button"
+                    key={index}
+                    className={index === safePage ? "active" : ""}
+                    aria-current={index === safePage ? "page" : undefined}
+                    onClick={() => setPages((current) => ({ ...current, [seller]: index }))}
+                  >
+                    {index + 1}
+                  </button>
+                ))}
+                <button type="button" disabled={safePage === pageCount - 1} onClick={() => setPages((current) => ({ ...current, [seller]: safePage + 1 }))}>
+                  ›
+                </button>
+              </div>
+            )}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 function BuyerDashboard({ user, onLogout }) {
   const localize = useLocalize();
+  const { language, backgroundColor, setBackgroundColor } = useLanguage();
   const { notify } = useNotification();
   const [tab, setTab] = useState("overview");
   useEffect(() => {
@@ -4127,6 +4199,7 @@ function BuyerDashboard({ user, onLogout }) {
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("");
   const [ticket, setTicket] = useState({ subject: "", message: "" });
+  const [passwordForm, setPasswordForm] = useState({ current_password: "", new_password: "" });
   const [error, setError] = useFeedbackState("error");
   const [message, setMessage] = useFeedbackState("success");
   const [busy, setBusy] = useState(false);
@@ -4242,6 +4315,22 @@ function BuyerDashboard({ user, onLogout }) {
     setBusy(false);
   }
 
+  async function changePassword(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    try {
+      await api("/auth/password", {
+        method: "PUT",
+        body: JSON.stringify(passwordForm),
+      });
+      setPasswordForm({ current_password: "", new_password: "" });
+      setMessage(translate("Nenosiri limebadilishwa.", language));
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   const filteredProducts = products.filter((product) =>
     (!category || product.category === category)
     && (!query || `${product.name} ${product.shop_name || ""}`.toLowerCase().includes(query.toLowerCase()))
@@ -4318,20 +4407,15 @@ function BuyerDashboard({ user, onLogout }) {
             <select className="text-input" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">Makundi yote</option>{categories.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select>
           </form>
           <ProductVideoFeed products={filteredProducts} />
-          <div className="product-grid marketplace-grid">
-            {filteredProducts.map((product) => (
-              <article className="market-product" key={product.id}>
-                <ProductGallery product={product} className="market-product-gallery" />
-                <div><small>{product.category || "Bidhaa"}</small><h2>{product.name}</h2><p>{product.description}</p><strong>TZS {formatMoney(product.amount)}</strong><span>{product.shop_name || "Duka"}</span></div>
-                <div className="market-product-actions">
-                  <button type="button" className="table-action" onClick={() => runAction(() => api(`/wishlist/${product.id}`, { method: "POST" }), "Bidhaa imehifadhiwa kwenye vipendwa.")}>Hifadhi</button>
-                  {product.store_slug && <a className="table-action" href={`/store/${encodeURIComponent(product.store_slug)}`}>Duka</a>}
-                  <a className="generate-button" href={`/pay/${product.id}`}>Nunua</a>
-                </div>
-              </article>
-            ))}
-            {!filteredProducts.length && <p className="empty-state">Hakuna bidhaa zinazolingana na utafutaji.</p>}
-          </div>
+          {filteredProducts.length ? (
+            <SellerProductSections
+              products={filteredProducts}
+              onSave={(product) => runAction(
+                () => api(`/wishlist/${product.id}`, { method: "POST" }),
+                translate("Bidhaa imehifadhiwa kwenye vipendwa.", language),
+              )}
+            />
+          ) : <p className="empty-state">{translate("Hakuna bidhaa zinazolingana na utafutaji.", language)}</p>}
         </section>
       )}
       {tab === "wishlist" && (
@@ -4369,7 +4453,43 @@ function BuyerDashboard({ user, onLogout }) {
           <div className="feature-list"><h2>Ombi zako</h2>{tickets.map((item) => <article className="seller-card" key={item.id}><div><strong>{item.subject}</strong><span>{item.status} · {item.created_at}</span><small>{item.admin_response || item.message}</small></div></article>)}{!tickets.length && <p className="empty-state">Hakuna ombi la msaada bado.</p>}</div>
         </section>
       )}
-      {tab === "account" && <AccountSecurity />}
+      {tab === "account" && (
+        <section className="dashboard-content buyer-settings-layout">
+          <section className="form-card settings-form background-settings" aria-labelledby="buyer-background-settings-title">
+            <h2 id="buyer-background-settings-title">{translateKey("settings.background.title", language)}</h2>
+            <p className="field-hint">{translateKey("settings.background.description", language)}</p>
+            <div className="background-palette" role="group" aria-label={translateKey("settings.background.title", language)}>
+              {backgroundThemes.map((theme) => {
+                const label = translateKey(theme.labelKey, language);
+                const selected = backgroundColor === theme.color;
+                return (
+                  <button
+                    className={`background-choice${selected ? " selected" : ""}`}
+                    type="button"
+                    key={theme.color}
+                    aria-label={translateKey("settings.background.select", language, { color: label })}
+                    aria-pressed={selected}
+                    onClick={() => setBackgroundColor(theme.color)}
+                  >
+                    <span className="background-swatch" style={{ backgroundColor: theme.color }} aria-hidden="true" />
+                    <span>{label}</span>
+                    {selected && <small>{translateKey("settings.background.selected", language)}</small>}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+          <form className="form-card settings-form" onSubmit={changePassword}>
+            <h2>{translateKey("settings.password", language)}</h2>
+            <label className="field-label" htmlFor="buyer-current-password">{translate("Nenosiri la sasa", language)}</label>
+            <input id="buyer-current-password" className="text-input" type="password" autoComplete="current-password" required value={passwordForm.current_password} onChange={(event) => setPasswordForm({ ...passwordForm, current_password: event.target.value })} />
+            <label className="field-label" htmlFor="buyer-new-password">{translate("Nenosiri jipya (angalau herufi 10)", language)}</label>
+            <input id="buyer-new-password" className="text-input" type="password" autoComplete="new-password" minLength={10} required value={passwordForm.new_password} onChange={(event) => setPasswordForm({ ...passwordForm, new_password: event.target.value })} />
+            <button className="generate-button" type="submit">{translate("Hifadhi nenosiri", language)}</button>
+          </form>
+          <AccountSecurity />
+        </section>
+      )}
       <BrandFooter><span key="copyright">© 2026 LipaRahisi</span><span key="payments">Malipo ya majaribio pekee</span></BrandFooter>
     </main>
   );
