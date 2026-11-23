@@ -625,6 +625,7 @@ function AuthScreen({ setupRequired, setupAvailable, onAuth, onBrowse }) {
             <>
               <label className="field-label" htmlFor="auth-totp">Nambari ya authenticator au recovery code (ikiwa 2FA imewashwa)</label>
               <input id="auth-totp" className="text-input" name="totp_code" inputMode="text" maxLength={32} autoComplete="one-time-code" value={form.totp_code} onChange={change} />
+              <p className="field-hint">Ikiwa 2FA imewashwa, ingiza nambari ya tarakimu 6 kutoka kwenye authenticator app au recovery code iliyohifadhiwa.</p>
             </>
           )}
           {message && <p className="success-message" role="status">{message}</p>}
@@ -989,6 +990,8 @@ function DashboardActivityFeed({ rows = [] }) {
 }
 
 function AccountSecurity() {
+  const { language } = useLanguage();
+  const localize = useLocalize();
   const [status, setStatus] = useState({ enabled: false, enrollment_available: false });
   const [sessions, setSessions] = useState([]);
   const [setupUri, setSetupUri] = useState("");
@@ -1026,11 +1029,6 @@ function AccountSecurity() {
   useEffect(() => {
     refresh().catch((requestError) => setError(requestError.message));
   }, []);
-
-  useEffect(() => {
-    if (!selectedBusinessId) return;
-    loadBusinessSummary(selectedBusinessId).catch((requestError) => setError(requestError.message));
-  }, [selectedBusinessId]);
 
   useEffect(() => {
     let active = true;
@@ -1102,22 +1100,22 @@ function AccountSecurity() {
     } catch (requestError) {
       setError(requestError.message);
     }
+  }
 
-    async function saveNotificationPreferences(event) {
-      event.preventDefault();
-      try {
-        await api("/notifications/preferences", {
-          method: "PUT",
-          body: JSON.stringify(notificationPreferences),
-        });
-        setMessage("Mapendeleo ya arifa yamehifadhiwa.");
-      } catch (requestError) {
-        setError(requestError.message);
-      }
+  async function saveNotificationPreferences(event) {
+    event.preventDefault();
+    try {
+      await api("/notifications/preferences", {
+        method: "PUT",
+        body: JSON.stringify(notificationPreferences),
+      });
+      setMessage("Mapendeleo ya arifa yamehifadhiwa.");
+    } catch (requestError) {
+      setError(requestError.message);
     }
   }
 
-  return (
+  return localize(
     <div className="dashboard-content">
       {error && <p className="form-error dashboard-alert" role="alert">{error}</p>}
       {message && <p className="success-message dashboard-alert" role="status">{message}</p>}

@@ -70,7 +70,7 @@ services:
       - key: ADMIN_SETUP_TOKEN
         generateValue: true
       - key: MFA_ENCRYPTION_KEY
-        sync: false
+        generateValue: true
       - key: SELLER_KYC_ENCRYPTION_KEY
         sync: false
       - key: OPENAI_API_KEY
