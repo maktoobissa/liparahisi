@@ -401,6 +401,7 @@ function Header({ label = "Demo", user, onLogout }) {
     setSettingsOpen(false);
     if (user) {
       window.location.hash = "settings";
+      window.dispatchEvent(new CustomEvent("liparahisi-open-settings"));
     } else {
       document.querySelector(".dashboard-content")?.scrollIntoView({ behavior: "smooth" });
     }
@@ -415,6 +416,9 @@ function Header({ label = "Demo", user, onLogout }) {
         <span className="brand-mobile-name" key="brand-name">LipaRahisi</span>
       </a>
       <div className="header-right" key="controls">
+        {user?.profile_image_url && (
+          <img className="header-avatar" src={user.profile_image_url} alt="" aria-hidden="true" key="avatar" />
+        )}
         <span className="prototype-label" key="label"><span className="status-dot" key="status-dot" />{label}</span>
         <div className="settings-menu" ref={settingsRef} key="settings-menu">
           <button
@@ -944,6 +948,37 @@ function DashboardTrendChart({ title, rows = [] }) {
               </div>
             );
           })}
+          {detailProduct && (
+            <div className="product-detail-backdrop" role="presentation" onClick={() => setDetailProduct(null)}>
+              <section
+                className="product-detail-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-label={detailProduct.name}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <button className="product-detail-close" type="button" aria-label={translate("Funga", language)} onClick={() => setDetailProduct(null)}>×</button>
+                <ProductGallery product={detailProduct} className="product-detail-gallery" />
+                <div className="product-detail-copy">
+                  <span>{detailProduct.category || translate("Bidhaa", language)}</span>
+                  <h2>{detailProduct.name}</h2>
+                  <p>{detailProduct.description || translate("Hakuna maelezo ya bidhaa.", language)}</p>
+                  <strong>TZS {formatMoney(detailProduct.amount, language)}</strong>
+                  <small>{detailProduct.shop_name || translate("Duka", language)}</small>
+                  <div className="market-product-actions">
+                    {showSave && (
+                      <button type="button" className="table-action" onClick={() => onSave(detailProduct)}>
+                        {translate("Hifadhi", language)}
+                      </button>
+                    )}
+                    <a className="generate-button" href={`/pay/${detailProduct.id}`}>
+                      {translate("Nunua sasa", language)}
+                    </a>
+                  </div>
+                </div>
+              </section>
+            </div>
+          )}
         </div>
       ) : <p className="empty-state">Hakuna mauzo katika kipindi hiki.</p>}
     </section>
@@ -1397,9 +1432,16 @@ function MarketplaceDashboard({ user, onLogout }) {
       if (window.location.hash === "#settings") setTab("settings");
       else if (!window.location.hash) setTab("overview");
     }
+    function openCustomSettings() {
+      setTab("settings");
+    }
     openRequestedSettings();
     window.addEventListener("hashchange", openRequestedSettings);
-    return () => window.removeEventListener("hashchange", openRequestedSettings);
+    window.addEventListener("liparahisi-open-settings", openCustomSettings);
+    return () => {
+      window.removeEventListener("hashchange", openRequestedSettings);
+      window.removeEventListener("liparahisi-open-settings", openCustomSettings);
+    };
   }, []);
   const [stats, setStats] = useState(null);
   const [products, setProducts] = useState([]);
@@ -1928,6 +1970,27 @@ function MarketplaceDashboard({ user, onLogout }) {
         body: JSON.stringify({ status }),
       });
       await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
+  async function uploadProfileImage(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    const file = event.currentTarget.elements.profile_image?.files?.[0];
+    if (!file) {
+      setError(translate("Chagua picha ya profile.", language));
+      return;
+    }
+    const formData = new FormData();
+    formData.append("image", file);
+    try {
+      await api("/account/profile-image", { method: "POST", body: formData });
+      setMessage(translate("Picha ya profile imehifadhiwa.", language));
+      await refresh();
+      window.location.reload();
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -3439,6 +3502,19 @@ function MarketplaceDashboard({ user, onLogout }) {
               })}
             </div>
           </section>
+          {!isAdmin && (
+            <section className="form-card settings-form profile-image-settings" aria-labelledby="seller-profile-image-title">
+              <h2 id="seller-profile-image-title">{translate("Picha ya profile ya muuzaji", language)}</h2>
+              {user.profile_image_url && (
+                <img className="profile-image-preview" src={user.profile_image_url} alt={user.shop_name || user.full_name} />
+              )}
+              <form className="buyer-form" onSubmit={uploadProfileImage}>
+                <label className="field-label" htmlFor="seller-profile-image">{translate("Pakia picha ya profile (JPEG, PNG au WebP)", language)}</label>
+                <input id="seller-profile-image" name="profile_image" className="text-input" type="file" accept="image/jpeg,image/png,image/webp" required />
+                <button className="generate-button" type="submit">{translate("Hifadhi picha", language)}</button>
+              </form>
+            </section>
+          )}
           <form className="form-card settings-form" onSubmit={changePassword}>
             <h2>{translateKey("settings.password", language)}</h2>
             <label className="field-label" htmlFor="current-password">Nenosiri la sasa</label>
@@ -4093,6 +4169,7 @@ function StorefrontPage({ storeSlug }) {
 function SellerProductSections({ products, onSave, showSave = true, maxPerPage = 4 }) {
   const { language } = useLanguage();
   const [pages, setPages] = useState({});
+  const [detailProduct, setDetailProduct] = useState(null);
   const grouped = products.reduce((groups, product) => {
     const seller = product.shop_name || translate("Duka", language);
     if (!groups[seller]) groups[seller] = [];
@@ -4127,6 +4204,9 @@ function SellerProductSections({ products, onSave, showSave = true, maxPerPage =
                     <strong>TZS {formatMoney(product.amount, language)}</strong>
                   </div>
                   <div className="market-product-actions">
+                    <button type="button" className="table-action" onClick={() => setDetailProduct(product)}>
+                      {translate("Chunguza bidhaa", language)}
+                    </button>
                     {showSave && (
                       <button type="button" className="table-action" onClick={() => onSave(product)}>
                         {translate("Hifadhi", language)}
@@ -4182,9 +4262,16 @@ function BuyerDashboard({ user, onLogout }) {
       if (window.location.hash === "#settings") setTab("account");
       else if (!window.location.hash) setTab("overview");
     }
+    function openCustomSettings() {
+      setTab("account");
+    }
     openRequestedSettings();
     window.addEventListener("hashchange", openRequestedSettings);
-    return () => window.removeEventListener("hashchange", openRequestedSettings);
+    window.addEventListener("liparahisi-open-settings", openCustomSettings);
+    return () => {
+      window.removeEventListener("hashchange", openRequestedSettings);
+      window.removeEventListener("liparahisi-open-settings", openCustomSettings);
+    };
   }, []);
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);

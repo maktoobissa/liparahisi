@@ -613,6 +613,12 @@ def initialize_db():
                 created_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, code_hash)
             );
+            CREATE TABLE IF NOT EXISTS account_images (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL,
+                image_data BLOB NOT NULL,
+                updated_at {timestamp_type} NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS seller_documents (
                 id TEXT PRIMARY KEY,
                 seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -979,6 +985,7 @@ def initialize_db():
             "store_slug": "TEXT NOT NULL DEFAULT ''",
             "store_description": "TEXT NOT NULL DEFAULT ''",
             "store_image_url": "TEXT NOT NULL DEFAULT ''",
+            "profile_image_url": "TEXT NOT NULL DEFAULT ''",
             "email_verified": "INTEGER NOT NULL DEFAULT 0",
             "verification_token_hash": "TEXT NOT NULL DEFAULT ''",
             "reset_token_hash": "TEXT NOT NULL DEFAULT ''",
@@ -2596,6 +2603,7 @@ def safe_user(user):
         "status": user["status"],
         "shop_name": user["shop_name"],
         "store_slug": store_slug,
+        "profile_image_url": user["profile_image_url"] if "profile_image_url" in user.keys() else "",
         "phone": user["phone"],
         "preferred_language": user["preferred_language"] if "preferred_language" in user.keys() else "sw",
     }
@@ -2610,7 +2618,7 @@ def get_current_user(request, allow_suspended=False):
         user = connection.execute(
             """
             SELECT u.id, u.full_name, u.email, u.role, u.status, u.shop_name,
-                   u.store_slug, u.phone, u.preferred_language
+                   u.store_slug, u.profile_image_url, u.phone, u.preferred_language
             FROM sessions s JOIN users u ON u.id = s.user_id
             WHERE s.token_hash = ? AND s.expires_at > ?
             """,
@@ -8103,6 +8111,50 @@ def read_product(product_id: str):
     return attach_product_variants(
         attach_product_videos(attach_product_gallery([result]))
     )[0]
+
+
+@app.api_route("/api/account/profile-image", methods=["GET", "POST", "DELETE"])
+async def account_profile_image(request: Request, image: UploadFile = File(None)):
+    if request.method == "GET":
+        user = get_current_user(request)
+        with db_connection() as connection:
+            row = connection.execute(
+                "SELECT content_type, image_data FROM account_images WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Picha ya profile haijapakiwa.")
+        return Response(content=bytes(row["image_data"]), media_type=row["content_type"], headers={"Cache-Control": "private, max-age=300"})
+
+    user = get_current_user(request)
+    if request.method == "DELETE":
+        with db_connection() as connection:
+            connection.execute("DELETE FROM account_images WHERE user_id = ?", (user["id"],))
+            connection.execute("UPDATE users SET profile_image_url = '' WHERE id = ?", (user["id"],))
+        return {"profile_image_url": ""}
+
+    if image is None:
+        raise HTTPException(status_code=422, detail="Chagua picha ya profile.")
+    content_type, image_data = read_uploaded_product_image(image)
+    profile_image_url = "/api/account/profile-image"
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO account_images (user_id, content_type, image_data)
+            VALUES (?, ?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET
+                content_type = excluded.content_type,
+                image_data = excluded.image_data,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user["id"], content_type, image_data),
+        )
+        connection.execute(
+            "UPDATE users SET profile_image_url = ? WHERE id = ?",
+            (profile_image_url, user["id"]),
+        )
+    record_audit("PROFILE_IMAGE_UPDATED", "account", user["id"], content_type, actor=user, request=request)
+    return {"profile_image_url": profile_image_url}
 
 
 def read_uploaded_product_image(image):
