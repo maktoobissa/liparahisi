@@ -1,4 +1,4 @@
-const CACHE_NAME = "liparahisi-shell-v8";
+const CACHE_NAME = "liparahisi-shell-v9";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
