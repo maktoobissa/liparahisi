@@ -3691,7 +3691,7 @@ function ProductVideoFeed({ products }) {
   );
 }
 
-function PublicMarketplace({ onLogin }) {
+function PublicMarketplace({ onLogin, unavailableMessage = "" }) {
   const localize = useLocalize();
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
@@ -3703,12 +3703,15 @@ function PublicMarketplace({ onLogin }) {
     const params = new URLSearchParams();
     if (query.trim()) params.set("q", query.trim());
     if (category) params.set("category", category);
-    const [productRows, categoryRows] = await Promise.all([
+    const [productResult, categoryResult] = await Promise.allSettled([
       api(`/products?${params.toString()}`),
       api("/categories"),
     ]);
-    setProducts(productRows);
-    setCategories(categoryRows);
+    if (productResult.status === "fulfilled") setProducts(productResult.value);
+    if (categoryResult.status === "fulfilled") setCategories(categoryResult.value);
+    if (productResult.status === "rejected" && categoryResult.status === "rejected") {
+      throw productResult.reason;
+    }
   }
 
   useEffect(() => {
@@ -3728,6 +3731,11 @@ function PublicMarketplace({ onLogin }) {
   return localize(
     <main className="page-shell">
       <Header label="Marketplace" />
+      {unavailableMessage && (
+        <p className="demo-notice dashboard-notice" role="status">
+          {translate("Huduma ya akaunti haijafikia sasa. Bidhaa za umma bado zinapatikana.", "")}
+        </p>
+      )}
       <section className="dashboard-welcome">
         <div><div className="eyebrow"><span /> MARKETPLACE</div><h1>Nunua kwa <span>LipaRahisi</span></h1><p>Tafuta bidhaa, angalia maduka na anza oda ya majaribio.</p></div>
         <button className="table-action" type="button" onClick={onLogin}>Ingia / Jisajili</button>
@@ -5497,9 +5505,25 @@ export default function App() {
 
   useEffect(() => {
     if (checkoutMatch || cartMatch || storefrontMatch || forgotMatch || resetMatch || verifyMatch) return;
+    let active = true;
     api("/auth/status")
-      .then(setAuthState)
-      .catch((requestError) => setAuthError(requestError.message));
+      .then((state) => {
+        if (active) setAuthState(state);
+      })
+      .catch((requestError) => {
+        if (!active) return;
+        setAuthError("");
+        setAuthState({
+          setup_required: false,
+          setup_available: false,
+          user: null,
+          unavailable: true,
+          message: requestError.message,
+        });
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   async function logout() {
@@ -5535,7 +5559,10 @@ export default function App() {
     if (authState.user.role === "DELIVERY_AGENT") return <DeliveryAgentDashboard user={authState.user} onLogout={logout} />;
     return <MarketplaceDashboard user={authState.user} onLogout={logout} />;
   }
-  if (!authState.setup_required && !showAuth) return <PublicMarketplace onLogin={() => setShowAuth(true)} />;
+  if (!authState.setup_required && !showAuth) return <PublicMarketplace
+    onLogin={() => setShowAuth(true)}
+    unavailableMessage={authState.unavailable ? authState.message : ""}
+  />;
   return <AuthScreen
     setupRequired={authState.setup_required}
     setupAvailable={authState.setup_available}
