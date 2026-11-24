@@ -18,14 +18,31 @@ function responseMessage(detail, fallback) {
 
 export async function api(path, options = {}) {
   const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
-  const response = await fetch(`${API}${path}`, {
-    credentials: "same-origin",
-    ...options,
-    headers: {
-      ...(options.body && !isFormData ? { "Content-Type": "application/json" } : {}),
-      ...options.headers,
-    },
-  });
+  const controller = new AbortController();
+  const externalSignal = options.signal;
+  const timeout = globalThis.setTimeout(() => controller.abort(), 15000);
+  if (externalSignal) {
+    externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  let response;
+  try {
+    response = await fetch(`${API}${path}`, {
+      credentials: "same-origin",
+      ...options,
+      signal: controller.signal,
+      headers: {
+        ...(options.body && !isFormData ? { "Content-Type": "application/json" } : {}),
+        ...options.headers,
+      },
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("Huduma imechukua muda mwingi kujibu. Jaribu tena.");
+    }
+    throw new Error("Imeshindikana kuunganisha na huduma.");
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(responseMessage(result.detail, "Ombi halikukamilika."));
   return result;
